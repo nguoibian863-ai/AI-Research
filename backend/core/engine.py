@@ -509,6 +509,9 @@ class ResearchEngine:
                 "answer": answer,
                 "budget": budget.summary()
             }
-        except Exception:
-            # Let the specific phase failure propagate so FastAPI handlers return 409, 429, 502, etc.
+        except Exception as e:
+            # Phase methods already handled their own failures (terminal state -> no-op here);
+            # this catches failures between phases (e.g. EVALUATE) so the session never hangs.
+            self._handle_phase_error(state, e, "RUN_E2E")
+            # Re-raise so FastAPI handlers return 409, 429, 502, etc.
             raise

@@ -4,6 +4,10 @@ from typing import List, Optional, Dict, Any, Set
 from backend.db.database import DatabaseManager
 
 
+# Sentinel distinguishing "leave column unchanged" from an explicit NULL.
+_UNSET: Any = object()
+
+
 class SessionRepository:
     def __init__(self, db: DatabaseManager):
         self.db = db
@@ -32,7 +36,7 @@ class SessionRepository:
         status: str,
         plan_json: Optional[str] = None,
         open_questions_json: Optional[str] = None,
-        error_message: Optional[str] = None,
+        error_message: Optional[str] = _UNSET,
         search_calls: Optional[int] = None,
         fetch_calls: Optional[int] = None,
         llm_calls: Optional[int] = None,
@@ -47,7 +51,7 @@ class SessionRepository:
             if open_questions_json is not None:
                 updates.append("open_questions_json = ?")
                 params.append(open_questions_json)
-            if error_message is not None:
+            if error_message is not _UNSET:
                 updates.append("error_message = ?")
                 params.append(error_message)
             if search_calls is not None:

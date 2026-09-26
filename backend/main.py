@@ -1,8 +1,9 @@
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.core.engine import ResearchEngine
@@ -17,24 +18,10 @@ from backend.core.errors import (
 from backend.db.database import DatabaseManager
 from backend.llm.ollama import OllamaBackend
 from backend.llm.mock import MockLLMBackend
-from backend.api.research import router as research_router
+from backend.api.research import router as research_router, get_engine
 
-# Setup local logging (both stdout and file)
 LOGS_DIR = Path("logs")
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-log_file = LOGS_DIR / "research.log"
-
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
-file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
-file_handler.setFormatter(formatter)
-
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-root_logger.handlers.clear()
-root_logger.addHandler(stream_handler)
-root_logger.addHandler(file_handler)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 logger = logging.getLogger("ResearchAI")
 
@@ -75,7 +62,41 @@ def get_research_engine() -> ResearchEngine:
     return _engine_instance
 
 
+def setup_logging(logs_dir: Optional[Path] = None) -> List[logging.Handler]:
+    """Attaches console + file handlers to the root logger without removing existing handlers."""
+    logs_dir = logs_dir or LOGS_DIR
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(LOG_FORMAT)
+    stream_handler = logging.StreamHandler()
+    file_handler = logging.FileHandler(str(logs_dir / "research.log"), encoding="utf-8")
+    handlers: List[logging.Handler] = [stream_handler, file_handler]
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+    return handlers
+
+
+def teardown_logging(handlers: List[logging.Handler]) -> None:
+    root_logger = logging.getLogger()
+    for handler in handlers:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    handlers = setup_logging()
+    try:
+        yield
+    finally:
+        teardown_logging(handlers)
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Local Deep Research Agent API",
     version="0.1.0",
     description="Local-first, grounded research system with provenance verification."
@@ -130,8 +151,7 @@ app.include_router(research_router)
 
 
 @app.get("/health")
-def health_check():
-    engine = get_research_engine()
+def health_check(engine: ResearchEngine = Depends(get_engine)):
     provider = "ollama" if isinstance(engine.llm, OllamaBackend) else "mock"
     return {
         "status": "healthy",

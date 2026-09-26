@@ -299,3 +299,33 @@ def test_run_with_nonexistent_session_id_returns_404(client):
     assert res.status_code == 404
 
 
+
+
+def test_error_between_phases_does_not_leave_session_hanging(isolated_engine):
+    """A failure outside phase methods (e.g. in EVALUATE) must still move the session to a terminal state."""
+    def _broken_evaluate(state):
+        raise RuntimeError("evaluate bug")
+    isolated_engine.state_machine.evaluate_next_step = _broken_evaluate
+    isolated_engine.llm = MockLLMBackend(canned_responses={
+        "GeneratedQueriesSchema": {"queries": [{"query": "latency benchmark", "rationale": "r"}]}
+    })
+
+    state = isolated_engine.create_session("Evaluate failure test")
+    with pytest.raises(RuntimeError, match="evaluate bug"):
+        isolated_engine.run_week1(state)
+
+    restored = isolated_engine.load_state(state.session_id)
+    assert restored.phase == ResearchPhase.PARTIAL  # sources were already collected
+    assert restored.status == ResearchStatus.PARTIAL
+    assert restored.error_message == "evaluate bug"
+
+
+def test_error_message_can_be_cleared(isolated_engine):
+    state = isolated_engine.create_session("Clear error test")
+    state.error_message = "transient failure"
+    isolated_engine.save_state(state)
+    assert isolated_engine.load_state(state.session_id).error_message == "transient failure"
+
+    state.error_message = None
+    isolated_engine.save_state(state)
+    assert isolated_engine.load_state(state.session_id).error_message is None

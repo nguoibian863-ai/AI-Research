@@ -18,8 +18,8 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 - **P0 Full State Restoration (`load_state`):** State, plan, open questions, queries, and sources are restored from SQLite across independent HTTP requests.
 - **P0 Active Budget & Step Enforcement:** `ExecutionBudgetTracker` actively enforces `max_search_calls`, `max_fetch_calls`, `max_llm_calls`, `max_runtime_seconds`. `run_week1` executes through `EVALUATE` and `evaluate_next_step()`, properly tracking `state.step`.
 - **P1 Robust Error Handling & HTTP Statuses:** Engine transitions to `FAILED` or `PARTIAL` on exceptions, recording `error_message`. FastAPI maps `StateTransitionError` → 409 Conflict, `BudgetExceededError` → 429, `ModelInferenceError` → 502, `KeyError` → 404.
-- **P1 Observability & Local Logging:** Dual output to console and `logs/research.log` tagged with `[sess_xxx][PHASE]`.
-- **P2 Benchmark & Isolated Test Suite:** 14/14 automated tests passing in ~0.6s with zero external network dependencies and temporary DB fixtures; added `scripts/benchmark_ollama.py`.
+- **P1 Observability & Local Logging:** Dual output to console and `logs/research.log` tagged with `[sess_xxx][PHASE]`, configured in the FastAPI lifespan (no import-time side effects).
+- **P2 Benchmark & Isolated Test Suite:** 22/22 automated tests passing in ~0.6s with zero external network dependencies and temporary DB fixtures; added `scripts/benchmark_ollama.py`.
 
 ### ⏳ Week 2: Parsing & Hybrid Retrieval (In Progress)
 - [ ] PyMuPDF page-aware and section-aware PDF text extraction.

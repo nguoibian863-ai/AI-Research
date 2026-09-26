@@ -76,8 +76,10 @@ def isolated_engine(tmp_path: Path):
 
 
 @pytest.fixture
-def client(isolated_engine):
+def client(isolated_engine, tmp_path: Path, monkeypatch):
     """FastAPI TestClient with isolated engine injected via dependency override."""
+    import backend.main
+    monkeypatch.setattr(backend.main, "LOGS_DIR", tmp_path / "logs")
     app.dependency_overrides[get_engine] = lambda: isolated_engine
     with TestClient(app) as test_client:
         yield test_client
