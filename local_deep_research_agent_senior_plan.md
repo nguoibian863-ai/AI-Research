@@ -637,6 +637,19 @@ Tìm bằng chứng ngược.
 
 ---
 
+## 12.5 Search Providers
+
+| Provider | Vai trò | Ghi chú |
+|---|---|---|
+| DuckDuckGo (`ddgs`) | Web search mặc định | Kết quả lẫn lộn, có rate limit |
+| OpenAlex API | Nguồn học thuật: DOI, năm, venue, số trích dẫn | Miễn phí, không cần key |
+| arXiv API | Paper gốc, arXiv id, version | Dùng cho canonical key (mục 15) |
+| SearXNG (tự host, tuỳ chọn) | Metasearch local-first | Giảm phụ thuộc DuckDuckGo |
+
+Metadata từ OpenAlex/arXiv (DOI, arXiv id, năm, venue) được dùng trực tiếp cho `source_score` (mục 14.1) và dedup (mục 15), không cần LLM.
+
+---
+
 # 13. Source Manager
 
 Mỗi source phải có:
@@ -754,6 +767,17 @@ PDF
 
 ---
 
+## Nâng cấp tuỳ chọn
+
+| Tool | Dùng cho | Ràng buộc |
+|---|---|---|
+| `pymupdf4llm` | PDF → Markdown giữ bảng, giảm quote rời rạc kiểu ô bảng | Cùng hệ PyMuPDF, nhẹ |
+| GROBID (Docker, CPU) | Tách section, references, metadata paper chính xác | Thêm một service Java |
+
+Không dùng `marker` hoặc `docling` bản đầy đủ trên máy 4GB (quá nặng VRAM).
+
+---
+
 # 17. Chunking Strategy
 
 Không chỉ cắt cứng theo token.
@@ -809,6 +833,19 @@ Vector search tốt với:
 
 - semantic questions;
 - conceptual matching.
+
+---
+
+## 18.1 Rerank
+
+```text
+Merge (RRF)
+→ cross-encoder reranker nhỏ chạy CPU (FastEmbed, họ bge-reranker)
+→ rule-based boosts chỉ dùng làm tie-breaker, đã scale theo 1/(k+1)
+→ TOP-K
+```
+
+Reranker lỗi hoặc chưa tải được model → fallback về thứ tự RRF, ghi log rõ ràng.
 
 ---
 
@@ -963,6 +1000,15 @@ NOT_SUPPORTED
 CONTRADICTED
 ```
 
+Thứ tự ưu tiên checker:
+
+```text
+1. NLI / fact-check model nhỏ chạy CPU (họ MiniCheck hoặc cross-encoder NLI DeBERTa-small)
+2. LLM 3B chỉ là fallback, không phải checker chính
+```
+
+Checker chuyên dụng ổn định hơn dùng chính model sinh report để tự chấm.
+
 ---
 
 # 24. Numeric Verification
@@ -983,6 +1029,18 @@ NUMERIC_MISMATCH
 ```
 
 Không cần hỏi LLM.
+
+Áp dụng cho cả câu trong report có `[E#]`:
+
+```text
+mọi con số trong câu
+→ phải xuất hiện trong exact_quote của ít nhất một evidence được trích dẫn trong câu đó
+→ nếu không: claim.status = NUMERIC_MISMATCH, session = PARTIAL
+```
+
+Một câu trích dẫn nhiều evidence → 1 claim với nhiều `evidence_ids`, không tách thành nhiều claim trùng nội dung.
+
+Claim chỉ có citation mà chưa qua entailment → status `CITED`, không gán `verified = true`.
 
 ---
 
@@ -1448,6 +1506,7 @@ Question
 - provenance;
 - source dedupe;
 - source credibility scoring (mục 14.1);
+- OpenAlex / arXiv search provider (mục 12.5);
 - Evidence Store;
 - Gap Evaluator;
 - open questions;
@@ -1470,8 +1529,9 @@ Question
 
 - source integrity verifier;
 - evidence integrity verifier;
-- numeric verifier;
-- semantic verifier;
+- numeric verifier (kể cả câu có `[E#]`, mục 24);
+- semantic verifier bằng NLI model nhỏ chạy CPU (mục 23);
+- cross-encoder reranker (mục 18.1);
 - contradiction handling;
 - claim store;
 - grounded writer theo từng section (mục 27.1);
@@ -1499,6 +1559,8 @@ Question
 - run evaluation;
 - log resource metrics;
 - trajectory schema;
+- trajectory logging cho `query_generation` và `evidence_extraction` kèm nhãn verifier (mục 43.1);
+- export JSONL theo partition;
 - trajectory filtering;
 - failure analysis;
 - bug fixing;
@@ -1536,6 +1598,9 @@ Question
 - Hybrid Retrieval
 - Source Dedup
 - Source Credibility Scoring
+- Academic Search Providers (OpenAlex / arXiv)
+- Cross-encoder Reranker
+- NLI Entailment Verifier
 - Gap Evaluation
 - Contradiction Detection
 - Section-by-Section Writer
@@ -1546,6 +1611,8 @@ Question
 - GitHub search
 - local cache optimization
 - report formatting (Markdown/HTML export, citation styles)
+- PDF nâng cao (`pymupdf4llm`, GROBID)
+- AI development context (Phụ lục A.3)
 
 ## P3
 
@@ -1836,6 +1903,37 @@ Gap Detection
 
 Không gộp tất cả ngay từ đầu.
 
+Bắt đầu với Dataset C (Atomic Evidence Extraction): đây là điểm yếu rõ nhất của model 3B khi chạy thật.
+
+## 43.1 Thu thập dữ liệu ngay trong MVP (không cần GPU)
+
+```text
+query_generation
+→ input: goal + plan
+→ output: queries
+→ nhãn: số source liên quan mang về
+
+evidence_extraction
+→ input: chunk
+→ output: facts
+→ nhãn: verifier (VERIFIED / NUMERIC_MISMATCH / SUBJECT_MISMATCH / ...)
+```
+
+Fact VERIFIED → mẫu SFT. Cặp (VERIFIED, bị loại) trên cùng chunk → mẫu DPO.
+
+Metadata theo mục 42.4. Xuất JSONL theo partition vào `data/trajectories/`.
+
+## 43.2 Nguồn dữ liệu
+
+| Nguồn | Vai trò |
+|---|---|
+| Trajectory của chính hệ thống | Nguồn chính, đúng schema và format JSON |
+| Chưng cất từ model lớn local (`qwen3:14b`, `deepseek-r1:8b`) | Teacher tạo mẫu, verifier lọc lại |
+| distilabel | Pipeline sinh dữ liệu tổng hợp |
+| Argilla hoặc Label Studio | Human review candidate → gold |
+
+Dùng API cloud làm teacher → kiểm tra điều khoản sử dụng output để train.
+
 ---
 
 # 44. Phase 2 Dataset Targets
@@ -1855,6 +1953,22 @@ Sau đó:
 ```
 
 nếu thực sự có dữ liệu chất lượng.
+
+## 44.1 Dataset công khai tham khảo
+
+| Kỹ năng | Dataset |
+|---|---|
+| A — Query Decomposition | HotpotQA, MuSiQue, 2WikiMultihopQA, StrategyQA |
+| B — Tool Selection | Dataset function-calling (họ xLAM/APIGen) + trajectory của hệ thống |
+| C — Atomic Evidence Extraction | QASPER, SciFact, FEVER |
+| D — Gap Detection / Citation | ALCE, ExpertQA |
+
+Quy tắc:
+
+- chuyển về đúng schema của hệ thống (vd. `ExtractedEvidencesSchema`);
+- dữ liệu của chính hệ thống chiếm ≥ 50% mỗi dataset;
+- kiểm tra license từng dataset (nhiều bộ chỉ cho phép phi thương mại);
+- dedup và kiểm tra leakage với `eval/` (mục 42.5).
 
 ---
 
@@ -1876,6 +1990,44 @@ LoRA adapter only
 
 Không full fine-tune trên phần cứng hiện tại.
 
+## 45.1 Framework
+
+| Tool | Khi nào dùng |
+|---|---|
+| Unsloth | Mặc định cho QLoRA ít VRAM (kiểm tra hỗ trợ SmolLM3 trước) |
+| TRL + PEFT + bitsandbytes | Khi Unsloth không hỗ trợ model; `SFTTrainer`, `DPOTrainer` |
+| LLaMA-Factory | Cần giao diện / cấu hình YAML |
+| Axolotl | Train bằng config, chạy trên Linux/WSL |
+
+## 45.2 Ràng buộc 4GB VRAM
+
+```text
+sequence length: 1024–2048
+batch size: 1 + gradient accumulation
+gradient checkpointing: bật
+```
+
+Chạy thử một lượt ngắn để đo VRAM trước khi train thật. Không đủ → thuê GPU cloud theo giờ chỉ cho bước train, inference vẫn local.
+
+## 45.3 Định dạng & triển khai
+
+- train đúng chat template của SmolLM3 ở chế độ `/no_think` như lúc chạy thật;
+- LoRA adapter → GGUF (llama.cpp) → `ADAPTER` trong Ollama Modelfile;
+- LLM backend không đổi, chỉ đổi model name trong config.
+
+## 45.4 Cấu trúc thư mục
+
+```text
+training/
+├── export_trajectories.py   # SQLite → JSONL theo partition/task_type
+├── promote.py               # raw → candidate (verifier) → gold (human review)
+├── dedup_leakage.py         # chống trùng train/eval
+├── datasets/                # build Dataset A–D
+├── train_qlora.py
+├── configs/smollm3_qlora.yaml
+└── eval_ab.py               # base vs LoRA (mục 46)
+```
+
 ---
 
 # 46. A/B Evaluation
@@ -1894,6 +2046,8 @@ Metrics:
 - evidence extraction;
 - citation accuracy;
 - completion rate.
+
+Kiểm tra thêm kỹ năng chung không bị suy giảm (EleutherAI `lm-evaluation-harness`).
 
 Nếu adapter không cải thiện đáng kể:
 
@@ -1949,3 +2103,57 @@ Core value cuối cùng:
 > **Mọi kết luận quan trọng đều truy ngược được về evidence thực tế mà hệ thống đã đọc.**
 
 Đó là tiêu chuẩn kỹ thuật để phân biệt project này với một RAG/Web Search wrapper thông thường.
+
+---
+
+# Phụ lục A — Tooling, References & AI Development Context
+
+## A.1 Repo tham khảo
+
+Chỉ học ý tưởng, không dùng làm nền. Kiểm tra license trước khi sao chép bất kỳ đoạn code nào và ghi rõ nguồn.
+
+| Repo | Học gì | Không dùng |
+|---|---|---|
+| `tarun7r/deep-research-agent` (MIT) | Credibility scoring (mục 14.1), viết report theo section, UI tiến độ | LangGraph/ReAct, citation chỉ ở cấp URL |
+| `stanford-oval/storm` | Outline nhiều góc nhìn, viết section có citation (mục 27.1) | — |
+| `langchain-ai/local-deep-researcher` | Vòng lặp tóm tắt → tìm gap → search tiếp với Ollama (Gap Evaluator) | Để LLM tự quyết vòng lặp |
+| `assafelovic/gpt-researcher` | Chọn/tổng hợp nhiều nguồn, định dạng report | — |
+| `huggingface/smol-course` | SFT/DPO/eval cho model nhỏ (Phase 2) | — |
+| Search-R1 và tương tự | Thiết kế reward, format trajectory cho search | RL training (không chạy được trên 4GB) |
+| EleutherAI `lm-evaluation-harness` | Kiểm tra suy giảm kỹ năng sau fine-tune | — |
+
+## A.2 Không đưa vào project
+
+- LangGraph, CrewAI hoặc agent ReAct tự do (vi phạm "Python quyết định transition");
+- `marker`, `docling` bản đầy đủ (quá nặng cho 4GB);
+- Ragas/DeepEval với LLM judge cần model mạnh hoặc API cloud;
+- cache toàn bộ report theo topic (mục 30).
+
+## A.3 AI Development Context
+
+Cấu trúc để AI coding assistant (Claude Code) làm việc nhất quán giữa các phiên:
+
+```text
+CLAUDE.md                     # nguyên tắc bất biến, lệnh test, ràng buộc phần cứng
+.claude/
+├── settings.json             # hook SessionStart: cài dependency + chạy pytest
+└── skills/
+    ├── review-project/       # quy trình review: fetch → diff → pytest → probe → đối chiếu acceptance
+    ├── run-e2e/              # checklist chạy thật với Ollama
+    └── week-acceptance/      # kiểm tra tiêu chí nghiệm thu từng tuần
+docs/
+├── context/                  # kiến trúc hiện tại, quyết định thiết kế (ADR)
+├── references/               # ghi chú repo/tool bên ngoài: link, license, học gì, không dùng gì
+└── reviews/                  # báo cáo review từng tuần
+third_party/                  # (gitignore) clone repo tham khảo để đọc, không commit
+```
+
+`CLAUDE.md` tối thiểu phải ghi:
+
+- Python quyết định transition, LLM không tự quyết vòng lặp;
+- không gán source khi không chắc chắn, reject thay vì đoán;
+- mọi số liệu phải xuất hiện nguyên văn trong quote;
+- mọi fix phải kèm test hồi quy;
+- báo cáo tiến độ chỉ dựa trên kết quả đã kiểm chứng (test + chạy thật).
+
+Skill có sẵn nên dùng: `/code-review` cho mỗi commit quan trọng, `/security-review` trước khi mở API ra ngoài `127.0.0.1` (SSRF qua fetch URL, đọc file local qua PDF tool).
