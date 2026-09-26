@@ -18,7 +18,7 @@ llm:
   default_profile: "laptop_4gb"
   profiles:
     laptop_4gb:
-      model: "smollm3:3b"
+      model: "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M"
       context_window: 4096
       max_output_tokens: 1024
     high_memory:
@@ -27,7 +27,9 @@ llm:
       max_output_tokens: 2048
   ollama:
     base_url: "http://127.0.0.1:11434"
-    model: "smollm3:3b"
+    model: "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M"
+    # SmolLM3 reasoning is toggled by a system-prompt flag; "/no_think" keeps JSON output clean.
+    system_prefix: "/no_think"
     context_window: 4096
     max_output_tokens: 1024
     timeout_seconds: 120

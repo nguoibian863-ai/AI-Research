@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any, Dict, Optional, Type
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -8,16 +9,24 @@ from backend.core.errors import ModelInferenceError
 
 logger = logging.getLogger(__name__)
 
+# Reasoning models (SmolLM3, Qwen3, DeepSeek-R1) may emit a <think> block before the answer.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_think_block(text: str) -> str:
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
 
 class OllamaBackend(LLMBackend):
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:11434",
-        model: str = "smollm3:3b",
+        model: str = "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M",
         timeout: float = 120.0,
         temperature: float = 0.1,
         context_window: int = 4096,
-        max_output_tokens: int = 1024
+        max_output_tokens: int = 1024,
+        system_prefix: Optional[str] = None
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -25,6 +34,12 @@ class OllamaBackend(LLMBackend):
         self.temperature = temperature
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
+        # Prepended to every system prompt, e.g. "/no_think" to disable SmolLM3 reasoning mode.
+        self.system_prefix = system_prefix
+
+    def _build_system(self, system_prompt: Optional[str]) -> Optional[str]:
+        parts = [p for p in (self.system_prefix, system_prompt) if p]
+        return "\n".join(parts) if parts else None
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
         url = f"{self.base_url}/api/generate"
@@ -38,8 +53,9 @@ class OllamaBackend(LLMBackend):
                 "num_ctx": kwargs.get("num_ctx", self.context_window)
             }
         }
-        if system_prompt:
-            payload["system"] = system_prompt
+        system = self._build_system(system_prompt)
+        if system:
+            payload["system"] = system
 
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -47,7 +63,7 @@ class OllamaBackend(LLMBackend):
                 res.raise_for_status()
                 data = res.json()
 
-            content = data.get("response", "")
+            content = strip_think_block(data.get("response", ""))
             prompt_eval_count = data.get("prompt_eval_count", 0)
             eval_count = data.get("eval_count", 0)
 
@@ -72,8 +88,9 @@ class OllamaBackend(LLMBackend):
         url = f"{self.base_url}/api/generate"
         schema_dict = schema.model_json_schema()
 
+        base_system = self._build_system(system_prompt)
         enriched_system = (
-            (system_prompt + "\n" if system_prompt else "") +
+            (base_system + "\n" if base_system else "") +
             "You MUST respond ONLY with a valid JSON object matching this schema. "
             "Do not include markdown codeblocks or preamble.\n"
             f"JSON Schema: {json.dumps(schema_dict)}"
@@ -98,7 +115,7 @@ class OllamaBackend(LLMBackend):
                 res.raise_for_status()
                 data = res.json()
 
-            raw_content = data.get("response", "").strip()
+            raw_content = strip_think_block(data.get("response", ""))
             if raw_content.startswith("```json"):
                 raw_content = raw_content[7:]
             if raw_content.startswith("```"):

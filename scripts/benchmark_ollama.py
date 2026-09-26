@@ -3,6 +3,7 @@ Ollama Local Benchmark Script
 Measures token generation speed (tokens/sec), latency, VRAM allocation, and verifies JSON schema constrained decoding.
 """
 
+import re
 import time
 import subprocess
 import httpx
@@ -43,7 +44,19 @@ def get_ollama_ps():
         return "Ollama ps not available"
 
 
-def run_benchmark(model_name: str = "smollm3:3b"):
+DEFAULT_MODEL = "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M"
+
+
+def no_think_system(model_name: str):
+    """SmolLM3 disables its reasoning mode via a '/no_think' system-prompt flag."""
+    return "/no_think" if "smollm3" in model_name.lower() else None
+
+
+def strip_think_block(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def run_benchmark(model_name: str = DEFAULT_MODEL):
     print(f"\n=======================================================")
     print(f"Benchmarking Local Ollama Model: {model_name} (Profile: Laptop 4GB)")
     print(f"=======================================================")
@@ -60,6 +73,7 @@ def run_benchmark(model_name: str = "smollm3:3b"):
         return
 
     print(f"Initial GPU Status: {get_vram_usage()}")
+    system = no_think_system(model_name)
 
     # 2. Benchmark Raw Generation
     print(f"\n[Test 1] Raw Generation Speed Benchmark...")
@@ -67,6 +81,7 @@ def run_benchmark(model_name: str = "smollm3:3b"):
         "model": model_name,
         "prompt": TEST_PROMPT,
         "stream": False,
+        **({"system": system} if system else {}),
         "options": {
             "temperature": 0.1,
             "num_predict": 512,
@@ -111,6 +126,7 @@ def run_benchmark(model_name: str = "smollm3:3b"):
         "prompt": "Output the estimated metrics for CenterPoint on nuScenes.",
         "format": schema,
         "stream": False,
+        **({"system": system} if system else {}),
         "options": {
             "temperature": 0.1,
             "num_predict": 128,
@@ -124,7 +140,7 @@ def run_benchmark(model_name: str = "smollm3:3b"):
         elapsed = time.time() - start_time
         res.raise_for_status()
         data = res.json()
-        raw_json = data.get("response", "").strip()
+        raw_json = strip_think_block(data.get("response", ""))
         parsed = json.loads(raw_json)
         print(f"  - Structured JSON Output Validated: {parsed}")
         print(f"  - Structured Latency: {elapsed:.2f}s")
@@ -134,5 +150,5 @@ def run_benchmark(model_name: str = "smollm3:3b"):
 
 if __name__ == "__main__":
     import sys
-    model = sys.argv[1] if len(sys.argv) > 1 else "smollm3:3b"
+    model = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
     run_benchmark(model)

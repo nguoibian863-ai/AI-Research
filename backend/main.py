@@ -45,11 +45,12 @@ def get_research_engine() -> ResearchEngine:
         if llm_provider == "ollama":
             llm_backend = OllamaBackend(
                 base_url=ollama_cfg.get("base_url", "http://127.0.0.1:11434"),
-                model=ollama_cfg.get("model", "smollm3:3b"),
+                model=ollama_cfg.get("model", "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M"),
                 timeout=ollama_cfg.get("timeout_seconds", 120.0),
                 temperature=ollama_cfg.get("temperature", 0.1),
                 context_window=ollama_cfg.get("context_window", 4096),
-                max_output_tokens=ollama_cfg.get("max_output_tokens", 1024)
+                max_output_tokens=ollama_cfg.get("max_output_tokens", 1024),
+                system_prefix=ollama_cfg.get("system_prefix")
             )
         else:
             llm_backend = MockLLMBackend()
