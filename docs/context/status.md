@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `73d8ee9`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `da1697b`.
 
 ## Tiến độ
 
@@ -89,10 +89,13 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
   - Sửa `test_extract_write_reservation_dynamic`: kiểm tra thời gian còn lại 130s (`elapsed_seconds = 470.0`), phân biệt rõ ngưỡng cũ (120s) và ngưỡng động mới (170s).
   - Bổ sung 2 regression test mới: `test_subject_matches_entity_strict_semantics` và `test_ollama_backend_clamps_predict_to_stay_within_context`.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống)
+## Vấn đề còn mở (ưu tiên từ trên xuống) — review `da1697b`
 
-1. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
-2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+1. **`test_extract_write_reservation_dynamic` vẫn không kiểm tra được gì** (vẫn pass trên `a05af31`). `mock_tracker` là `MagicMock` không có spec, và `MagicMock` từ chối mọi thuộc tính bắt đầu bằng `assert_`. Vì vậy `budget_tracker.assert_can_call_llm()` ném `AttributeError`, lỗi này bị `except` nuốt, và `structured_generate` không bao giờ được gọi, bất kể ngưỡng thời gian. Cách sửa: thêm `mock_tracker.assert_can_call_llm = MagicMock()` hoặc dùng `ExecutionBudgetTracker` thật. Đã thử: sau khi thêm dòng đó, test fail trên `a05af31` và pass trên HEAD.
+2. **Cắt chunk ở 2400 ký tự làm mất phần cuối chunk mà không báo.** Chunker cho phép tới 600 token ước lượng (khoảng 460 từ, tức khoảng 2700–3000 ký tự), nên chunk dài mất khoảng 10–20% cuối. Nếu câu làm chunk được retrieve nằm ở đoạn cuối này thì không bao giờ được trích xuất. Nên giảm `max_chunk_tokens` (khoảng 450) để chunk vừa ngân sách, thay vì cắt; hoặc ít nhất ghi log khi cắt.
+3. `num_predict` chỉ được tính một lần từ prompt gốc. Ở lần retry, prompt có thêm thông báo lỗi validation nhưng không được tính lại. Khi prompt tự nó đã vượt `num_ctx`, code chỉ hạ `num_predict` xuống 128 (Ollama vẫn cắt đầu prompt); nên cắt input hoặc báo lỗi rõ ràng.
+4. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
+5. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
 
 ## Lịch sử kết quả chạy thật
 
