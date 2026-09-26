@@ -12,7 +12,7 @@
 | 4 — Verification + UI | chưa bắt đầu | |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 76 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 82 passed + 1 skipped (test FastEmbed cần mạng).
 
 ## Đã giải quyết ở `4f3872c`
 
@@ -33,15 +33,21 @@ Test: 76 passed + 1 skipped (test FastEmbed cần mạng).
 - Mỗi lần retrieve đều embed lại toàn bộ chunk (177 chunk ≈ 20–37s/lần trên CPU, ~2 phút/vòng RETRIEVE) → **đã sửa**: index theo session chỉ embed chunk mới.
 - Retrieve/coverage theo thực thể chạy cả cho dataset (`coco`) → **đã sửa**: chỉ dùng thực thể được so sánh.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống) — từ E2E thật `sess_a90c2f47fd8e`, `sess_84c5aa35ff8f`
+## Đã sửa sau E2E thật (chờ chạy lại để xác nhận)
 
-1. **Statement không được quote hỗ trợ vẫn được lưu** (chưa có entailment). Vd E1 "RF-DETR achieves state-of-the-art accuracy…" nhưng quote chỉ là "We evaluate RF-DETR on COCO for fair comparison…"; E1 run 2 "MySQL is the best open-source tool" đọc sai quote về BenchBase. Cần kiểm tra overlap statement↔quote ngay, NLI ở Tuần 4.
-2. **Evidence thiếu đa dạng**: cả 5 evidence run 1 từ một paper (RF-DETR); extractor lấy 5 chunk đầu (đều từ retrieve chính), không chia theo thực thể/tài liệu.
-3. **Coverage theo evidence chỉ kiểm "có nhắc tên"**: RF-DETR paper nhắc YOLOv8/RT-DETR nên coverage coi là đủ; cần tính theo `subject` của evidence.
-4. **Writer không dùng đúng định dạng `[E#]`**: run 2 viết `**E1**` → "no valid citations"; run 1 dùng `[E1]` làm nhãn đầu đoạn.
-5. **Planner vẫn lập kế hoạch làm thí nghiệm** ("Train YOLOv8 model on COCO…") thay vì tìm kết quả đã công bố; query run 2 lạc sang `max_connections`, `max_prepared_statements`.
-6. Tỉ lệ quote bị loại "not in source chunk" cao (model diễn đạt lại thay vì trích nguyên văn).
-7. Chưa ghi trajectory cho `query_generation` / `evidence_extraction` (plan 43.1).
+1. Statement phải được quote hỗ trợ: ≥ 50% từ nội dung của statement có trong quote, nếu không → `STATEMENT_NOT_GROUNDED`.
+2. Chọn chunk để trích xuất theo vòng giữa các thực thể được so sánh, tối đa 2 chunk/tài liệu; thực thể không có chunk ứng viên được retrieve riêng.
+3. Coverage theo evidence tính theo `subject` (chấp nhận biến thể YOLOv8n, RT-DETR-R50), không tính "có nhắc tên".
+4. Chuẩn hoá trích dẫn `**E1**`, `(E1)`, `E1`, `[E1, E2]` → `[E1]`; prompt writer bắt buộc citation cuối câu, câu có số phải có citation.
+5. Prompt planner/query cấm lập kế hoạch làm thí nghiệm và tìm tham số cấu hình.
+6. So khớp thực thể chấp nhận hậu tố biến thể (`text_mentions_entity`) khi chọn chunk.
+
+## Vấn đề còn mở (ưu tiên từ trên xuống)
+
+1. **Chạy lại 2 câu hỏi E2E** (YOLOv8/RT-DETR, PostgreSQL/MySQL) để xác nhận các bản sửa trên — điều kiện đóng Tuần 3.
+2. Statement đọc sai quote nhưng trùng từ nhiều (vd "MySQL is the best open-source tool") vẫn qua → cần NLI (plan 23, Tuần 4).
+3. Tỉ lệ quote bị loại "not in source chunk" cao (model diễn đạt lại thay vì trích nguyên văn) → dữ liệu cho Dataset C (plan 43).
+4. Chưa ghi trajectory cho `query_generation` / `evidence_extraction` (plan 43.1).
 
 ## Lịch sử kết quả chạy thật
 

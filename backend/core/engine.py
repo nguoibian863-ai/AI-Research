@@ -52,6 +52,7 @@ from backend.core.coverage import (
     GENERIC_RESEARCH_TERMS,
     DATASET_BENCHMARK_TERMS,
     extract_context_entities,
+    text_mentions_entity,
     extract_substantive_numbers
 )
 from backend.evidence.extractor import EvidenceExtractor
@@ -333,7 +334,10 @@ class ResearchEngine:
             prompt = (
                 f"You are a Senior Technical Research Planner. Given the following research question, "
                 f"break it down into 3-5 concrete, factual investigation sub-tasks focusing on measurable benchmarks, "
-                f"hardware specifications, datasets, and baseline comparisons.\n\n"
+                f"hardware specifications, datasets, and baseline comparisons.\n"
+                f"IMPORTANT: You are planning a LITERATURE search. Do NOT plan to run experiments, train models, "
+                f"collect or preprocess datasets, or tune configurations yourself. Every task must FIND already "
+                f"published results (papers, official benchmarks, documentation) for the entities in the question.\n\n"
                 f"Example Benchmark Plan:\n"
                 f"Goal: Compare RocksDB vs LevelDB write amplification and throughput on NVMe SSDs\n"
                 f"Tasks:\n"
@@ -387,7 +391,10 @@ class ResearchEngine:
                 budget.assert_can_call_llm()
                 prompt = (
                     f"Based on the research goal and plan, generate 2-4 concise, highly-targeted keyword search queries "
-                    f"(3 to 8 words per query). Do NOT use conversational question sentences.\n\n"
+                    f"(3 to 8 words per query). Do NOT use conversational question sentences.\n"
+                    f"Each query must name at least one entity from the goal and target published results "
+                    f"(benchmark numbers, papers, official docs). Do NOT search for configuration parameters, "
+                    f"installation steps or tooling.\n\n"
                     f"Good Examples:\n"
                     f"- 'RocksDB LevelDB write amplification benchmark NVMe'\n"
                     f"- 'RocksDB compaction throughput latency SSD'\n"
@@ -703,6 +710,7 @@ class ResearchEngine:
             source_id = c.get("source_id") or meta.get("source_id")
             url = c.get("url") or meta.get("url") or "local"
             source_title = c.get("source_title") or c.get("title") or meta.get("source_title") or meta.get("title") or ""
+            doc_id = c.get("doc_id", "")
         else:
             chunk_id = getattr(c, "chunk_id", "")
             text = getattr(c, "text", "")
@@ -714,6 +722,7 @@ class ResearchEngine:
             source_id = getattr(c, "source_id", None) or meta.get("source_id")
             url = meta.get("url") or getattr(c, "url", "local")
             source_title = meta.get("source_title") or meta.get("title") or getattr(c, "source_title", "")
+            doc_id = getattr(c, "doc_id", "")
 
         # Look up in SQLite if source_id is missing or placeholder
         if (not source_id or source_id == "src_unknown") and chunk_id and self.db:
@@ -746,8 +755,69 @@ class ResearchEngine:
             "char_end": char_end,
             "source_id": source_id,
             "url": url,
-            "source_title": source_title
+            "source_title": source_title,
+            "doc_id": doc_id
         }
+
+    def _select_chunks_for_extraction(
+        self,
+        state: ResearchState,
+        chunks: List[Dict[str, Any]],
+        limit: int = 5,
+        max_per_doc: int = 2
+    ) -> List[Dict[str, Any]]:
+        """
+        Picks extraction chunks round-robin across compared entities, at most `max_per_doc` per document,
+        so one paper cannot supply all evidence. Entities with no candidate chunk get a targeted retrieval.
+        """
+        entities = self._goal_subject_entities(state.goal)
+        pool = list(chunks)
+        seen = {c["chunk_id"] for c in pool}
+
+        for ent in entities:
+            if not any(text_mentions_entity(c.get("text", ""), ent) for c in pool):
+                for rc in self.retrieve_chunks(state.session_id, f"{ent} {state.goal}", top_k=3):
+                    if rc.chunk_id not in seen:
+                        seen.add(rc.chunk_id)
+                        pool.append(self._normalize_chunk_for_evidence(rc))
+
+        selected: List[Dict[str, Any]] = []
+        used: set = set()
+        per_doc: Dict[str, int] = {}
+
+        def take(c: Dict[str, Any], enforce_doc_cap: bool) -> bool:
+            doc = c.get("doc_id") or c["chunk_id"]
+            if c["chunk_id"] in used or (enforce_doc_cap and per_doc.get(doc, 0) >= max_per_doc):
+                return False
+            selected.append(c)
+            used.add(c["chunk_id"])
+            per_doc[doc] = per_doc.get(doc, 0) + 1
+            return True
+
+        # Round-robin over entities
+        progress = True
+        while len(selected) < limit and progress and entities:
+            progress = False
+            for ent in entities:
+                if len(selected) >= limit:
+                    break
+                for c in pool:
+                    if text_mentions_entity(c.get("text", ""), ent) and take(c, enforce_doc_cap=True):
+                        progress = True
+                        break
+
+        # Fill remaining slots in retrieval order, still respecting the per-document cap, then relax it
+        for enforce in (True, False):
+            for c in pool:
+                if len(selected) >= limit:
+                    break
+                take(c, enforce_doc_cap=enforce)
+
+        logger.info(
+            f"[{state.session_id}][EXTRACT] Selected {len(selected)} chunks from {len(per_doc)} documents "
+            f"for entities {entities}."
+        )
+        return selected
 
     def run_extract_phase(
         self,
@@ -769,6 +839,7 @@ class ResearchEngine:
                 return []
 
             normalized_chunks = [self._normalize_chunk_for_evidence(c) for c in cand_chunks]
+            normalized_chunks = self._select_chunks_for_extraction(state, normalized_chunks)
 
             evidence_items = self.evidence_extractor.extract_from_chunks(
                 session_id=state.session_id,
@@ -783,6 +854,38 @@ class ResearchEngine:
         except Exception as e:
             self._handle_phase_error(state, e, "EXTRACT")
             raise
+
+    @staticmethod
+    def _normalize_citations(report: str, evidence_count: int) -> str:
+        """
+        Normalizes citation variants the small model produces (**E1**, (E1), E1, [E1, E2]) to [E1] form.
+        Only indices within 1..evidence_count are rewritten.
+        """
+        if evidence_count <= 0 or not report:
+            return report
+
+        def valid(n: str) -> bool:
+            return 1 <= int(n) <= evidence_count
+
+        # [E1, E2] / [E1; E2] -> [E1][E2]
+        def split_group(m):
+            nums = re.findall(r"E(\d+)", m.group(0))
+            return "".join(f"[E{n}]" for n in nums) if nums and all(valid(n) for n in nums) else m.group(0)
+        report = re.sub(r"\[E\d+(?:\s*[,;]\s*E\d+)+\]", split_group, report)
+
+        # **E1** / __E1__ / (E1) -> [E1]
+        report = re.sub(
+            r"(\*\*|__|\()E(\d+)(\*\*|__|\))",
+            lambda m: f"[E{m.group(2)}]" if valid(m.group(2)) else m.group(0),
+            report,
+        )
+        # bare E1 not already inside brackets -> [E1]
+        report = re.sub(
+            r"(?<![\[\w])E(\d+)(?![\]\w])",
+            lambda m: f"[E{m.group(1)}]" if valid(m.group(1)) else m.group(0),
+            report,
+        )
+        return report
 
     def run_basic_answer(
         self,
@@ -881,7 +984,12 @@ class ResearchEngine:
                     f"CRITICAL CITATION RULES:\n"
                     f"1. For every substantive claim, metric, or finding, you MUST explicitly cite the supporting evidence using [E1], [E2], etc.\n"
                     f"2. Example: 'Model A achieves 60.3 mAP [E1], whereas Model B achieves 59.2 mAP [E2].'\n"
-                    f"3. Do NOT make claims that cannot be grounded in the provided evidence.\n\n"
+                    f"3. Do NOT make claims that cannot be grounded in the provided evidence.\n"
+                    f"4. Write citations exactly as [E1], [E2] at the END of the sentence. Never write E1, **E1** or (E1), "
+                    f"and never use [E1] as a paragraph label.\n"
+                    f"5. Every sentence that contains a number must end with the [E#] citation of the evidence holding that number, "
+                    f"including summary sentences. Do not repeat numbers in a summary without citing them.\n"
+                    f"6. If the evidence does not cover an entity in the question, say so explicitly.\n\n"
                     f"Synthesize the key findings, comparisons, and metrics directly addressing the question with strict [E#] citations."
                 )
             else:
@@ -897,7 +1005,7 @@ class ResearchEngine:
             self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
             res = self.llm.generate(prompt)
             budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
-            raw_report = res.content.strip()
+            raw_report = self._normalize_citations(res.content.strip(), len(evidence_items) if evidence_items else 0)
 
             # Append Evidence & Provenance Table and populate claims lineage if evidence items exist
             claims_json = "[]"

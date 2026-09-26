@@ -1257,3 +1257,124 @@ def test_search_skips_low_credibility_source_and_evidence_carries_score(tmp_path
     assert evidence[0]["source_score"] == sources[0]["credibility_score"]
     assert "Source score:" in CitationVerifier.format_evidence_for_prompt(evidence)
 
+
+
+# ---------------------------------------------------------------------------
+# Regression tests from real E2E runs sess_a90c2f47fd8e / sess_84c5aa35ff8f
+# ---------------------------------------------------------------------------
+
+def test_statement_not_grounded_in_quote_is_rejected():
+    from backend.evidence.extractor import verify_atomic_fact, statement_quote_overlap
+    from backend.llm.schemas import AtomicFactItemSchema
+
+    chunk = {"text": "We evaluate RF-DETR on COCO for fair comparison with prior work and on RF100-VL to "
+                     "evaluate generalization to real-world datasets. RF-DETR (nano) matches the performance "
+                     "of YOLOv8 and YOLOv11 (medium)."}
+
+    # Real E2E case: SOTA claim not stated by the quote
+    sota = AtomicFactItemSchema(
+        statement="RF-DETR achieves state-of-the-art accuracy among all real-time methods on COCO.",
+        subject="RF-DETR", predicate="achieves",
+        raw_quote="We evaluate RF-DETR on COCO for fair comparison with prior work")
+    ok, reason = verify_atomic_fact(sota, chunk, "We evaluate RF-DETR on COCO for fair comparison with prior work")
+    assert not ok and reason.startswith("STATEMENT_NOT_GROUNDED")
+
+    # Faithful restatement of the quote passes
+    faithful = AtomicFactItemSchema(
+        statement="RF-DETR (nano) matches the performance of YOLOv8 and YOLOv11 (medium) on COCO.",
+        subject="RF-DETR", predicate="matches",
+        raw_quote="RF-DETR (nano) matches the performance of YOLOv8 and YOLOv11 (medium).")
+    ok, reason = verify_atomic_fact(faithful, chunk, "RF-DETR (nano) matches the performance of YOLOv8 and YOLOv11 (medium).")
+    assert ok, reason
+
+    assert statement_quote_overlap("CenterPoint achieved 67.3 NDS", "CenterPoint achieves 67.3 NDS") == 1.0
+
+
+def test_evidence_coverage_counts_subjects_not_mentions():
+    from backend.core.coverage import evaluate_evidence_coverage
+
+    # Real E2E case: a paper about RF-DETR mentions YOLOv8 and RT-DETR but is not evidence about them
+    rf_detr_only = [{"subject": "RF-DETR", "statement": "RF-DETR (nano) matches YOLOv8 and outperforms RT-DETR.",
+                     "exact_quote": "RF-DETR (nano) matches YOLOv8 and outperforms RT-DETR."}]
+    cov = evaluate_evidence_coverage(["yolov8", "rt-detr"], rf_detr_only)
+    assert cov["missing"] == ["yolov8", "rt-detr"]
+
+    # Variant subject names still count
+    variants = [{"subject": "YOLOv8n"}, {"subject": "RT-DETR-R50"}]
+    assert evaluate_evidence_coverage(["yolov8", "rt-detr"], variants)["is_complete"]
+
+
+def test_citation_variants_are_normalized():
+    from backend.core.engine import ResearchEngine
+
+    norm = ResearchEngine._normalize_citations
+    assert norm("MySQL tool **E1** and PostgreSQL fork (E2).", 2) == "MySQL tool [E1] and PostgreSQL fork [E2]."
+    assert norm("Both reach 67.3 NDS [E1, E2].", 2) == "Both reach 67.3 NDS [E1][E2]."
+    assert norm("See E1 for details.", 1) == "See [E1] for details."
+    # Out-of-range indices and unrelated tokens are untouched
+    assert norm("Refers to E9 and E2E latency.", 2) == "Refers to E9 and E2E latency."
+    assert norm("Already fine [E1].", 1) == "Already fine [E1]."
+
+
+def test_bold_citations_from_small_model_count_as_cited(tmp_path):
+    """Real E2E case: writer produced **E1** so the session ended with 'Report contains no valid citations'."""
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.db.database import DatabaseManager
+    from backend.llm.mock import MockLLMBackend
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+    from tests.conftest import FakeSearchTool, FakeFetchTool
+
+    doc = ("On the test split CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes. "
+           "PointPillars achieves 59.2 NDS with a fast encoder on nuScenes.")
+    canned = {
+        "ResearchPlanSchema": {"goal": "g", "tasks": [{"task_id": "t", "description": "Find results", "expected_evidence": "NDS"}]},
+        "GeneratedQueriesSchema": {"queries": [{"query": "CenterPoint PointPillars nuScenes", "rationale": "r"}]},
+        "ExtractedEvidencesSchema": {"facts": [
+            {"statement": "CenterPoint achieves 67.3 NDS on nuScenes.", "subject": "CenterPoint", "predicate": "achieves",
+             "metric": "NDS", "value": "67.3", "raw_quote": "CenterPoint achieves 60.3 mAP and 67.3 NDS"},
+            {"statement": "PointPillars achieves 59.2 NDS on nuScenes.", "subject": "PointPillars", "predicate": "achieves",
+             "metric": "NDS", "value": "59.2", "raw_quote": "PointPillars achieves 59.2 NDS"}]},
+        "generate": "CenterPoint reaches 67.3 NDS **E1** while PointPillars reaches 59.2 NDS (E2).",
+    }
+    engine = ResearchEngine(
+        MockLLMBackend(canned), DatabaseManager(db_path=tmp_path / "cite.db"), ResearchLimits(max_research_steps=2),
+        FakeSearchTool(), FakeFetchTool(doc), embedding_backend=LocalHashEmbeddingBackend(128))
+    result = engine.run_week1("Compare CenterPoint and PointPillars on nuScenes")
+
+    assert result["phase"] == "DONE", result.get("error_message")
+    claims = engine.claim_repo.get_by_session(result["session_id"])
+    assert [c["status"] for c in claims] == ["CITED"]
+    assert len(claims[0]["evidence_ids"]) == 2
+
+
+def test_extraction_selection_spreads_across_entities_and_documents(isolated_engine):
+    """Real E2E case: all 5 evidence came from one RF-DETR paper."""
+    state = isolated_engine.create_session("Compare YOLOv8 and RT-DETR accuracy and latency on COCO")
+    one_paper = [
+        {"chunk_id": f"rf_{i}", "doc_id": "doc_rfdetr", "text": f"RF-DETR matches YOLOv8 in bucket {i}."}
+        for i in range(6)
+    ]
+    rt_detr_chunk = {"chunk_id": "rt_0", "doc_id": "doc_rtdetr", "text": "RT-DETR-R50 reaches 53.1 AP on COCO."}
+
+    selected = isolated_engine._select_chunks_for_extraction(state, one_paper + [rt_detr_chunk], limit=5)
+    ids = [c["chunk_id"] for c in selected]
+
+    assert "rt_0" in ids
+    # Per-document cap applies while other documents can still fill slots
+    assert sum(1 for c in selected if c["doc_id"] == "doc_rfdetr") <= 4
+    assert ids.index("rt_0") <= 1  # RT-DETR gets its round-robin turn early
+
+
+def test_planner_and_query_prompts_forbid_running_experiments(isolated_engine):
+    """Real E2E case: planner produced 'Train YOLOv8 model on COCO'; queries searched max_connections."""
+    from backend.core.state import ResearchPhase
+
+    state = isolated_engine.create_session("Compare PostgreSQL and MySQL on TPC-C")
+    isolated_engine.run_plan_phase(state)
+    isolated_engine.run_search_phase(state)
+
+    prompts = [call["prompt"] for call in isolated_engine.llm.call_history]
+    assert "Do NOT plan to run experiments" in prompts[0]
+    assert "Do NOT search for configuration parameters" in prompts[1]
+    assert state.phase == ResearchPhase.SEARCH

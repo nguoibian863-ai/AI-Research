@@ -110,6 +110,40 @@ def expand_quote_to_sentence(start_idx: int, end_idx: int, text: str) -> Tuple[i
     return sent_start, sent_end, expanded
 
 
+# Minimum share of a statement's content words that must appear in its verbatim quote.
+STATEMENT_MIN_OVERLAP = 0.5
+
+_STATEMENT_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "by", "for", "with", "from", "as",
+    "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those", "it", "its",
+    "which", "while", "than", "also", "both", "all", "each", "into", "over", "under", "about",
+    "has", "have", "had", "can", "could", "will", "would", "such", "their", "they", "them", "we", "our",
+}
+
+
+def _content_tokens(text: str) -> List[str]:
+    tokens = re.findall(r"[a-z0-9][a-z0-9_.+-]*", (text or "").lower())
+    return [t.rstrip(".-") for t in tokens if t.rstrip(".-") and t.rstrip(".-") not in _STATEMENT_STOPWORDS]
+
+
+def statement_quote_overlap(statement: str, quote: str) -> float:
+    """
+    Share of the statement's content words found in the quote.
+    Light stemming: tokens of length >= 6 also match a quote token sharing their first 5 characters
+    (achieves/achieved, evaluation/evaluated).
+    """
+    stmt_tokens = _content_tokens(statement)
+    if not stmt_tokens:
+        return 1.0
+    quote_tokens = set(_content_tokens(quote))
+    quote_prefixes = {q[:5] for q in quote_tokens if len(q) >= 6}
+    hits = sum(
+        1 for t in stmt_tokens
+        if t in quote_tokens or (len(t) >= 6 and t[:5] in quote_prefixes)
+    )
+    return hits / len(stmt_tokens)
+
+
 def verify_atomic_fact(
     fact: AtomicFactItemSchema,
     target_chunk: Dict[str, Any],
@@ -201,6 +235,15 @@ def verify_atomic_fact(
                     # For non-dataset competitor entities, must be grounded in quote or chunk
                     if not check_entity_in_text(ent, quote_lower) and not check_entity_in_text(ent, chunk_text_lower):
                         return False, f"UNSUPPORTED_COMPARISON: foreign entity '{ent}' in statement not found in verbatim quote or chunk"
+
+    # 6. Statement grounding: the statement must restate the quote, not add new content
+    if fact.statement:
+        overlap = statement_quote_overlap(fact.statement, verified_quote)
+        if overlap < STATEMENT_MIN_OVERLAP:
+            return False, (
+                f"STATEMENT_NOT_GROUNDED: only {overlap:.0%} of statement content words appear in quote "
+                f"(min {STATEMENT_MIN_OVERLAP:.0%})"
+            )
 
     return True, "VERIFIED"
 

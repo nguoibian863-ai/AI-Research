@@ -253,6 +253,36 @@ def extract_substantive_numbers(text: str) -> List[str]:
     return substantive
 
 
+def text_mentions_entity(text: str, entity: str) -> bool:
+    """
+    Whole-word mention that also accepts model-variant suffixes for entities of length >= 3:
+    'rt-detr' matches 'RT-DETR-R50', 'yolov8' matches 'YOLOv8n' / 'YOLOv8-L'.
+    Short entities (e.g. 'go') still require an exact whole-word match.
+    """
+    if not text or not entity:
+        return False
+    if check_entity_in_text(entity, text):
+        return True
+    ent = entity.lower()
+    if len(ent) < 3:
+        return False
+    return bool(re.search(rf"(?<![a-z0-9_-]){re.escape(ent)}[a-z0-9_-]*", text.lower()))
+
+
+def subject_matches_entity(subject: str, entity: str) -> bool:
+    """
+    True when an evidence subject names the entity, allowing variant suffixes
+    (entity 'yolov8' matches subjects 'YOLOv8', 'YOLOv8n', 'YOLOv8-L'; 'rt-detr' matches 'RT-DETR-R50').
+    """
+    if not subject or not entity:
+        return False
+    ent = entity.lower()
+    if check_entity_in_text(ent, subject):
+        return True
+    tokens = re.findall(r"[a-z0-9][a-z0-9_.-]*", subject.lower())
+    return len(ent) >= 3 and any(tok.startswith(ent) for tok in tokens)
+
+
 def evaluate_evidence_coverage(
     entities: List[str],
     evidence_items: List[Dict[str, Any]]
@@ -272,13 +302,9 @@ def evaluate_evidence_coverage(
 
     covered = []
     for ent in entities:
-        ent_found = False
-        for ev in evidence_items:
-            ev_text = f"{ev.get('subject', '')} {ev.get('predicate', '')} {ev.get('statement', '')} {ev.get('exact_quote', '')} {ev.get('raw_quote', '')}"
-            if check_entity_in_text(ent, ev_text):
-                ent_found = True
-                break
-        if ent_found:
+        # An entity is covered only when it is the SUBJECT of some evidence.
+        # A paper about model C that merely mentions A and B does not cover A or B.
+        if any(subject_matches_entity(ev.get("subject", ""), ent) for ev in evidence_items):
             covered.append(ent)
 
     missing = [e for e in entities if e not in covered]
