@@ -19,7 +19,7 @@ llm:
   profiles:
     laptop_4gb:
       model: "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M"
-      context_window: 4096
+      context_window: 2048
       max_output_tokens: 1024
     high_memory:
       model: "qwen3:8b"
@@ -30,14 +30,14 @@ llm:
     model: "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M"
     # SmolLM3 reasoning is toggled by a system-prompt flag; "/no_think" keeps JSON output clean.
     system_prefix: "/no_think"
-    context_window: 4096
+    context_window: 2048
     max_output_tokens: 1024
-    timeout_seconds: 120
+    timeout_seconds: 180
     temperature: 0.1
   llama_cpp:
     base_url: "http://127.0.0.1:8080"
     model: "smollm3-3b"
-  context_window: 4096
+  context_window: 2048
   max_output_tokens: 1024
 
 limits:
