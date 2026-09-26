@@ -52,6 +52,16 @@ BLOCKED_DOMAINS = {
     "tiktok.com", "quora.com", "youtube.com"
 }
 
+GENERIC_RESEARCH_TERMS = {
+    "the", "and", "for", "with", "from", "that", "this", "which", "what", "how",
+    "why", "where", "when", "does", "did", "are", "were", "been", "has", "have",
+    "had", "not", "but", "can", "could", "will", "would", "about", "into", "over",
+    "after", "compare", "comparison", "eval", "evaluation", "evaluating", "evaluate",
+    "benchmark", "benchmarks", "performance", "overview", "review", "summary",
+    "analysis", "study", "article", "report", "guide", "post", "blog", "paper", "papers",
+    "test", "tests", "testing"
+}
+
 
 class ResearchEngine:
     def __init__(
@@ -74,15 +84,7 @@ class ResearchEngine:
         self.fetch_tool = fetch_tool or WebFetchTool()
         self.pdf_tool = pdf_tool or PDFFetchTool()
         self.chunker = chunker or SectionAwareChunker(max_chunk_tokens=self.limits.max_chunk_tokens)
-        if embedding_backend is not None:
-            self.embedding_backend = embedding_backend
-        else:
-            try:
-                from backend.retrieval.embeddings import FastEmbedEmbeddingBackend
-                self.embedding_backend = FastEmbedEmbeddingBackend()
-            except Exception as e:
-                logger.info(f"Using LocalHashEmbeddingBackend as default fallback ({e}).")
-                self.embedding_backend = LocalHashEmbeddingBackend()
+        self.embedding_backend = embedding_backend or LocalHashEmbeddingBackend()
         
         # Per-session hybrid retrievers (BM25 + FAISS isolation)
 
@@ -384,18 +386,23 @@ class ResearchEngine:
                             logger.info(f"[{state.session_id}][SEARCH] Skipping blocked domain: {domain}")
                             continue
 
-                        # Relevance filter: skip items with zero substantive keyword match
+                        # Relevance filter: whole-word matching against core entities of goal & query
                         query_and_goal = f"{state.goal} {q}".lower()
-                        goal_tokens = {
-                            w for w in re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", query_and_goal)
-                            if w not in {
-                                "the", "and", "for", "with", "from", "that", "this", "which",
-                                "what", "how", "why", "where", "when", "does", "compare", "vs"
+                        raw_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", query_and_goal))
+                        # Primary: core entities (excluding generic research terms and stop words)
+                        core_entities = {t for t in raw_tokens if t not in GENERIC_RESEARCH_TERMS and len(t) >= 3}
+                        if not core_entities:
+                            # Fallback if query/goal consists entirely of generic terms (e.g. minimal unit tests)
+                            basic_stops = {
+                                "the", "and", "for", "with", "from", "that", "this", "which", "what",
+                                "how", "why", "where", "when", "does", "did", "are", "were", "been"
                             }
-                        }
-                        item_text = f"{item.title} {item.snippet} {item.url}".lower()
-                        if goal_tokens and not any(t in item_text for t in goal_tokens):
-                            logger.info(f"[{state.session_id}][SEARCH] Skipping irrelevant search result: {item.title}")
+                            core_entities = {t for t in raw_tokens if t not in basic_stops and len(t) >= 2}
+
+                        # Tokenize item title, snippet, and URL path into discrete whole words
+                        item_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", f"{item.title} {item.snippet} {url}".lower()))
+                        if core_entities and not (core_entities & item_tokens):
+                            logger.info(f"[{state.session_id}][SEARCH] Skipping irrelevant search result (no core entity match): '{item.title}'")
                             continue
 
                         if url not in existing_urls and url not in found_urls:

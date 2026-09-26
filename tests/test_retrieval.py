@@ -183,6 +183,7 @@ def test_api_clean_and_retrieve_endpoints(client, isolated_engine):
     assert "71.2 NDS" in data["results"][0]["text"]
 
 
+@pytest.mark.slow
 def test_fastembed_true_semantic_paraphrasing(tmp_path):
     """
     P0 Test: True semantic search with paraphrased query without shared vocabulary.

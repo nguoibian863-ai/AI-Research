@@ -183,3 +183,57 @@ def test_engine_search_skips_blocked_domains(tmp_path):
     assert "m.facebook.com" not in domains
     assert "x.com" not in domains
 
+
+def test_engine_search_relevance_whole_words_and_core_entities(tmp_path):
+    """
+    Issue #1 Regression Test:
+    Search relevance filtering must:
+    1. Match discrete whole words (e.g., 'map' must NOT match 'sitemap', 'nds' must NOT match 'friends').
+    2. Focus on core domain entities of goal/query, ignoring generic research terms ('benchmark', 'accuracy').
+    """
+    from backend.tools.web_search import SearchResultItem
+
+    class RelevanceSearchTool:
+        def search(self, query: str, max_results: int = 5):
+            return [
+                SearchResultItem(
+                    title="Store Navigation",
+                    url="https://store.example.com/sitemap.xml",
+                    snippet="Download the sitemap for our online retail store."
+                ),
+                SearchResultItem(
+                    title="Social Status",
+                    url="https://quotes.example.com/status",
+                    snippet="Best friends forever - WhatsApp status quotes."
+                ),
+                SearchResultItem(
+                    title="Mobile Hardware Review",
+                    url="https://phones.example.com/review",
+                    snippet="Top 10 benchmark phones 2026 performance review."
+                ),
+                SearchResultItem(
+                    title="YOLOv8 Object Detection Benchmark",
+                    url="https://docs.ultralytics.com/models/yolov8",
+                    snippet="Comprehensive YOLOv8 mAP accuracy and latency benchmark on COCO dataset."
+                )
+            ]
+
+    db = DatabaseManager(db_path=tmp_path / "relevance.db")
+    engine = ResearchEngine(
+        llm=MockLLMBackend(),
+        db=db,
+        search_tool=RelevanceSearchTool()
+    )
+
+    state = engine.create_session("Compare YOLOv8 and RT-DETR accuracy and latency on COCO")
+    state.phase = ResearchPhase.PLAN
+    engine.save_state(state)
+
+    found_urls = engine.run_search_phase(state, custom_queries=["yolov8 coco latency"])
+
+    # Only ultralytics YOLOv8 doc must be retained!
+    # sitemap, friends (WhatsApp), and benchmark phones must all be discarded!
+    assert len(found_urls) == 1
+    assert "docs.ultralytics.com" in found_urls[0]
+
+

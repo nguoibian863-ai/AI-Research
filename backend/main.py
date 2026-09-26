@@ -68,15 +68,19 @@ def get_research_engine() -> ResearchEngine:
                 embedding_backend = FastEmbedEmbeddingBackend(model_name=emb_model)
                 logger.info(f"Loaded FastEmbedEmbeddingBackend with model: {emb_model}")
             except Exception as e:
-                logger.warning(f"Could not load FastEmbed ({e}). Falling back to LocalHashEmbeddingBackend.")
-                from backend.retrieval.embeddings import LocalHashEmbeddingBackend
-                embedding_backend = LocalHashEmbeddingBackend()
+                logger.error(f"Failed to load configured FastEmbed model '{emb_model}': {e}")
+                raise RuntimeError(
+                    f"Configured embedding backend 'fastembed' failed to load model '{emb_model}' ({e}). "
+                    f"Check internet connection or pre-cached models in ~/.cache/fastembed."
+                ) from e
         elif emb_type == "ollama":
             from backend.retrieval.embeddings import OllamaEmbeddingBackend
             embedding_backend = OllamaEmbeddingBackend(model=emb_model)
-        else:
+        elif emb_type in {"hash", "local_hash"}:
             from backend.retrieval.embeddings import LocalHashEmbeddingBackend
             embedding_backend = LocalHashEmbeddingBackend()
+        else:
+            raise ValueError(f"Unknown embedding backend type: '{emb_type}'")
 
         _engine_instance = ResearchEngine(
             llm=llm_backend,
@@ -179,10 +183,12 @@ app.include_router(research_router)
 @app.get("/health")
 def health_check(engine: ResearchEngine = Depends(get_engine)):
     provider = "ollama" if isinstance(engine.llm, OllamaBackend) else "mock"
+    emb_name = engine.embedding_backend.__class__.__name__ if engine.embedding_backend else "None"
     return {
         "status": "healthy",
         "llm_provider": provider,
         "model": getattr(engine.llm, "model", "mock"),
+        "embedding_backend": emb_name,
         "database": str(engine.db.db_path)
     }
 

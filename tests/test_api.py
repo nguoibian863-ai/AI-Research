@@ -8,6 +8,7 @@ def test_health_endpoint(client):
     data = response.json()
     assert data["status"] == "healthy"
     assert "llm_provider" in data
+    assert "embedding_backend" in data
     assert "database" in data
 
 

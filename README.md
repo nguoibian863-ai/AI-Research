@@ -33,7 +33,7 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 - **Calibrated Score Reranker (`ScoreReranker`):** Multi-signal reranker with calibrated scaling ($1 / (K + 1)$) preventing boost explosion over RRF fusion; filters stop words and applies precise phrase and numerical target boosts.
 - **Per-Session Isolated Hybrid Retrieval (`HybridRetriever`):** Combines BM25 and FAISS results using standard RRF fusion ($k=60$) with per-session instance isolation (`get_session_retriever(session_id)`).
 - **End-to-End & REST Integration:** Pipeline routes `.pdf` URLs and `application/pdf` headers to `PDFFetchTool`, records author and publication date metadata in SQLite `sources`, and provides read-only `/session/{id}/retrieve` queries.
-- **Automated Test Coverage:** 45/45 tests passing with air-gapped test container safety.
+- **Automated Test Coverage:** 46/46 tests passing in ~2s with isolated fixtures and air-gapped test container safety.
 - **Review & Validation:** see [`docs/week2_review.md`](docs/week2_review.md).
 
 ### 📅 Weeks 3–5: Evidence, Verification, UI & Benchmark (Roadmap)
