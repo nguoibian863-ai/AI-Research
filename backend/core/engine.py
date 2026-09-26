@@ -13,7 +13,7 @@ from backend.core.state import (
 from backend.core.limits import ResearchLimits
 from backend.core.budget import ExecutionBudgetTracker
 from backend.core.transitions import StateMachine
-from backend.core.errors import BudgetExceededError, StateTransitionError
+from backend.core.errors import BudgetExceededError, StateTransitionError, ResearchException
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ResearchPlanSchema, GeneratedQueriesSchema
 from backend.db.database import DatabaseManager
@@ -61,12 +61,23 @@ class ResearchEngine:
         self.report_repo = ReportRepository(self.db)
         self.trajectory_repo = TrajectoryRepository(self.db)
 
-        # Session Budget Trackers
+        # Session Budget Trackers (cached in-memory, backed by SQLite)
         self._budget_trackers: Dict[str, ExecutionBudgetTracker] = {}
 
     def get_budget_tracker(self, session_id: str) -> ExecutionBudgetTracker:
         if session_id not in self._budget_trackers:
-            self._budget_trackers[session_id] = ExecutionBudgetTracker(limits=self.limits)
+            row = self.session_repo.get(session_id)
+            if row:
+                self._budget_trackers[session_id] = ExecutionBudgetTracker(
+                    limits=self.limits,
+                    search_calls=row.get("search_calls") or 0,
+                    fetch_calls=row.get("fetch_calls") or 0,
+                    llm_calls=row.get("llm_calls") or 0,
+                    tokens_consumed=row.get("tokens_consumed") or 0,
+                    step_count=row.get("step") or 0
+                )
+            else:
+                self._budget_trackers[session_id] = ExecutionBudgetTracker(limits=self.limits)
         return self._budget_trackers[session_id]
 
     def create_session(self, goal: str, session_id: Optional[str] = None) -> ResearchState:
@@ -113,6 +124,16 @@ class ResearchEngine:
         evidence_ids = self.evidence_repo.get_ids_by_session(session_id)
         claim_ids = self.claim_repo.get_ids_by_session(session_id)
 
+        # Restore budget tracker with persistent counters
+        self._budget_trackers[session_id] = ExecutionBudgetTracker(
+            limits=self.limits,
+            search_calls=row.get("search_calls") or 0,
+            fetch_calls=row.get("fetch_calls") or 0,
+            llm_calls=row.get("llm_calls") or 0,
+            tokens_consumed=row.get("tokens_consumed") or 0,
+            step_count=row.get("step") or 0
+        )
+
         state = ResearchState(
             session_id=session_id,
             goal=row["goal"],
@@ -124,7 +145,8 @@ class ResearchEngine:
             open_questions=open_questions,
             step=row["step"],
             phase=ResearchPhase(row["phase"]),
-            status=ResearchStatus(row["status"])
+            status=ResearchStatus(row["status"]),
+            error_message=row.get("error_message")
         )
         logger.info(
             f"[{session_id}][RESTORE] Full state restored: phase={state.phase.value}, step={state.step}, "
@@ -133,237 +155,284 @@ class ResearchEngine:
         return state
 
     def save_state(self, state: ResearchState) -> None:
-        """Persists ResearchState updates to SQLite."""
+        """Persists ResearchState and cumulative budget counters to SQLite."""
         plan_json = state.plan.model_dump_json() if state.plan else None
         open_q_json = json.dumps([q.model_dump() for q in state.open_questions])
+        budget = self._budget_trackers.get(state.session_id)
+
         self.session_repo.update_state(
             session_id=state.session_id,
             phase=state.phase.value,
             step=state.step,
             status=state.status.value,
             plan_json=plan_json,
-            open_questions_json=open_q_json
+            open_questions_json=open_q_json,
+            error_message=state.error_message,
+            search_calls=budget.search_calls if budget else None,
+            fetch_calls=budget.fetch_calls if budget else None,
+            llm_calls=budget.llm_calls if budget else None,
+            tokens_consumed=budget.total_tokens_consumed if budget else None
         )
+
+    def _handle_phase_error(self, state: ResearchState, error: Exception, phase_name: str) -> None:
+        """Transitions state to FAILED or PARTIAL upon unhandled exception and saves error context."""
+        logger.error(f"[{state.session_id}][{phase_name}] Failure: {error}", exc_info=True)
+        state.error_message = str(error)
+        target_phase = ResearchPhase.PARTIAL if state.source_ids else ResearchPhase.FAILED
+        try:
+            self.state_machine.transition(state, target_phase, reason=f"Error in {phase_name}: {error}")
+        except Exception:
+            state.phase = target_phase
+            state.status = ResearchStatus.PARTIAL if target_phase == ResearchPhase.PARTIAL else ResearchStatus.FAILED
+        self.save_state(state)
 
     def run_plan_phase(self, state: ResearchState) -> None:
         """Executes the PLAN phase with strict budget checks."""
-        budget = self.get_budget_tracker(state.session_id)
-        budget.assert_can_call_llm()
+        try:
+            budget = self.get_budget_tracker(state.session_id)
+            budget.assert_can_call_llm()
 
-        self.state_machine.transition(state, ResearchPhase.PLAN, reason="Starting research plan")
-        prompt = (
-            f"You are a Senior Research Planner. Given the following research question, "
-            f"break it down into 3-5 concrete, factual investigation sub-tasks and identify core hypotheses to test.\n\n"
-            f"Question: {state.goal}"
-        )
-        res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema)
-        budget.record_llm_call(tokens=res.total_tokens)
-
-        plan_data: ResearchPlanSchema = res.parsed
-        tasks = [
-            PlanTask(
-                task_id=t.task_id,
-                description=t.description,
-                expected_evidence=t.expected_evidence
+            self.state_machine.transition(state, ResearchPhase.PLAN, reason="Starting research plan")
+            prompt = (
+                f"You are a Senior Research Planner. Given the following research question, "
+                f"break it down into 3-5 concrete, factual investigation sub-tasks and identify core hypotheses to test.\n\n"
+                f"Question: {state.goal}"
             )
-            for t in plan_data.tasks
-        ]
-        state.plan = ResearchPlan(
-            goal=state.goal,
-            tasks=tasks,
-            key_hypotheses=plan_data.key_hypotheses
-        )
+            res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema)
+            budget.record_llm_call(tokens=res.total_tokens)
 
-        self.save_state(state)
+            plan_data: ResearchPlanSchema = res.parsed
+            tasks = [
+                PlanTask(
+                    task_id=t.task_id,
+                    description=t.description,
+                    expected_evidence=t.expected_evidence
+                )
+                for t in plan_data.tasks
+            ]
+            state.plan = ResearchPlan(
+                goal=state.goal,
+                tasks=tasks,
+                key_hypotheses=plan_data.key_hypotheses
+            )
 
-        # Save trajectory sample in raw partition
-        self.trajectory_repo.add(
-            trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
-            session_id=state.session_id,
-            task_type="planning",
-            model_source=getattr(self.llm, "model", "mock"),
-            payload={"goal": state.goal, "plan": state.plan.model_dump()},
-            partition="raw"
-        )
-        logger.info(f"[{state.session_id}][PLAN] Plan generated with {len(tasks)} tasks.")
+            self.save_state(state)
+
+            # Save trajectory sample in raw partition
+            self.trajectory_repo.add(
+                trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
+                session_id=state.session_id,
+                task_type="planning",
+                model_source=getattr(self.llm, "model", "mock"),
+                payload={"goal": state.goal, "plan": state.plan.model_dump()},
+                partition="raw"
+            )
+            logger.info(f"[{state.session_id}][PLAN] Plan generated with {len(tasks)} tasks.")
+        except Exception as e:
+            self._handle_phase_error(state, e, "PLAN")
+            raise
 
     def run_search_phase(self, state: ResearchState, custom_queries: Optional[List[str]] = None) -> List[str]:
         """Generates targeted search queries and executes web search with URL deduplication & source limits."""
-        budget = self.get_budget_tracker(state.session_id)
-        self.state_machine.transition(state, ResearchPhase.SEARCH, reason="Executing web search")
+        try:
+            budget = self.get_budget_tracker(state.session_id)
+            self.state_machine.transition(state, ResearchPhase.SEARCH, reason="Executing web search")
 
-        queries_to_run = custom_queries or []
-        if not queries_to_run:
-            budget.assert_can_call_llm()
-            prompt = (
-                f"Based on the research goal and plan, generate 2-4 search queries across categories "
-                f"(discovery, evidence, verification, contradiction) to gather required facts.\n\n"
-                f"Goal: {state.goal}\n"
-                f"Plan: {state.plan.model_dump_json() if state.plan else ''}\n"
-                f"Previously visited: {state.visited_queries}"
-            )
-            res = self.llm.structured_generate(prompt, schema=GeneratedQueriesSchema)
-            budget.record_llm_call(tokens=res.total_tokens)
-            generated: GeneratedQueriesSchema = res.parsed
-            queries_to_run = [q.query for q in generated.queries]
-
-        existing_urls = self.source_repo.get_urls_by_session(state.session_id)
-        found_urls: List[str] = []
-
-        for q in queries_to_run:
-            if not budget.can_search():
-                logger.warning(f"[{state.session_id}][SEARCH] Search budget exhausted ({budget.search_calls} calls). Skipping query: {q}")
-                break
-
-            if q not in state.visited_queries:
-                state.visited_queries.append(q)
-                self.query_repo.add(
-                    query_id=f"qry_{uuid.uuid4().hex[:8]}",
-                    session_id=state.session_id,
-                    query_text=q,
-                    query_type="discovery"
+            queries_to_run = custom_queries or []
+            if not queries_to_run:
+                budget.assert_can_call_llm()
+                prompt = (
+                    f"Based on the research goal and plan, generate 2-4 search queries across categories "
+                    f"(discovery, evidence, verification, contradiction) to gather required facts.\n\n"
+                    f"Goal: {state.goal}\n"
+                    f"Plan: {state.plan.model_dump_json() if state.plan else ''}\n"
+                    f"Previously visited: {state.visited_queries}"
                 )
-                budget.record_search()
+                res = self.llm.structured_generate(prompt, schema=GeneratedQueriesSchema)
+                budget.record_llm_call(tokens=res.total_tokens)
+                generated: GeneratedQueriesSchema = res.parsed
+                queries_to_run = [q.query for q in generated.queries]
 
-                items = self.search_tool.search(q, max_results=self.limits.max_search_results)
-                for item in items:
-                    # Enforce max sources limit
-                    if len(state.source_ids) >= self.limits.max_sources_per_run:
-                        logger.info(f"[{state.session_id}][SEARCH] Reached max_sources_per_run limit ({self.limits.max_sources_per_run}).")
-                        break
+            existing_urls = self.source_repo.get_urls_by_session(state.session_id)
+            found_urls: List[str] = []
 
-                    url = item.url.strip() if item.url else ""
-                    if url and url not in existing_urls and url not in found_urls:
-                        found_urls.append(url)
-                        existing_urls.add(url)
-                        source_id = f"src_{uuid.uuid4().hex[:8]}"
-                        state.source_ids.append(source_id)
+            for q in queries_to_run:
+                if not budget.can_search():
+                    logger.warning(f"[{state.session_id}][SEARCH] Search budget exhausted ({budget.search_calls} calls). Skipping query: {q}")
+                    break
+
+                if q not in state.visited_queries:
+                    state.visited_queries.append(q)
+                    self.query_repo.add(
+                        query_id=f"qry_{uuid.uuid4().hex[:8]}",
+                        session_id=state.session_id,
+                        query_text=q,
+                        query_type="discovery"
+                    )
+                    budget.record_search()
+
+                    items = self.search_tool.search(q, max_results=self.limits.max_search_results)
+                    for item in items:
+                        if len(state.source_ids) >= self.limits.max_sources_per_run:
+                            logger.info(f"[{state.session_id}][SEARCH] Reached max_sources_per_run limit ({self.limits.max_sources_per_run}).")
+                            break
+
+                        url = item.url.strip() if item.url else ""
+                        if url and url not in existing_urls and url not in found_urls:
+                            found_urls.append(url)
+                            existing_urls.add(url)
+                            source_id = f"src_{uuid.uuid4().hex[:8]}"
+                            state.source_ids.append(source_id)
+                            domain = url.split("/")[2] if "://" in url else ""
+                            self.source_repo.add(
+                                source_id=source_id,
+                                session_id=state.session_id,
+                                url=url,
+                                title=item.title,
+                                domain=domain,
+                                canonical_key=url.lower().rstrip("/")
+                            )
+
+            self.save_state(state)
+            logger.info(f"[{state.session_id}][SEARCH] Completed. Found {len(found_urls)} new URLs, total sources: {len(state.source_ids)}.")
+            return found_urls
+        except Exception as e:
+            self._handle_phase_error(state, e, "SEARCH")
+            raise
+
+    def run_fetch_phase(self, state: ResearchState, urls: Optional[List[str]] = None) -> List[FetchedWebContent]:
+        """
+        Fetches web pages, cleans HTML via Trafilatura, stores document in SQLite.
+        NOTE: Does NOT write arbitrary dummy raw evidence (resolves P0 evidence corruption).
+        """
+        try:
+            budget = self.get_budget_tracker(state.session_id)
+            self.state_machine.transition(state, ResearchPhase.FETCH, reason="Fetching source documents")
+
+            # Accurate fallback: If urls is provided (even if []), use it directly
+            if urls is not None:
+                target_urls = urls
+            else:
+                sources = self.source_repo.get_by_session(state.session_id)
+                target_urls = [s["url"] for s in sources if s.get("url")]
+
+            fetched_documents: List[FetchedWebContent] = []
+            sources = self.source_repo.get_by_session(state.session_id)
+
+            for url in target_urls:
+                if not budget.can_fetch():
+                    logger.warning(f"[{state.session_id}][FETCH] Fetch budget exhausted ({budget.fetch_calls} calls). Skipping: {url}")
+                    break
+
+                budget.record_fetch()
+                fetched = self.fetch_tool.fetch(url)
+                if fetched and fetched.text:
+                    fetched_documents.append(fetched)
+
+                    # Accurately match source or create source for this URL (resolves P0 source misattribution)
+                    matching_source = next((s for s in sources if s["url"] == url), None)
+                    if not matching_source:
                         domain = url.split("/")[2] if "://" in url else ""
+                        source_id = f"src_{uuid.uuid4().hex[:8]}"
                         self.source_repo.add(
                             source_id=source_id,
                             session_id=state.session_id,
                             url=url,
-                            title=item.title,
+                            title=fetched.title or url,
                             domain=domain,
                             canonical_key=url.lower().rstrip("/")
                         )
+                        if source_id not in state.source_ids:
+                            state.source_ids.append(source_id)
+                    else:
+                        source_id = matching_source["source_id"]
 
-        self.save_state(state)
-        logger.info(f"[{state.session_id}][SEARCH] Completed. Found {len(found_urls)} new URLs, total sources: {len(state.source_ids)}.")
-        return found_urls
+                    # Save document
+                    doc_id = f"doc_{uuid.uuid4().hex[:8]}"
+                    self.doc_repo.add(
+                        doc_id=doc_id,
+                        source_id=source_id,
+                        file_path=None,
+                        content_hash=fetched.content_hash,
+                        raw_text=fetched.text
+                    )
 
-    def run_fetch_phase(self, state: ResearchState, urls: Optional[List[str]] = None) -> List[FetchedWebContent]:
-        """Fetches web pages, cleans HTML via Trafilatura, stores document and raw evidence baseline."""
-        budget = self.get_budget_tracker(state.session_id)
-        self.state_machine.transition(state, ResearchPhase.FETCH, reason="Fetching source documents")
-
-        sources = self.source_repo.get_by_session(state.session_id)
-        target_urls = urls or [s["url"] for s in sources if s.get("url")]
-
-        fetched_documents: List[FetchedWebContent] = []
-
-        for url in target_urls:
-            if not budget.can_fetch():
-                logger.warning(f"[{state.session_id}][FETCH] Fetch budget exhausted ({budget.fetch_calls} calls). Skipping: {url}")
-                break
-
-            budget.record_fetch()
-            fetched = self.fetch_tool.fetch(url)
-            if fetched and fetched.text:
-                fetched_documents.append(fetched)
-                # Find matching source
-                matching_source = next((s for s in sources if s["url"] == url), None)
-                source_id = matching_source["source_id"] if matching_source else state.source_ids[0]
-
-                # Save document
-                doc_id = f"doc_{uuid.uuid4().hex[:8]}"
-                self.doc_repo.add(
-                    doc_id=doc_id,
-                    source_id=source_id,
-                    file_path=None,
-                    content_hash=fetched.content_hash,
-                    raw_text=fetched.text
-                )
-
-                # Register raw evidence baseline
-                raw_ev_id = f"raw_{uuid.uuid4().hex[:8]}"
-                sample_quote = fetched.text[:300].strip()
-                self.raw_evidence_repo.add(
-                    raw_evidence_id=raw_ev_id,
-                    session_id=state.session_id,
-                    source_id=source_id,
-                    raw_quote=sample_quote,
-                    char_start=0,
-                    char_end=len(sample_quote)
-                )
-
-        self.save_state(state)
-        logger.info(f"[{state.session_id}][FETCH] Fetched {len(fetched_documents)} documents successfully.")
-        return fetched_documents
+            self.save_state(state)
+            logger.info(f"[{state.session_id}][FETCH] Fetched {len(fetched_documents)} documents successfully.")
+            return fetched_documents
+        except Exception as e:
+            self._handle_phase_error(state, e, "FETCH")
+            raise
 
     def run_basic_answer(self, state: ResearchState, fetched_docs: List[FetchedWebContent]) -> str:
-        """Week 1 Deliverable: Synthesizes a grounded initial answer from fetched sources."""
-        budget = self.get_budget_tracker(state.session_id)
-        budget.assert_can_call_llm()
+        """
+        Synthesizes a grounded initial answer from fetched sources.
+        Records unverified trajectory strictly in 'raw' partition (resolves P0 fake confidence).
+        """
+        try:
+            budget = self.get_budget_tracker(state.session_id)
+            budget.assert_can_call_llm()
 
-        # Build context from fetched documents
-        context_snippets = []
-        for i, doc in enumerate(fetched_docs[:5], start=1):
-            snippet = doc.text[:1200]
-            context_snippets.append(f"--- Source [{i}] ({doc.url}) ---\n{snippet}\n")
-        full_context = "\n".join(context_snippets) if context_snippets else "No external documents retrieved."
+            # Build context from fetched documents
+            context_snippets = []
+            for i, doc in enumerate(fetched_docs[:5], start=1):
+                snippet = doc.text[:1200]
+                context_snippets.append(f"--- Source [{i}] ({doc.url}) ---\n{snippet}\n")
+            full_context = "\n".join(context_snippets) if context_snippets else "No external documents retrieved."
 
-        prompt = (
-            f"You are a Research Analyst. Provide a clear, factual, and grounded answer to the question "
-            f"based strictly on the gathered context.\n\n"
-            f"Question: {state.goal}\n\n"
-            f"Gathered Evidence Context:\n{full_context}\n\n"
-            f"Synthesize the key findings, metrics, and comparisons directly addressing the question."
-        )
+            prompt = (
+                f"You are a Research Analyst. Provide a clear, factual, and grounded answer to the question "
+                f"based strictly on the gathered context.\n\n"
+                f"Question: {state.goal}\n\n"
+                f"Gathered Evidence Context:\n{full_context}\n\n"
+                f"Synthesize the key findings, metrics, and comparisons directly addressing the question."
+            )
 
-        # Transition to WRITE phase
-        self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
-        res = self.llm.generate(prompt)
-        budget.record_llm_call(tokens=res.total_tokens)
-        answer = res.content.strip()
+            # Transition to WRITE phase
+            self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
+            res = self.llm.generate(prompt)
+            budget.record_llm_call(tokens=res.total_tokens)
+            answer = res.content.strip()
 
-        # Transition state to DONE (or PARTIAL if no docs)
-        target_phase = ResearchPhase.DONE if fetched_docs else ResearchPhase.PARTIAL
-        self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
-        self.save_state(state)
+            # Transition state to DONE (or PARTIAL if no docs)
+            target_phase = ResearchPhase.DONE if fetched_docs else ResearchPhase.PARTIAL
+            self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
+            self.save_state(state)
 
-        # Save report
-        report_id = f"rep_{uuid.uuid4().hex[:8]}"
-        self.report_repo.create(
-            report_id=report_id,
-            session_id=state.session_id,
-            title=f"Research: {state.goal[:60]}",
-            content_markdown=answer,
-            status=state.status.value
-        )
+            # Save report
+            report_id = f"rep_{uuid.uuid4().hex[:8]}"
+            self.report_repo.create(
+                report_id=report_id,
+                session_id=state.session_id,
+                title=f"Research: {state.goal[:60]}",
+                content_markdown=answer,
+                status=state.status.value
+            )
 
-        # Save final trajectory
-        self.trajectory_repo.add(
-            trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
-            session_id=state.session_id,
-            task_type="answer_synthesis",
-            model_source=getattr(self.llm, "model", "mock"),
-            payload={"goal": state.goal, "answer": answer, "sources_count": len(fetched_docs)},
-            verified=True if fetched_docs else False,
-            quality_score=0.90 if fetched_docs else 0.50,
-            partition="candidate"
-        )
+            # Save final trajectory into 'raw' partition with verified=False (resolves P0 fake confidence)
+            self.trajectory_repo.add(
+                trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
+                session_id=state.session_id,
+                task_type="answer_synthesis",
+                model_source=getattr(self.llm, "model", "mock"),
+                payload={"goal": state.goal, "answer": answer, "sources_count": len(fetched_docs)},
+                verified=False,
+                quality_score=0.0,
+                partition="raw"
+            )
 
-        logger.info(f"[{state.session_id}][ANSWER] Final report saved (report_id={report_id}, status={state.status.value}).")
-        return answer
+            logger.info(f"[{state.session_id}][ANSWER] Final report saved (report_id={report_id}, status={state.status.value}).")
+            return answer
+        except Exception as e:
+            self._handle_phase_error(state, e, "WRITE")
+            raise
 
     def run_week1(self, session_or_goal: Union[ResearchState, str]) -> Dict[str, Any]:
         """
-        Week 1 End-to-End Orchestrator:
-        Question -> PLAN -> SEARCH -> FETCH -> ANSWER -> DONE
+        Week 1 End-to-End Orchestrator with real EVALUATE loop and step enforcement:
+        Question -> PLAN -> (SEARCH -> FETCH -> EVALUATE)* -> WRITE -> DONE / PARTIAL
         """
         if isinstance(session_or_goal, str):
-            # Check if existing session_id or new goal
             if session_or_goal.startswith("sess_") and self.session_repo.get(session_or_goal):
                 state = self.load_state(session_or_goal)
             else:
@@ -374,27 +443,57 @@ class ResearchEngine:
         budget = self.get_budget_tracker(state.session_id)
         logger.info(f"[{state.session_id}][E2E] Starting end-to-end research for: '{state.goal}'")
 
-        # 1. Plan
-        self.run_plan_phase(state)
+        try:
+            # 1. Plan
+            self.run_plan_phase(state)
 
-        # 2. Search
-        urls = self.run_search_phase(state)
+            docs: List[FetchedWebContent] = []
 
-        # 3. Fetch
-        docs = self.run_fetch_phase(state, urls=urls)
+            # Research Loop (enforcing max_research_steps and evaluate_next_step)
+            while True:
+                # Search
+                urls = self.run_search_phase(state)
 
-        # 4. Answer
-        answer = self.run_basic_answer(state, fetched_docs=docs)
+                # Fetch
+                new_docs = self.run_fetch_phase(state, urls=urls)
+                docs.extend(new_docs)
 
-        return {
-            "session_id": state.session_id,
-            "goal": state.goal,
-            "phase": state.phase.value,
-            "status": state.status.value,
-            "plan": state.plan.model_dump() if state.plan else None,
-            "visited_queries": state.visited_queries,
-            "sources_count": len(state.source_ids),
-            "documents_fetched": len(docs),
-            "answer": answer,
-            "budget": budget.summary()
-        }
+                # Evaluate: Transition to EVALUATE and let Python determine termination
+                self.state_machine.transition(state, ResearchPhase.EVALUATE, reason="Evaluating research iteration")
+                next_phase = self.state_machine.evaluate_next_step(state)  # Increments state.step!
+                self.save_state(state)
+
+                logger.info(f"[{state.session_id}][EVALUATE] Step {state.step}/{self.limits.max_research_steps}, next: {next_phase.value}")
+
+                if next_phase == ResearchPhase.SEARCH and state.open_questions and budget.can_search():
+                    continue
+                else:
+                    break
+
+            # 4. Answer
+            answer = self.run_basic_answer(state, fetched_docs=docs)
+
+            return {
+                "session_id": state.session_id,
+                "goal": state.goal,
+                "phase": state.phase.value,
+                "status": state.status.value,
+                "step": state.step,
+                "plan": state.plan.model_dump() if state.plan else None,
+                "visited_queries": state.visited_queries,
+                "sources_count": len(state.source_ids),
+                "documents_fetched": len(docs),
+                "answer": answer,
+                "budget": budget.summary()
+            }
+        except Exception as e:
+            self._handle_phase_error(state, e, "RUN_E2E")
+            return {
+                "session_id": state.session_id,
+                "goal": state.goal,
+                "phase": state.phase.value,
+                "status": state.status.value,
+                "step": state.step,
+                "error": state.error_message,
+                "budget": budget.summary()
+            }

@@ -12,8 +12,8 @@ class SessionRepository:
         with self.db.session() as conn:
             conn.execute(
                 """
-                INSERT INTO sessions (session_id, goal, plan_json, open_questions_json, step, phase, status, updated_at)
-                VALUES (?, ?, ?, '[]', 0, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO sessions (session_id, goal, plan_json, open_questions_json, error_message, step, phase, status, search_calls, fetch_calls, llm_calls, tokens_consumed, updated_at)
+                VALUES (?, ?, ?, '[]', NULL, 0, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP)
                 """,
                 (session_id, goal, plan_json, phase, status)
             )
@@ -31,17 +31,38 @@ class SessionRepository:
         step: int,
         status: str,
         plan_json: Optional[str] = None,
-        open_questions_json: Optional[str] = None
+        open_questions_json: Optional[str] = None,
+        error_message: Optional[str] = None,
+        search_calls: Optional[int] = None,
+        fetch_calls: Optional[int] = None,
+        llm_calls: Optional[int] = None,
+        tokens_consumed: Optional[int] = None
     ) -> None:
         with self.db.session() as conn:
             updates = ["phase = ?", "step = ?", "status = ?", "updated_at = CURRENT_TIMESTAMP"]
-            params = [phase, step, status]
+            params: List[Any] = [phase, step, status]
             if plan_json is not None:
                 updates.append("plan_json = ?")
                 params.append(plan_json)
             if open_questions_json is not None:
                 updates.append("open_questions_json = ?")
                 params.append(open_questions_json)
+            if error_message is not None:
+                updates.append("error_message = ?")
+                params.append(error_message)
+            if search_calls is not None:
+                updates.append("search_calls = ?")
+                params.append(search_calls)
+            if fetch_calls is not None:
+                updates.append("fetch_calls = ?")
+                params.append(fetch_calls)
+            if llm_calls is not None:
+                updates.append("llm_calls = ?")
+                params.append(llm_calls)
+            if tokens_consumed is not None:
+                updates.append("tokens_consumed = ?")
+                params.append(tokens_consumed)
+
             params.append(session_id)
             query = f"UPDATE sessions SET {', '.join(updates)} WHERE session_id = ?"
             conn.execute(query, params)

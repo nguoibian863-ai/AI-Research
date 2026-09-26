@@ -14,9 +14,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     goal TEXT NOT NULL,
     plan_json TEXT,
     open_questions_json TEXT,
+    error_message TEXT,
     step INTEGER DEFAULT 0,
     phase TEXT NOT NULL,
     status TEXT NOT NULL,
+    search_calls INTEGER DEFAULT 0,
+    fetch_calls INTEGER DEFAULT 0,
+    llm_calls INTEGER DEFAULT 0,
+    tokens_consumed INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -173,6 +178,15 @@ class DatabaseManager:
             conn.executescript(SCHEMA_SQL)
             # Safe migration for existing databases
             cursor = conn.execute("PRAGMA table_info(sessions)")
-            columns = [row["name"] for row in cursor.fetchall()]
-            if "open_questions_json" not in columns:
-                conn.execute("ALTER TABLE sessions ADD COLUMN open_questions_json TEXT")
+            existing_columns = {row["name"] for row in cursor.fetchall()}
+            needed_columns = {
+                "open_questions_json": "TEXT",
+                "error_message": "TEXT",
+                "search_calls": "INTEGER DEFAULT 0",
+                "fetch_calls": "INTEGER DEFAULT 0",
+                "llm_calls": "INTEGER DEFAULT 0",
+                "tokens_consumed": "INTEGER DEFAULT 0",
+            }
+            for col_name, col_type in needed_columns.items():
+                if col_name not in existing_columns:
+                    conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")

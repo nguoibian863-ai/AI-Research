@@ -1,10 +1,4 @@
-from fastapi.testclient import TestClient
-from backend.main import app
-
-client = TestClient(app)
-
-
-def test_health_endpoint():
+def test_health_endpoint(client):
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
@@ -13,7 +7,7 @@ def test_health_endpoint():
     assert "database" in data
 
 
-def test_create_session_endpoint():
+def test_create_session_endpoint(client):
     response = client.post("/api/research/session", json={"goal": "Investigate Sparse4D v3 latency"})
     assert response.status_code == 200
     data = response.json()
@@ -31,7 +25,7 @@ def test_create_session_endpoint():
     assert sess_body["session"]["goal"] == "Investigate Sparse4D v3 latency"
 
 
-def test_list_trajectories_endpoint():
+def test_list_trajectories_endpoint(client):
     response = client.get("/api/research/trajectories/gold")
     assert response.status_code == 200
     data = response.json()

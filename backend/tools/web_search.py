@@ -1,6 +1,16 @@
 import logging
+import warnings
 from typing import List, Dict, Any, Optional
-from duckduckgo_search import DDGS
+
+try:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        from ddgs import DDGS
+except ImportError:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        from duckduckgo_search import DDGS
+
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)

@@ -10,15 +10,16 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 
 ## Implementation Status by Milestone
 
-### ✅ Week 1: Core Engine & Deterministic Flow (Completed & Closed)
-- **Deterministic Python State Machine:** 14 states (`INIT` → `PLAN` → `SEARCH` → `FETCH` → `CLEAN` → `RETRIEVE` → `EXTRACT` → `EVALUATE` → `VERIFY` → `WRITE` → `DONE`/`PARTIAL`/`FAILED`) strictly controlled by Python logic to prevent infinite LLM loops.
-- **SQLite Single Source of Truth:** Schema with WAL mode and foreign keys. Includes immutable raw evidence (`raw_evidences`) and partitioned trajectory storage (`data/trajectories/{raw, candidate, gold, eval}`) for Phase 2 fine-tuning.
-- **Full State Restoration (`load_state`):** Guarantees that across decoupled HTTP requests (`/session`, `/plan`, `/search`, `/fetch`), the engine seamlessly reconstructs plan, visited queries, sources, and open questions without state drift.
-- **Execution Budget Tracker Enforcement:** Active enforcement of hard limits (`max_search_calls`, `max_fetch_calls`, `max_llm_calls`, `max_runtime_seconds`).
-- **Swappable LLM Backend:** Abstract `LLMBackend` interface with `MockLLMBackend` and `OllamaBackend` featuring native JSON Schema constrained decoding, configured with `smollm3:3b` default profile (with `num_ctx: 4096`) optimized for 4GB VRAM.
-- **Tools & Deduplication:** Web search tool with query categorization, URL deduplication, and max sources limits. Web fetch tool with Trafilatura HTML cleaning and local disk caching.
-- **End-to-End Runner:** `ResearchEngine.run_week1()` and `POST /api/research/run` implementing Question → Plan → Search → Fetch → Grounded Initial Answer.
-- **Automated Testing Suite:** 12/12 unit and multi-request integration tests passing in `pytest`.
+### ✅ Week 1: Core Engine & Hardened Foundation (Verified & Passed)
+- **Deterministic Python State Machine:** 14 states (`INIT` → `PLAN` → `SEARCH` → `FETCH` → `CLEAN` → `RETRIEVE` → `EXTRACT` → `EVALUATE` → `VERIFY` → `WRITE` → `DONE`/`PARTIAL`/`FAILED`) strictly controlled by Python logic.
+- **SQLite Single Source of Truth:** Schema with WAL mode, foreign keys, and persistent budget counters (`search_calls`, `fetch_calls`, `llm_calls`, `tokens_consumed`).
+- **P0 Evidence Integrity Guard:** Dummy raw evidence writing removed from fetch; `raw_evidences` table is kept pristine for verified verbatim claim citations only.
+- **P0 Trajectory Governance:** Initial synthesis trajectories strictly placed in `raw` partition with `verified=False` and `quality_score=0.0` (zero Fake Confidence before Phase 4 verifier).
+- **P0 Full State Restoration (`load_state`):** State, plan, open questions, queries, and sources are restored from SQLite across independent HTTP requests.
+- **P0 Active Budget & Step Enforcement:** `ExecutionBudgetTracker` actively enforces `max_search_calls`, `max_fetch_calls`, `max_llm_calls`, `max_runtime_seconds`. `run_week1` executes through `EVALUATE` and `evaluate_next_step()`, properly tracking `state.step`.
+- **P1 Robust Error Handling & HTTP Statuses:** Engine transitions to `FAILED` or `PARTIAL` on exceptions, recording `error_message`. FastAPI maps `StateTransitionError` → 409 Conflict, `BudgetExceededError` → 429, `ModelInferenceError` → 502, `KeyError` → 404.
+- **P1 Observability & Local Logging:** Dual output to console and `logs/research.log` tagged with `[sess_xxx][PHASE]`.
+- **P2 Benchmark & Isolated Test Suite:** 14/14 automated tests passing in ~0.6s with zero external network dependencies and temporary DB fixtures; added `scripts/benchmark_ollama.py`.
 
 ### ⏳ Week 2: Parsing & Hybrid Retrieval (In Progress)
 - [ ] PyMuPDF page-aware and section-aware PDF text extraction.

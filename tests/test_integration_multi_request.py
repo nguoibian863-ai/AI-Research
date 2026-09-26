@@ -1,22 +1,19 @@
-import tempfile
-from pathlib import Path
-from fastapi.testclient import TestClient
-from backend.main import app, research_engine
-from backend.llm.mock import MockLLMBackend
+import pytest
+from backend.core.state import ResearchPhase, ResearchStatus, OpenQuestion
 from backend.core.limits import ResearchLimits
-from backend.core.errors import BudgetExceededError
+from backend.core.errors import BudgetExceededError, ModelInferenceError
 from backend.core.budget import ExecutionBudgetTracker
+from backend.llm.mock import MockLLMBackend
 
 
-def test_plan_then_search_restores_full_state():
+def test_plan_then_search_restores_full_state(client, isolated_engine):
     """
     P0-1 Integration Test:
     Ensures that when a user calls /plan, the plan is persisted,
     and when the user subsequently calls /search, the state is fully
     restored from DB so the query generator prompt contains the plan.
+    Zero real network calls; isolated in temporary SQLite database.
     """
-    client = TestClient(app)
-
     canned = {
         "ResearchPlanSchema": {
             "goal": "Compare PointPillars and CenterPoint",
@@ -32,9 +29,7 @@ def test_plan_then_search_restores_full_state():
             ]
         }
     }
-    mock_llm = MockLLMBackend(canned_responses=canned)
-    # Inject mock LLM into the engine
-    research_engine.llm = mock_llm
+    isolated_engine.llm = MockLLMBackend(canned_responses=canned)
 
     # 1. Create Session
     create_res = client.post("/api/research/session", json={"goal": "Compare PointPillars and CenterPoint"})
@@ -47,32 +42,29 @@ def test_plan_then_search_restores_full_state():
     assert plan_res.json()["plan"] is not None
     assert len(plan_res.json()["plan"]["tasks"]) == 2
 
-    # Clear mock LLM call history
-    mock_llm.call_history.clear()
+    # Clear mock LLM call history to inspect only subsequent calls
+    isolated_engine.llm.call_history.clear()
 
-    # 3. Call /search (simulating separate HTTP request where in-memory state must be restored from DB)
+    # 3. Call /search (simulating separate HTTP request where state must be restored from DB)
     search_res = client.post(f"/api/research/session/{session_id}/search")
     assert search_res.status_code == 200
 
     # 4. Verify search query generator received the restored plan in its prompt
-    assert len(mock_llm.call_history) > 0
-    query_call = mock_llm.call_history[0]
+    assert len(isolated_engine.llm.call_history) > 0
+    query_call = isolated_engine.llm.call_history[0]
     prompt_sent = query_call["prompt"]
 
-    # P0 verification: prompt MUST contain the saved plan details
     assert "PointPillars" in prompt_sent
     assert "CenterPoint" in prompt_sent
     assert "Extract PointPillars nuScenes mAP" in prompt_sent
 
 
-def test_end_to_end_run_api():
+def test_end_to_end_run_api(client, isolated_engine):
     """
-    P0-3, P0-4, P0-5 Integration Test:
-    Ensures POST /api/research/run executes Question -> Plan -> Search -> Fetch -> Answer -> Done
-    and persists report in SQLite.
+    P0-3, P0-4, P0-5 & Step Enforcement Integration Test:
+    Ensures POST /api/research/run executes Question -> Plan -> Search -> Fetch -> Evaluate -> Answer -> Done
+    with step >= 1 and persists report and budget in SQLite.
     """
-    client = TestClient(app)
-
     canned = {
         "ResearchPlanSchema": {
             "goal": "Benchmark FlashAttention-2 speedup",
@@ -87,12 +79,7 @@ def test_end_to_end_run_api():
             ]
         }
     }
-    mock_llm = MockLLMBackend(canned_responses=canned)
-    research_engine.llm = mock_llm
-
-    from tests.test_engine import FakeSearchTool, FakeFetchTool
-    research_engine.search_tool = FakeSearchTool()
-    research_engine.fetch_tool = FakeFetchTool()
+    isolated_engine.llm = MockLLMBackend(canned_responses=canned)
 
     run_res = client.post("/api/research/run", json={"goal": "Benchmark FlashAttention-2 speedup"})
     assert run_res.status_code == 200
@@ -100,6 +87,7 @@ def test_end_to_end_run_api():
 
     assert data["status"] == "COMPLETED"
     assert data["phase"] == "DONE"
+    assert data["step"] >= 1  # Verifies real EVALUATE loop execution!
     assert data["plan"] is not None
     assert data["answer"] != ""
     assert "budget" in data
@@ -113,6 +101,57 @@ def test_end_to_end_run_api():
     assert body["report"] is not None
     assert body["report"]["content_markdown"] == data["answer"]
 
+    # Trajectory verification: verify trajectory is placed in raw partition with verified=False (resolves P0 fake confidence)
+    trajs = isolated_engine.trajectory_repo.list_by_partition("raw")
+    assert len(trajs) >= 1
+    answer_traj = next((t for t in trajs if t["task_type"] == "answer_synthesis"), None)
+    assert answer_traj is not None
+    assert answer_traj["verified"] == 0  # Not verified yet in Week 1!
+
+
+def test_error_handling_and_status_codes(client, isolated_engine):
+    """
+    P1 Tests for HTTP Status Code Mappings and Robustness:
+    - 409 Conflict on invalid state transition (calling /plan on DONE session)
+    - 404 Not Found on unknown session
+    - 502 Bad Gateway on ModelInferenceError
+    """
+    # 1. 404 test
+    res_404 = client.get("/api/research/session/sess_nonexistent_999")
+    assert res_404.status_code == 404
+
+    # 2. 409 Conflict test
+    create_res = client.post("/api/research/session", json={"goal": "State machine test"})
+    sid = create_res.json()["session_id"]
+    # Mark session as DONE
+    state = isolated_engine.load_state(sid)
+    state.phase = ResearchPhase.DONE
+    state.status = ResearchStatus.COMPLETED
+    isolated_engine.save_state(state)
+
+    # Calling /plan on a DONE session must return 409 Conflict
+    conflict_res = client.post(f"/api/research/session/{sid}/plan")
+    assert conflict_res.status_code == 409
+    assert "StateTransitionError" in conflict_res.json()["error"]
+
+    # 3. 502 Bad Gateway test on ModelInferenceError
+    class FailingLLM(MockLLMBackend):
+        def structured_generate(self, *args, **kwargs):
+            raise ModelInferenceError("Ollama connection timed out")
+
+    isolated_engine.llm = FailingLLM()
+    create_res2 = client.post("/api/research/session", json={"goal": "Failing model test"})
+    sid2 = create_res2.json()["session_id"]
+
+    fail_res = client.post(f"/api/research/session/{sid2}/plan")
+    assert fail_res.status_code == 502
+    assert "ModelInferenceError" in fail_res.json()["error"]
+
+    # Session in DB must be transitioned to FAILED, not left dangling in PENDING
+    st_failed = isolated_engine.load_state(sid2)
+    assert st_failed.status == ResearchStatus.FAILED
+    assert "Ollama connection timed out" in (st_failed.error_message or "")
+
 
 def test_budget_limits_enforce_hard_stops():
     """
@@ -122,24 +161,34 @@ def test_budget_limits_enforce_hard_stops():
     limits = ResearchLimits(max_search_calls=2, max_llm_calls=2, max_runtime_seconds=1)
     tracker = ExecutionBudgetTracker(limits=limits)
 
-    # Search calls
     tracker.record_search()
     tracker.record_search()
     assert not tracker.can_search()
 
-    try:
+    with pytest.raises(BudgetExceededError) as exc_info:
         tracker.record_search()
-        assert False, "Should have raised BudgetExceededError"
-    except BudgetExceededError as e:
-        assert "Maximum search calls limit reached" in str(e)
+    assert "Maximum search calls limit reached" in str(exc_info.value)
 
-    # LLM calls
     tracker.record_llm_call(tokens=100)
     tracker.record_llm_call(tokens=200)
     assert not tracker.can_call_llm()
 
-    try:
+    with pytest.raises(BudgetExceededError) as exc_info:
         tracker.record_llm_call(tokens=50)
-        assert False, "Should have raised BudgetExceededError"
-    except BudgetExceededError as e:
-        assert "Maximum LLM calls limit reached" in str(e)
+    assert "Maximum LLM calls limit reached" in str(exc_info.value)
+
+
+def test_multi_step_e2e_terminates_at_max_steps(isolated_engine):
+    """
+    Verifies that run_week1 loops through EVALUATE when open questions exist
+    and stops strictly when state.step reaches limits.max_research_steps without infinite loop.
+    """
+    isolated_engine.limits.max_research_steps = 2
+    state = isolated_engine.create_session("Multi-step loop test")
+    state.open_questions = [OpenQuestion(question_id="q1", text="What is the latency?")]
+    isolated_engine.save_state(state)
+
+    result = isolated_engine.run_week1(state)
+    assert result["step"] == 2  # Proves loop ran 2 times and stopped cleanly at max_research_steps!
+    assert result["status"] in {"COMPLETED", "PARTIAL"}
+

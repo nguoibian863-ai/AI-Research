@@ -14,15 +14,23 @@ class TokenBudget(BaseModel):
 
 
 class ExecutionBudgetTracker:
-    def __init__(self, limits=None):
+    def __init__(
+        self,
+        limits=None,
+        search_calls: int = 0,
+        fetch_calls: int = 0,
+        llm_calls: int = 0,
+        tokens_consumed: int = 0,
+        step_count: int = 0
+    ):
         from backend.core.limits import ResearchLimits
         self.limits = limits or ResearchLimits()
         self.start_time: float = time.time()
-        self.step_count: int = 0
-        self.search_calls: int = 0
-        self.fetch_calls: int = 0
-        self.llm_calls: int = 0
-        self.total_tokens_consumed: int = 0
+        self.step_count: int = step_count
+        self.search_calls: int = search_calls
+        self.fetch_calls: int = fetch_calls
+        self.llm_calls: int = llm_calls
+        self.total_tokens_consumed: int = tokens_consumed
 
     @property
     def elapsed_seconds(self) -> float:
