@@ -459,7 +459,11 @@ class ResearchEngine:
                         if url not in existing_urls and url not in found_urls:
                             # Plan 14.2: score source before fetching; low-credibility sources are skipped
                             cred = score_source_credibility(
-                                url=url, title=item.title, domain=domain, text=item.snippet,
+                                url=url,
+                                title=item.title,
+                                domain=domain,
+                                text=item.snippet,
+                                published_at=getattr(item, "published_at", None),
                                 goal_entities=goal_entities
                             )
                             if cred["score"] < self.limits.min_source_score:
@@ -478,13 +482,43 @@ class ResearchEngine:
                                 session_id=state.session_id,
                                 url=url,
                                 title=item.title,
+                                source_type=getattr(item, "source_type", "web"),
                                 domain=domain,
                                 canonical_key=canonical_k,
+                                published_at=getattr(item, "published_at", None),
                                 credibility_score=cred["score"],
                                 credibility_details=cred
                             )
 
             self.save_state(state)
+
+            # Plan 43.1: Log query_generation trajectory
+            has_sources = len(found_urls) > 0
+            self.trajectory_repo.add(
+                trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
+                session_id=state.session_id,
+                task_type="query_generation",
+                model_source=getattr(self.llm, "model", "mock"),
+                payload={
+                    "goal": state.goal,
+                    "plan": state.plan.model_dump() if state.plan else None,
+                    "queries": queries_to_run,
+                    "found_urls": found_urls,
+                    "relevant_sources_count": len(found_urls),
+                    "total_sources": len(state.source_ids),
+                    "metadata": {
+                        "task_type": "query_generation",
+                        "model_source": getattr(self.llm, "model", "mock"),
+                        "verified": has_sources,
+                        "quality_score": min(1.0, len(found_urls) / max(1, len(queries_to_run))),
+                        "source_ids": list(state.source_ids),
+                        "language": "en"
+                    }
+                },
+                verified=has_sources,
+                quality_score=min(1.0, len(found_urls) / max(1, len(queries_to_run))),
+                partition="raw"
+            )
             logger.info(f"[{state.session_id}][SEARCH] Completed. Found {len(found_urls)} new URLs, total sources: {len(state.source_ids)}.")
             return found_urls
         except Exception as e:

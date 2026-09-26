@@ -1,54 +1,44 @@
 import logging
-import warnings
 from typing import List, Dict, Any, Optional
 
-try:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        from ddgs import DDGS
-except ImportError:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        from duckduckgo_search import DDGS
-
-from pydantic import BaseModel, Field
+from backend.tools.search_providers import (
+    SearchResultItem,
+    BaseSearchProvider,
+    DuckDuckGoSearchProvider,
+    ArxivSearchProvider,
+    OpenAlexSearchProvider,
+    CompositeSearchProvider,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class SearchResultItem(BaseModel):
-    title: str
-    url: str
-    snippet: str
-    query: str = ""
-    rank: int = 1
-
-
-
 class WebSearchTool:
-    def __init__(self, max_results: int = 8, timeout: int = 15):
+    """
+    Unified multi-provider search tool for Local Deep Research Agent (Plan 12.5).
+    Searches academic repositories (arXiv, OpenAlex) and general web (DuckDuckGo),
+    prioritizing primary sources and deduplicating by canonical key.
+    """
+    def __init__(
+        self,
+        max_results: int = 8,
+        timeout: int = 15,
+        providers: Optional[List[BaseSearchProvider]] = None
+    ):
         self.max_results = max_results
         self.timeout = timeout
+        if providers is not None:
+            self.composite = CompositeSearchProvider(providers=providers, max_results=max_results)
+        else:
+            self.composite = CompositeSearchProvider(
+                providers=[
+                    ArxivSearchProvider(timeout=min(10, timeout)),
+                    OpenAlexSearchProvider(timeout=min(10, timeout)),
+                    DuckDuckGoSearchProvider(timeout=timeout),
+                ],
+                max_results=max_results
+            )
 
     def search(self, query: str, max_results: Optional[int] = None) -> List[SearchResultItem]:
         limit = max_results or self.max_results
-        results: List[SearchResultItem] = []
-        logger.info(f"[WebSearchTool] Searching: '{query}' (limit={limit})")
-
-        try:
-            with DDGS(timeout=self.timeout) as ddgs:
-                ddg_gen = ddgs.text(query, max_results=limit)
-                if ddg_gen:
-                    for i, r in enumerate(ddg_gen, start=1):
-                        results.append(SearchResultItem(
-                            title=r.get("title", ""),
-                            url=r.get("href", ""),
-                            snippet=r.get("body", ""),
-                            query=query,
-                            rank=i
-                        ))
-        except Exception as e:
-            logger.error(f"[WebSearchTool] Search error for query '{query}': {e}")
-
-        logger.info(f"[WebSearchTool] Returned {len(results)} results for query: '{query}'")
-        return results
+        return self.composite.search(query=query, max_results=limit)

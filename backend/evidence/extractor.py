@@ -3,7 +3,7 @@ import uuid
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from backend.db.database import DatabaseManager
-from backend.db.repositories import RawEvidenceRepository, EvidenceRepository
+from backend.db.repositories import RawEvidenceRepository, EvidenceRepository, TrajectoryRepository
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema
 from backend.core.coverage import (
@@ -258,6 +258,52 @@ class EvidenceExtractor:
         self.db = db
         self.raw_evidence_repo = RawEvidenceRepository(db)
         self.evidence_repo = EvidenceRepository(db)
+        self.trajectory_repo = TrajectoryRepository(db)
+
+    def _log_fact_trajectory(
+        self,
+        session_id: str,
+        chunk: Dict[str, Any],
+        fact: AtomicFactItemSchema,
+        verdict: str,
+        verified_quote: Optional[str] = None,
+        goal: str = ""
+    ) -> None:
+        """Logs evidence extraction trajectory sample with verifier label (Plan 43.1)."""
+        try:
+            chunk_id = chunk.get("chunk_id", "")
+            source_id = chunk.get("source_id")
+            c_text = chunk.get("text", "")
+            is_verified = (verdict == "VERIFIED")
+            self.trajectory_repo.add(
+                trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
+                session_id=session_id,
+                task_type="evidence_extraction",
+                model_source=getattr(self.llm, "model", "mock"),
+                payload={
+                    "chunk_id": chunk_id,
+                    "source_id": source_id,
+                    "chunk_text": c_text,
+                    "fact": fact.model_dump(),
+                    "verdict": verdict,
+                    "verified_quote": verified_quote,
+                    "goal": goal,
+                    "metadata": {
+                        "task_type": "evidence_extraction",
+                        "model_source": getattr(self.llm, "model", "mock"),
+                        "verified": is_verified,
+                        "quality_score": 1.0 if is_verified else 0.0,
+                        "source_ids": [source_id] if source_id else [],
+                        "language": "en",
+                        "has_valid_citations": is_verified
+                    }
+                },
+                verified=is_verified,
+                quality_score=1.0 if is_verified else 0.0,
+                partition="raw"
+            )
+        except Exception as e:
+            logger.warning(f"[{session_id}][EXTRACT] Failed to log fact trajectory: {e}")
 
     def extract_from_chunks(
         self,
@@ -342,10 +388,12 @@ class EvidenceExtractor:
             for fact in extracted_facts:
                 candidate_quote = fact.raw_quote.strip() if fact.raw_quote else ""
                 if not candidate_quote:
+                    self._log_fact_trajectory(session_id, target_chunk, fact, "EMPTY_QUOTE", None, goal)
                     continue
 
                 match_res = find_quote_in_text(candidate_quote, c_text)
                 if not match_res:
+                    self._log_fact_trajectory(session_id, target_chunk, fact, "QUOTE_NOT_FOUND", None, goal)
                     logger.warning(
                         f"[{session_id}][EXTRACT] Rejected ungrounded quote (not in source chunk): '{candidate_quote[:60]}...'"
                     )
@@ -371,6 +419,7 @@ class EvidenceExtractor:
                         final_start, final_end = exp_start, exp_end
                         is_valid = True
                     else:
+                        self._log_fact_trajectory(session_id, target_chunk, fact, reject_reason, None, goal)
                         logger.warning(
                             f"[{session_id}][EXTRACT] Rejected candidate fact ({reject_reason}): statement='{fact.statement}', quote='{matched_quote}'"
                         )
@@ -409,6 +458,7 @@ class EvidenceExtractor:
 
                 # If source_id cannot be verified, reject the evidence to prevent false attribution!
                 if not source_id or source_id == "src_unknown":
+                    self._log_fact_trajectory(session_id, target_chunk, fact, "SOURCE_UNRESOLVED", None, goal)
                     logger.warning(
                         f"[{session_id}][EXTRACT] Rejected evidence: source_id could not be resolved for chunk {chunk_id}."
                     )
@@ -484,6 +534,7 @@ class EvidenceExtractor:
                     "char_end": abs_end,
                     "confidence": fact.confidence or 1.0
                 })
+                self._log_fact_trajectory(session_id, target_chunk, fact, "VERIFIED", verified_verbatim_quote, goal)
 
                 if len(verified_evidence) >= max_evidence:
                     break

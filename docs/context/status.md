@@ -12,9 +12,23 @@
 | 4 — Verification + UI | 🟢 bắt đầu | Đã có Session Viewer (/ui). Còn: NLI, writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 85 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 91 passed + 1 skipped (test FastEmbed cần mạng).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
+Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
+
+## Đã giải quyết (Plan 12.5 & 43.1)
+
+- **Search Providers học thuật đa nguồn (Plan 12.5)**:
+  - Bổ sung `ArxivSearchProvider`: truy vấn Atom XML feed của arXiv, trích xuất paper gốc, DOI, arXiv ID, abstract snippet.
+  - Bổ sung `OpenAlexSearchProvider`: truy vấn OpenAlex API, trích xuất venue, publication year, citation count, DOI, và tái cấu trúc abstract từ inverted index; xử lý 429 graceful.
+  - `CompositeSearchProvider` / `WebSearchTool`: kết hợp tìm kiếm học thuật và web tổng hợp, deduplicate tự động bằng `canonical_key`.
+  - Kết nối dữ liệu `source_type="paper"|"academic"`, `published_at`, `doi` vào `SourceRepository` và tính điểm uy tín `score_source_credibility`.
+- **Trajectory Logging cho Training & DPO (Plan 43.1 & 42.4)**:
+  - Ghi trajectory cho bước `query_generation`: lưu goal, plan, danh sách queries, số lượng nguồn liên quan và điểm chất lượng.
+  - Ghi trajectory cho bước `evidence_extraction`: lưu từng candidate fact với nhãn verifier đầy đủ (`VERIFIED`, `QUOTE_NOT_FOUND`, `NUMERIC_MISMATCH`, `SUBJECT_MISMATCH`, `UNSUPPORTED_COMPARISON`, `STATEMENT_NOT_GROUNDED`, `SOURCE_UNRESOLVED`). Mẫu VERIFIED sẵn sàng cho SFT; cặp (VERIFIED, bị loại) trên cùng chunk sẵn sàng cho DPO.
+  - `TrajectoryRepository.export_partition_jsonl`: xuất toàn bộ trajectory ra các file JSONL có cấu trúc metadata chuẩn mục 42.4.
+  - CLI script: `python scripts/export_trajectories.py` xuất dữ liệu ra `data/trajectories/{partition}/{task_type}.jsonl`.
 
 ## Đã giải quyết ở `4f3872c`
 
@@ -45,11 +59,9 @@ Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `
 
 ## Vấn đề còn mở (ưu tiên từ trên xuống)
 
-1. **Nguồn search chưa sát bài báo benchmark (cần OpenAlex/arXiv - plan 12.5)**: CSDL tìm được tool benchmark thay vì số liệu đo đạc thực tế; model Object Detection tìm được bài báo họ hàng (RF-DETR). Cần provider học thuật để lấy paper gốc.
-2. **Thời gian EXTRACT trên CPU/Small GPU**: Trích xuất 5 chunk mất ~8.5 phút trên SmolLM3-3B, dễ chạm trần `max_runtime_seconds: 600s`. Cần tối ưu số lượng chunk chọn lọc (hoặc lọc trước bằng heuristic).
-3. **Statement đọc sai quote nhưng trùng từ nhiều** (vd "MySQL is the best open-source tool") vẫn qua → cần NLI (plan 23, Tuần 4).
-4. **Tỉ lệ quote bị loại "not in source chunk" cao** (model diễn đạt lại thay vì trích nguyên văn) → dữ liệu cho Dataset C (plan 43).
-5. **Chưa ghi trajectory** cho `query_generation` / `evidence_extraction` (plan 43.1).
+1. **Thời gian EXTRACT trên CPU/Small GPU**: Trích xuất 5 chunk mất ~8.5 phút trên SmolLM3-3B, dễ chạm trần `max_runtime_seconds: 600s`. Cần tối ưu số lượng chunk chọn lọc (hoặc lọc trước bằng heuristic).
+2. **Statement đọc sai quote nhưng trùng từ nhiều** (vd "MySQL is the best open-source tool") vẫn qua → cần NLI (plan 23, Tuần 4).
+3. **Tỉ lệ quote bị loại "not in source chunk" cao** (model diễn đạt lại thay vì trích nguyên văn) → dữ liệu cho Dataset C (plan 43).
 
 ## Lịch sử kết quả chạy thật
 

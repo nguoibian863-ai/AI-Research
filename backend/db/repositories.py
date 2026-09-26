@@ -402,3 +402,70 @@ class TrajectoryRepository:
         with self.db.session() as conn:
             cur = conn.execute("SELECT * FROM trajectories WHERE partition = ? ORDER BY created_at DESC", (partition,))
             return [dict(row) for row in cur.fetchall()]
+
+    def list_by_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute("SELECT * FROM trajectories WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
+            return [dict(row) for row in cur.fetchall()]
+
+    def list_by_task_type(self, task_type: str, partition: str = "raw") -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "SELECT * FROM trajectories WHERE task_type = ? AND partition = ? ORDER BY created_at DESC",
+                (task_type, partition)
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def export_partition_jsonl(self, partition: str = "raw", output_dir: Any = "data/trajectories") -> Dict[str, int]:
+        """
+        Exports trajectories in SQLite for a given partition into JSONL files under output_dir/partition/{task_type}.jsonl,
+        formatted with Plan 42.4 metadata schema. Returns dict of {task_type: count_exported}.
+        """
+        from pathlib import Path
+        out_base = Path(output_dir) / partition
+        out_base.mkdir(parents=True, exist_ok=True)
+        counts: Dict[str, int] = {}
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "SELECT * FROM trajectories WHERE partition = ? ORDER BY created_at ASC",
+                (partition,)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+
+        files: Dict[str, Any] = {}
+        try:
+            for row in rows:
+                tt = row["task_type"]
+                if tt not in files:
+                    fp = open(out_base / f"{tt}.jsonl", "w", encoding="utf-8")
+                    files[tt] = fp
+                    counts[tt] = 0
+
+                payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+                record = {
+                    "trajectory_id": row["trajectory_id"],
+                    "session_id": row["session_id"],
+                    "task_type": row["task_type"],
+                    "model_source": row["model_source"],
+                    "verified": bool(row["verified"]),
+                    "quality_score": row["quality_score"],
+                    "created_at": row["created_at"],
+                    "partition": row["partition"],
+                    "payload": payload,
+                    "metadata": payload.get("metadata", {
+                        "task_type": row["task_type"],
+                        "model_source": row["model_source"],
+                        "verified": bool(row["verified"]),
+                        "quality_score": row["quality_score"],
+                        "created_at": row["created_at"],
+                        "language": "en"
+                    })
+                }
+                files[tt].write(json.dumps(record, ensure_ascii=False) + "\n")
+                counts[tt] += 1
+        finally:
+            for f in files.values():
+                f.close()
+
+        return counts
+
