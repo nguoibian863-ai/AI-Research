@@ -17,6 +17,11 @@ class RunResearchRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Existing session ID to run to completion")
 
 
+class RetrieveRequest(BaseModel):
+    query: Optional[str] = Field(None, description="Custom query to retrieve for; defaults to research goal")
+    top_k: Optional[int] = Field(5, description="Number of top chunks to retrieve")
+
+
 class SessionResponse(BaseModel):
     session_id: str
     goal: str
@@ -53,6 +58,7 @@ def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     raw_evidences = engine.raw_evidence_repo.get_by_session(session_id)
     report = engine.report_repo.get_by_session(session_id)
     budget = engine.get_budget_tracker(session_id)
+    chunks_count = engine.chunk_repo.count_by_session(session_id)
 
     return {
         "session": {
@@ -63,7 +69,8 @@ def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
             "step": state.step,
             "plan": state.plan.model_dump() if state.plan else None,
             "visited_queries": state.visited_queries,
-            "open_questions": [q.model_dump() for q in state.open_questions]
+            "open_questions": [q.model_dump() for q in state.open_questions],
+            "chunks_count": chunks_count
         },
         "sources": sources,
         "raw_evidences": raw_evidences,
@@ -116,6 +123,40 @@ def run_fetch(session_id: str, engine: ResearchEngine = Depends(get_engine)):
         "phase": state.phase.value,
         "documents_count": len(docs),
         "documents": [{"url": d.url, "title": d.title, "length": len(d.text)} for d in docs]
+    }
+
+
+@router.post("/session/{session_id}/clean")
+def run_clean(session_id: str, engine: ResearchEngine = Depends(get_engine)):
+    try:
+        state = engine.load_state(session_id)
+    except (KeyError, SessionNotFoundError):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    total_chunks = engine.run_clean_phase(state)
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "total_chunks": total_chunks
+    }
+
+
+@router.post("/session/{session_id}/retrieve")
+def run_retrieve(session_id: str, req: Optional[RetrieveRequest] = None, engine: ResearchEngine = Depends(get_engine)):
+    try:
+        state = engine.load_state(session_id)
+    except (KeyError, SessionNotFoundError):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    query = req.query if req and req.query else state.goal
+    top_k = req.top_k if req and req.top_k else 5
+    retrieved = engine.run_retrieve_phase(state, query=query, top_k=top_k)
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "query": query,
+        "results_count": len(retrieved),
+        "results": [r.model_dump() for r in retrieved]
     }
 
 

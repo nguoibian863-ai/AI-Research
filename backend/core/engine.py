@@ -27,6 +27,7 @@ from backend.db.repositories import (
     QueryRepository,
     SourceRepository,
     DocumentRepository,
+    ChunkRepository,
     RawEvidenceRepository,
     EvidenceRepository,
     ClaimRepository,
@@ -35,6 +36,13 @@ from backend.db.repositories import (
 )
 from backend.tools.web_search import WebSearchTool
 from backend.tools.web_fetch import WebFetchTool, FetchedWebContent
+from backend.tools.pdf_fetch import PDFFetchTool, FetchedPDFContent
+from backend.parsing.html_cleaner import HTMLCleaner, CleanedDocument
+from backend.parsing.chunker import SectionAwareChunker, ParsedChunk
+from backend.retrieval.bm25 import BM25Index
+from backend.retrieval.embeddings import EmbeddingBackend, LocalHashEmbeddingBackend
+from backend.retrieval.faiss_index import FaissVectorIndex
+from backend.retrieval.hybrid import HybridRetriever, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +54,11 @@ class ResearchEngine:
         db: DatabaseManager,
         limits: Optional[ResearchLimits] = None,
         search_tool: Optional[WebSearchTool] = None,
-        fetch_tool: Optional[WebFetchTool] = None
+        fetch_tool: Optional[WebFetchTool] = None,
+        pdf_tool: Optional[PDFFetchTool] = None,
+        embedding_backend: Optional[EmbeddingBackend] = None,
+        chunker: Optional[SectionAwareChunker] = None,
+        hybrid_retriever: Optional[HybridRetriever] = None
     ):
         self.llm = llm
         self.db = db
@@ -54,12 +66,20 @@ class ResearchEngine:
         self.state_machine = StateMachine(limits=self.limits)
         self.search_tool = search_tool or WebSearchTool(max_results=self.limits.max_search_results)
         self.fetch_tool = fetch_tool or WebFetchTool()
+        self.pdf_tool = pdf_tool or PDFFetchTool()
+        self.chunker = chunker or SectionAwareChunker(max_chunk_tokens=self.limits.max_chunk_tokens)
+        self.embedding_backend = embedding_backend or LocalHashEmbeddingBackend()
+        self.hybrid_retriever = hybrid_retriever or HybridRetriever(
+            bm25_index=BM25Index(),
+            vector_index=FaissVectorIndex(embedding_backend=self.embedding_backend)
+        )
 
         # Repositories
         self.session_repo = SessionRepository(self.db)
         self.query_repo = QueryRepository(self.db)
         self.source_repo = SourceRepository(self.db)
         self.doc_repo = DocumentRepository(self.db)
+        self.chunk_repo = ChunkRepository(self.db)
         self.raw_evidence_repo = RawEvidenceRepository(self.db)
         self.evidence_repo = EvidenceRepository(self.db)
         self.claim_repo = ClaimRepository(self.db)
@@ -371,13 +391,39 @@ class ResearchEngine:
 
                     # Save document
                     doc_id = f"doc_{uuid.uuid4().hex[:8]}"
+                    file_path = getattr(fetched, "file_path", None)
                     self.doc_repo.add(
                         doc_id=doc_id,
                         source_id=source_id,
-                        file_path=None,
+                        file_path=file_path,
                         content_hash=fetched.content_hash,
                         raw_text=fetched.text
                     )
+
+                    # Contextual section-aware chunking
+                    cleaned_doc = CleanedDocument(
+                        title=fetched.title,
+                        author=getattr(fetched, "author", None),
+                        date=getattr(fetched, "date", None),
+                        text=fetched.text,
+                        sections=getattr(fetched, "sections", [])
+                    )
+                    chunks = self.chunker.chunk_document(doc_id=doc_id, document=cleaned_doc)
+                    if chunks:
+                        chunk_dicts = [
+                            {
+                                "chunk_id": c.chunk_id,
+                                "doc_id": c.doc_id,
+                                "text": c.text,
+                                "page": c.page,
+                                "section": c.section,
+                                "char_start": c.char_start,
+                                "char_end": c.char_end,
+                                "token_count": c.token_count
+                            }
+                            for c in chunks
+                        ]
+                        self.chunk_repo.add_batch(chunk_dicts)
 
             self.save_state(state)
             logger.info(f"[{state.session_id}][FETCH] Fetched {len(fetched_documents)} documents successfully.")
@@ -386,20 +432,105 @@ class ResearchEngine:
             self._handle_phase_error(state, e, "FETCH")
             raise
 
-    def run_basic_answer(self, state: ResearchState, fetched_docs: List[FetchedWebContent]) -> str:
+    def run_clean_phase(self, state: ResearchState) -> int:
         """
-        Synthesizes a grounded initial answer from fetched sources.
+        Executes the CLEAN phase: ensures all documents for the session are cleaned,
+        section-aware chunked, and stored in SQLite chunks table.
+        """
+        try:
+            self.state_machine.transition(state, ResearchPhase.CLEAN, reason="Cleaning and chunking documents")
+            sources = self.source_repo.get_by_session(state.session_id)
+            total_chunks = 0
+            for s in sources:
+                doc = self.doc_repo.get_by_source(s["source_id"])
+                if doc:
+                    existing_chunks = self.chunk_repo.get_by_doc(doc["doc_id"])
+                    if not existing_chunks:
+                        cleaned = CleanedDocument(
+                            title=s.get("title"),
+                            text=doc["raw_text"]
+                        )
+                        chunks = self.chunker.chunk_document(doc_id=doc["doc_id"], document=cleaned)
+                        if chunks:
+                            chunk_dicts = [
+                                {
+                                    "chunk_id": c.chunk_id,
+                                    "doc_id": c.doc_id,
+                                    "text": c.text,
+                                    "page": c.page,
+                                    "section": c.section,
+                                    "char_start": c.char_start,
+                                    "char_end": c.char_end,
+                                    "token_count": c.token_count
+                                }
+                                for c in chunks
+                            ]
+                            self.chunk_repo.add_batch(chunk_dicts)
+                            total_chunks += len(chunks)
+                    else:
+                        total_chunks += len(existing_chunks)
+
+            self.save_state(state)
+            logger.info(f"[{state.session_id}][CLEAN] Documents chunked. Total chunks in SQLite: {total_chunks}")
+            return total_chunks
+        except Exception as e:
+            self._handle_phase_error(state, e, "CLEAN")
+            raise
+
+    def run_retrieve_phase(self, state: ResearchState, query: Optional[str] = None, top_k: Optional[int] = None) -> List[RetrievedChunk]:
+        """
+        Executes the RETRIEVE phase: builds hybrid BM25 + FAISS index from SQLite chunks
+        and retrieves top-K chunks via Reciprocal Rank Fusion (RRF).
+        """
+        try:
+            self.state_machine.transition(state, ResearchPhase.RETRIEVE, reason="Retrieving relevant evidence chunks")
+            chunks = self.chunk_repo.get_by_session(state.session_id)
+            if not chunks:
+                logger.warning(f"[{state.session_id}][RETRIEVE] No chunks found in SQLite for retrieval.")
+                return []
+
+            target_query = query or state.goal
+            self.hybrid_retriever.index_chunks(chunks)
+            k = top_k or self.limits.retrieval_top_k
+            results = self.hybrid_retriever.retrieve(query=target_query, top_k=k)
+            self.save_state(state)
+            logger.info(f"[{state.session_id}][RETRIEVE] Retrieved {len(results)} chunks for query: '{target_query}'.")
+            return results
+        except Exception as e:
+            self._handle_phase_error(state, e, "RETRIEVE")
+            raise
+
+    def run_basic_answer(
+        self,
+        state: ResearchState,
+        fetched_docs: Optional[List[FetchedWebContent]] = None,
+        retrieved_chunks: Optional[List[RetrievedChunk]] = None
+    ) -> str:
+        """
+        Synthesizes a grounded initial answer from retrieved chunks or fetched sources.
         Records unverified trajectory strictly in 'raw' partition (resolves P0 fake confidence).
         """
         try:
             budget = self.get_budget_tracker(state.session_id)
             budget.assert_can_call_llm()
 
-            # Build context from fetched documents
+            # Build context prioritizing precision retrieved chunks
             context_snippets = []
-            for i, doc in enumerate(fetched_docs[:5], start=1):
-                snippet = doc.text[:1200]
-                context_snippets.append(f"--- Source [{i}] ({doc.url}) ---\n{snippet}\n")
+            if retrieved_chunks:
+                for i, chunk in enumerate(retrieved_chunks[:self.limits.retrieval_top_k], start=1):
+                    src_url = chunk.metadata.get("url") or "local"
+                    sec_info = f" [Section: {chunk.section}, Page: {chunk.page}]" if chunk.section else ""
+                    context_snippets.append(f"--- Evidence [{i}] ({src_url}){sec_info} ---\n{chunk.text}\n")
+            elif fetched_docs:
+                for i, doc in enumerate(fetched_docs[:5], start=1):
+                    snippet = doc.text[:1200]
+                    context_snippets.append(f"--- Source [{i}] ({doc.url}) ---\n{snippet}\n")
+            else:
+                db_chunks = self.chunk_repo.get_by_session(state.session_id)
+                for i, c in enumerate(db_chunks[:self.limits.retrieval_top_k], start=1):
+                    sec_info = f" [Section: {c.get('section')}, Page: {c.get('page')}]" if c.get('section') else ""
+                    context_snippets.append(f"--- Evidence [{i}] ({c.get('url', '')}){sec_info} ---\n{c['text']}\n")
+
             full_context = "\n".join(context_snippets) if context_snippets else "No external documents retrieved."
 
             prompt = (
@@ -417,7 +548,8 @@ class ResearchEngine:
             answer = res.content.strip()
 
             # Transition state to DONE (or PARTIAL if no docs)
-            target_phase = ResearchPhase.DONE if fetched_docs else ResearchPhase.PARTIAL
+            has_data = bool(context_snippets) or bool(state.source_ids)
+            target_phase = ResearchPhase.DONE if has_data else ResearchPhase.PARTIAL
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
             self.save_state(state)
 
@@ -437,7 +569,7 @@ class ResearchEngine:
                 session_id=state.session_id,
                 task_type="answer_synthesis",
                 model_source=getattr(self.llm, "model", "mock"),
-                payload={"goal": state.goal, "answer": answer, "sources_count": len(fetched_docs)},
+                payload={"goal": state.goal, "answer": answer, "sources_count": len(state.source_ids)},
                 verified=False,
                 quality_score=0.0,
                 partition="raw"
@@ -451,8 +583,8 @@ class ResearchEngine:
 
     def run_week1(self, session_or_goal: Union[ResearchState, str]) -> Dict[str, Any]:
         """
-        Week 1 End-to-End Orchestrator with real EVALUATE loop and step enforcement:
-        Question -> PLAN -> (SEARCH -> FETCH -> EVALUATE)* -> WRITE -> DONE / PARTIAL
+        End-to-End Orchestrator with real EVALUATE loop, chunking, and hybrid retrieval:
+        Question -> PLAN -> (SEARCH -> FETCH -> CLEAN -> RETRIEVE -> EVALUATE)* -> WRITE -> DONE / PARTIAL
         """
         if isinstance(session_or_goal, str):
             if session_or_goal.startswith("sess_") and self.session_repo.get(session_or_goal):
@@ -470,6 +602,7 @@ class ResearchEngine:
             self.run_plan_phase(state)
 
             docs: List[FetchedWebContent] = []
+            top_chunks: List[RetrievedChunk] = []
 
             # Research Loop (enforcing max_research_steps and evaluate_next_step)
             while True:
@@ -479,6 +612,12 @@ class ResearchEngine:
                 # Fetch
                 new_docs = self.run_fetch_phase(state, urls=urls)
                 docs.extend(new_docs)
+
+                # Clean & Chunk
+                self.run_clean_phase(state)
+
+                # Hybrid Retrieval
+                top_chunks = self.run_retrieve_phase(state, query=state.goal)
 
                 # Evaluate: Transition to EVALUATE and let Python determine termination
                 self.state_machine.transition(state, ResearchPhase.EVALUATE, reason="Evaluating research iteration")
@@ -494,7 +633,7 @@ class ResearchEngine:
                     break
 
             # 4. Answer
-            answer = self.run_basic_answer(state, fetched_docs=docs)
+            answer = self.run_basic_answer(state, fetched_docs=docs, retrieved_chunks=top_chunks)
 
             return {
                 "session_id": state.session_id,
@@ -506,6 +645,7 @@ class ResearchEngine:
                 "visited_queries": state.visited_queries,
                 "sources_count": len(state.source_ids),
                 "documents_fetched": len(docs),
+                "chunks_count": self.chunk_repo.count_by_session(state.session_id),
                 "answer": answer,
                 "budget": budget.summary()
             }

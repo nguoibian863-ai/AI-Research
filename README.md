@@ -22,12 +22,16 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 - **P2 Benchmark & Isolated Test Suite:** 27/27 automated tests passing in ~0.6s with zero external network dependencies and temporary DB fixtures; added `scripts/benchmark_ollama.py`.
 - **Review & real-model results:** see [`docs/week1_review.md`](docs/week1_review.md) (SmolLM3-3B: 68 tok/s, 2.2 GB VRAM; known search-quality issues to fix before Week 2).
 
-### ⏳ Week 2: Parsing & Hybrid Retrieval (In Progress)
-- [ ] PyMuPDF page-aware and section-aware PDF text extraction.
-- [ ] Contextual section-based chunking with token overlap.
-- [ ] BM25 keyword index for exact metrics and model names.
-- [ ] CPU-optimized FAISS vector search for semantic matching.
-- [ ] Hybrid search merge and reranking.
+### ✅ Week 2: Parsing & Hybrid Retrieval (Verified & Passed)
+- **Trafilatura Web Cleaner & Metadata (`HTMLCleaner`):** Cleans HTML articles, extracts title, author, date, and preserves structured sections with character offsets.
+- **PyMuPDF Page-Aware & Section-Aware PDF Parser (`PDFParser`):** Extracts structured academic text preserving exact 1-indexed page numbers, section boundaries (`Abstract`, `Introduction`, `Experiments`), and character offsets.
+- **Section-Aware Hierarchical Chunker (`SectionAwareChunker`):** Prioritizes Section → Heading → Paragraph → Token limit with configurable max chunk tokens (600) and overlap (80).
+- **SQLite Chunk Persistence (`ChunkRepository`):** Chunks stored directly in SQLite `chunks` table linked to documents and sources.
+- **BM25 Exact Metric & Keyword Index (`BM25Index`):** Tokenizer preserves floats and metrics (`71.2 NDS`, `59.2 mAP`), model identifiers, and technical names using `rank_bm25`.
+- **CPU-Optimized FAISS Vector Index (`FaissVectorIndex`):** Normalized inner product / cosine similarity vector search with disk persistence and full rebuild from SQLite Source of Truth (`rebuild_from_db`).
+- **Hybrid Retrieval via Reciprocal Rank Fusion (`HybridRetriever`):** Combines BM25 and FAISS results using standard RRF fusion ($k=60$), delivering high precision for both exact metrics and conceptual queries.
+- **End-to-End & REST Integration:** Added `/session/{id}/clean` and `/session/{id}/retrieve` endpoints; E2E loop automatically cleans, chunks, and hybrid retrieves top evidence chunks for answer synthesis.
+- **Automated Test Coverage:** 35/35 tests passing in ~1.5s with isolated fixtures.
 
 ### 📅 Weeks 3–5: Evidence, Verification, UI & Benchmark (Roadmap)
 - [ ] Atomic evidence extraction (1 Fact = 1 Evidence) and Provenance.

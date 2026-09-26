@@ -155,6 +155,70 @@ class DocumentRepository:
             return dict(row) if row else None
 
 
+class ChunkRepository:
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    def add(self, chunk_id: str, doc_id: str, text: str, page: Optional[int] = None,
+            section: Optional[str] = None, char_start: Optional[int] = None,
+            char_end: Optional[int] = None, token_count: Optional[int] = None) -> None:
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chunks (chunk_id, doc_id, text, page, section, char_start, char_end, token_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, doc_id, text, page, section, char_start, char_end, token_count)
+            )
+
+    def add_batch(self, chunks: List[Dict[str, Any]]) -> None:
+        with self.db.session() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO chunks (chunk_id, doc_id, text, page, section, char_start, char_end, token_count)
+                VALUES (:chunk_id, :doc_id, :text, :page, :section, :char_start, :char_end, :token_count)
+                """,
+                chunks
+            )
+
+    def get(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute("SELECT * FROM chunks WHERE chunk_id = ?", (chunk_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_by_doc(self, doc_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute("SELECT * FROM chunks WHERE doc_id = ? ORDER BY page ASC, char_start ASC", (doc_id,))
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_by_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            query = """
+            SELECT c.*, s.url, s.source_id, s.title as source_title
+            FROM chunks c
+            JOIN documents d ON c.doc_id = d.doc_id
+            JOIN sources s ON d.source_id = s.source_id
+            WHERE s.session_id = ?
+            ORDER BY c.page ASC, c.char_start ASC
+            """
+            cur = conn.execute(query, (session_id,))
+            return [dict(row) for row in cur.fetchall()]
+
+    def count_by_session(self, session_id: str) -> int:
+        with self.db.session() as conn:
+            query = """
+            SELECT COUNT(*) as cnt
+            FROM chunks c
+            JOIN documents d ON c.doc_id = d.doc_id
+            JOIN sources s ON d.source_id = s.source_id
+            WHERE s.session_id = ?
+            """
+            cur = conn.execute(query, (session_id,))
+            row = cur.fetchone()
+            return row["cnt"] if row else 0
+
+
 class RawEvidenceRepository:
     def __init__(self, db: DatabaseManager):
         self.db = db

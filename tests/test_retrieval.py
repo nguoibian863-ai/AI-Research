@@ -1,0 +1,182 @@
+import pytest
+from pathlib import Path
+from backend.retrieval.bm25 import BM25Index, tokenize_for_bm25
+from backend.retrieval.embeddings import LocalHashEmbeddingBackend, MockEmbeddingBackend
+from backend.retrieval.faiss_index import FaissVectorIndex
+from backend.retrieval.hybrid import HybridRetriever
+from backend.core.state import ResearchPhase, ResearchStatus
+
+
+def test_bm25_exact_metric_match():
+    """
+    Acceptance Criteria 3: exact metric query BM25 tim duoc.
+    Verifies BM25 ranks exact metric queries (numbers, model names, benchmarks) #1.
+    """
+    chunks = [
+        {"chunk_id": "c1", "text": "CenterPoint achieves 71.2 NDS on the nuScenes 3D detection benchmark."},
+        {"chunk_id": "c2", "text": "PointPillars achieves 59.2 mAP on KITTI dataset at 62 FPS."},
+        {"chunk_id": "c3", "text": "FlashAttention-2 provides 2x speedup on NVIDIA A100 GPU."},
+        {"chunk_id": "c4", "text": "General overview of autonomous driving perception sensors and cameras."}
+    ]
+    bm25 = BM25Index(chunks)
+
+    # 1. Query for exact metric: 71.2 NDS
+    res1 = bm25.search("71.2 NDS", top_k=2)
+    assert len(res1) > 0
+    assert res1[0][0]["chunk_id"] == "c1"
+    assert res1[0][1] > 0.0
+
+    # 2. Query for exact model and metric: PointPillars 59.2 mAP
+    res2 = bm25.search("PointPillars 59.2 mAP", top_k=2)
+    assert len(res2) > 0
+    assert res2[0][0]["chunk_id"] == "c2"
+
+    # 3. Query for FlashAttention-2 A100
+    res3 = bm25.search("FlashAttention-2 A100", top_k=2)
+    assert len(res3) > 0
+    assert res3[0][0]["chunk_id"] == "c3"
+
+
+def test_faiss_vector_semantic_search(tmp_path):
+    """
+    Acceptance Criteria 4: semantic query vector tim duoc.
+    Verifies FAISS vector index performs semantic search and handles persistence.
+    """
+    emb = LocalHashEmbeddingBackend(dimension=128)
+    faiss_idx = FaissVectorIndex(embedding_backend=emb, index_dir=tmp_path)
+
+    chunks = [
+        {"chunk_id": "c1", "text": "Accuracy comparison and evaluation of 3D object detection LiDAR pipelines."},
+        {"chunk_id": "c2", "text": "Culinary recipes for Italian pasta carbonara with eggs and pecorino cheese."},
+        {"chunk_id": "c3", "text": "Hardware cooling solutions and liquid cooling loops for desktop computers."}
+    ]
+    faiss_idx.add_chunks(chunks)
+
+    # Semantic query without exact keywords
+    results = faiss_idx.search("evaluation of 3D LiDAR perception accuracy", top_k=2)
+    assert len(results) > 0
+    assert results[0][0]["chunk_id"] == "c1"
+    assert results[0][1] > 0.0
+
+    # Test persistence (save and load)
+    faiss_idx.save("test_session_index")
+    loaded_idx = FaissVectorIndex(embedding_backend=emb, index_dir=tmp_path)
+    assert loaded_idx.load("test_session_index")
+    loaded_res = loaded_idx.search("3D perception evaluation", top_k=1)
+    assert len(loaded_res) > 0
+    assert loaded_res[0][0]["chunk_id"] == "c1"
+
+
+def test_faiss_rebuild_from_sqlite(isolated_engine, tmp_path):
+    """
+    P0 Invariant: SQLite is Source of Truth.
+    If FAISS vector index is wiped or corrupted, it must be 100% rebuildable from SQLite chunks table.
+    """
+    state = isolated_engine.create_session("Rebuild test")
+    sid = state.session_id
+
+    # 1. Add source, document, and chunks directly to SQLite
+    src_id = "src_rebuild_01"
+    doc_id = "doc_rebuild_01"
+    isolated_engine.source_repo.add(
+        source_id=src_id, session_id=sid, url="https://example.com/paper",
+        title="Paper Title", domain="example.com"
+    )
+    isolated_engine.doc_repo.add(
+        doc_id=doc_id, source_id=src_id, file_path=None,
+        content_hash="hash123", raw_text="Paper content with 71.2 NDS nuScenes."
+    )
+    isolated_engine.chunk_repo.add(
+        chunk_id="chk_rb_1", doc_id=doc_id, text="Model X achieved 71.2 NDS on nuScenes.",
+        page=1, section="Results", char_start=0, char_end=38, token_count=10
+    )
+
+    # 2. Corrupt/Clear FAISS index
+    faiss_idx = FaissVectorIndex(
+        embedding_backend=isolated_engine.embedding_backend,
+        index_dir=tmp_path
+    )
+    faiss_idx.clear()
+    assert faiss_idx.index.ntotal == 0
+
+    # 3. Rebuild from SQLite Source of Truth
+    rebuilt_count = faiss_idx.rebuild_from_db(isolated_engine.db, session_id=sid)
+    assert rebuilt_count == 1
+    assert faiss_idx.index.ntotal == 1
+
+    # Verify search works immediately after rebuild
+    res = faiss_idx.search("nuScenes 71.2 NDS", top_k=1)
+    assert len(res) == 1
+    assert res[0][0]["chunk_id"] == "chk_rb_1"
+
+
+def test_hybrid_retrieval_rrf():
+    """
+    Acceptance Criteria 5: hybrid retrieval chay duoc.
+    Verifies HybridRetriever correctly merges BM25 keyword matching and Vector search via RRF.
+    """
+    chunks = [
+        {"chunk_id": "c1", "text": "CenterPoint achieves 71.2 NDS on nuScenes.", "page": 7, "section": "Results"},
+        {"chunk_id": "c2", "text": "PointPillars achieves 59.2 mAP at 62 FPS.", "page": 5, "section": "Benchmark"},
+        {"chunk_id": "c3", "text": "General autonomous driving overview.", "page": 1, "section": "Intro"}
+    ]
+    retriever = HybridRetriever(
+        bm25_index=BM25Index(chunks),
+        vector_index=FaissVectorIndex(embedding_backend=LocalHashEmbeddingBackend(dimension=128))
+    )
+    retriever.vector_index.add_chunks(chunks)
+
+    # Hybrid query containing exact metric
+    results = retriever.retrieve(query="CenterPoint 71.2 NDS nuScenes", top_k=2)
+
+    assert len(results) >= 1
+    top_chunk = results[0]
+    assert top_chunk.chunk_id == "c1"
+    assert top_chunk.page == 7
+    assert top_chunk.section == "Results"
+    assert top_chunk.score > 0.0
+    assert top_chunk.bm25_score is not None
+    assert top_chunk.vector_score is not None
+
+
+def test_api_clean_and_retrieve_endpoints(client, isolated_engine):
+    """
+    Integration Test for API Endpoints:
+    - POST /api/research/session/{session_id}/clean
+    - POST /api/research/session/{session_id}/retrieve
+    """
+    # 1. Create session
+    create_res = client.post("/api/research/session", json={"goal": "nuScenes 3D benchmark"})
+    sid = create_res.json()["session_id"]
+    state = isolated_engine.load_state(sid)
+
+    # 2. Add source and doc
+    isolated_engine.source_repo.add(
+        source_id="src_api_01", session_id=sid, url="https://example.com/test",
+        title="Test Doc", domain="example.com"
+    )
+    isolated_engine.doc_repo.add(
+        doc_id="doc_api_01", source_id="src_api_01", file_path=None,
+        content_hash="h1", raw_text="CenterPoint achieved 71.2 NDS on nuScenes benchmark."
+    )
+
+    # Move phase to FETCH so transitioning to CLEAN is valid
+    state.phase = ResearchPhase.FETCH
+    isolated_engine.save_state(state)
+
+    # 3. Call /clean
+    clean_res = client.post(f"/api/research/session/{sid}/clean")
+    assert clean_res.status_code == 200
+    assert clean_res.json()["total_chunks"] >= 1
+    assert clean_res.json()["phase"] == "CLEAN"
+
+    # 4. Call /retrieve
+    ret_res = client.post(
+        f"/api/research/session/{sid}/retrieve",
+        json={"query": "71.2 NDS nuScenes", "top_k": 3}
+    )
+    assert ret_res.status_code == 200
+    data = ret_res.json()
+    assert data["phase"] == "RETRIEVE"
+    assert data["results_count"] >= 1
+    assert "71.2 NDS" in data["results"][0]["text"]
