@@ -119,6 +119,12 @@ def teardown_logging(handlers: List[logging.Handler]) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     handlers = setup_logging()
+    # Eagerly initialize engine to validate embedding backend at startup
+    from backend.api.research import get_engine
+    if get_engine in app.dependency_overrides:
+        _ = app.dependency_overrides[get_engine]()
+    else:
+        _ = get_research_engine()
     try:
         yield
     finally:

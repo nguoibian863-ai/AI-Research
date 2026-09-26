@@ -186,10 +186,10 @@ def test_engine_search_skips_blocked_domains(tmp_path):
 
 def test_engine_search_relevance_whole_words_and_core_entities(tmp_path):
     """
-    Issue #1 Regression Test:
+    Issue #1 Regression Test (Neutral domain: RocksDB vs LevelDB storage):
     Search relevance filtering must:
     1. Match discrete whole words (e.g., 'map' must NOT match 'sitemap', 'nds' must NOT match 'friends').
-    2. Focus on core domain entities of goal/query, ignoring generic research terms ('benchmark', 'accuracy').
+    2. Focus on core domain entities of goal/query, ignoring generic research terms ('benchmark', 'accuracy', 'write').
     """
     from backend.tools.web_search import SearchResultItem
 
@@ -207,14 +207,14 @@ def test_engine_search_relevance_whole_words_and_core_entities(tmp_path):
                     snippet="Best friends forever - WhatsApp status quotes."
                 ),
                 SearchResultItem(
-                    title="Mobile Hardware Review",
-                    url="https://phones.example.com/review",
-                    snippet="Top 10 benchmark phones 2026 performance review."
+                    title="Storage Hardware Review",
+                    url="https://hardware.example.com/review",
+                    snippet="Top 10 benchmark storage devices 2026 performance review."
                 ),
                 SearchResultItem(
-                    title="YOLOv8 Object Detection Benchmark",
-                    url="https://docs.ultralytics.com/models/yolov8",
-                    snippet="Comprehensive YOLOv8 mAP accuracy and latency benchmark on COCO dataset."
+                    title="RocksDB Storage Engine Architecture",
+                    url="https://rocksdb.org/docs/benchmark",
+                    snippet="Comprehensive RocksDB throughput and write amplification benchmark on NVMe SSD."
                 )
             ]
 
@@ -225,15 +225,165 @@ def test_engine_search_relevance_whole_words_and_core_entities(tmp_path):
         search_tool=RelevanceSearchTool()
     )
 
-    state = engine.create_session("Compare YOLOv8 and RT-DETR accuracy and latency on COCO")
+    state = engine.create_session("Compare RocksDB and LevelDB write amplification on NVMe")
     state.phase = ResearchPhase.PLAN
     engine.save_state(state)
 
-    found_urls = engine.run_search_phase(state, custom_queries=["yolov8 coco latency"])
+    found_urls = engine.run_search_phase(state, custom_queries=["rocksdb nvme write amplification"])
 
-    # Only ultralytics YOLOv8 doc must be retained!
-    # sitemap, friends (WhatsApp), and benchmark phones must all be discarded!
+    # Only rocksdb.org doc must be retained!
+    # sitemap, friends, and generic hardware review must all be discarded!
     assert len(found_urls) == 1
-    assert "docs.ultralytics.com" in found_urls[0]
+    assert "rocksdb.org" in found_urls[0]
+
+
+def test_entity_coverage_loop_and_partial_reporting(tmp_path):
+    """
+    P0 Test: Verifies that comparison questions (A vs B) trigger targeted queries
+    in EVALUATE when entity B is missing, and if B remains uncovered at max_steps,
+    the session cleanly transitions to PARTIAL with 'Missing coverage: ...'.
+    """
+    from backend.tools.web_search import SearchResultItem
+    from backend.tools.web_fetch import FetchedWebContent
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    searched_queries = []
+
+    class MockSearch:
+        def search(self, query: str, max_results: int = 5):
+            searched_queries.append(query)
+            if "redis" in query.lower():
+                return [
+                    SearchResultItem(
+                        title="Redis In-Memory Data Store",
+                        url="https://redis.io/docs/benchmark",
+                        snippet="Redis latency and throughput benchmarks in RAM.",
+                        query=query,
+                        rank=1
+                    )
+                ]
+            # No results for memcached
+            return []
+
+    class MockFetch:
+        def fetch(self, url: str):
+            return FetchedWebContent(
+                url=url,
+                title="Redis Benchmarks",
+                text="Redis achieves 100k ops/sec throughput with sub-millisecond latency.",
+                content_hash=f"hash_{hash(url)}"
+            )
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Compare Redis and Memcached throughput",
+            "tasks": [
+                {"task_id": "t1", "description": "Benchmark Redis", "expected_evidence": "ops/sec"},
+                {"task_id": "t2", "description": "Benchmark Memcached", "expected_evidence": "ops/sec"}
+            ],
+            "key_hypotheses": ["Redis has higher throughput"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [
+                {"query": "Redis throughput benchmark", "query_type": "evidence", "rationale": "Redis data"}
+            ]
+        }
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "coverage_test.db")
+    engine = ResearchEngine(
+        llm=MockLLMBackend(canned_responses=canned),
+        db=db,
+        limits=ResearchLimits(max_research_steps=2),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    state = engine.create_session("Compare Redis and Memcached throughput")
+    result = engine.run_week1(state)
+
+    # 1. State must end in PARTIAL because Memcached was never found
+    assert result["phase"] == "PARTIAL"
+    assert result["status"] == "PARTIAL"
+    assert "Missing coverage: memcached" in (state.error_message or "")
+
+    # 2. Targeted search query for the missing entity 'memcached' was executed in step 2
+    assert any("memcached" in q.lower() for q in searched_queries)
+
+
+def test_entity_balanced_context_generation(tmp_path):
+    """
+    P0 Test: Verifies entity-balanced context generation in run_basic_answer:
+    Even if Entity A has 10 chunks and Entity B has only 1 chunk, the context
+    sent to the LLM synthesizer is guaranteed to include Entity B.
+    """
+    db = DatabaseManager(db_path=tmp_path / "balanced_test.db")
+    mock_llm = MockLLMBackend()
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(retrieval_top_k=4)
+    )
+
+    state = engine.create_session("Compare SystemAlpha and SystemBeta performance")
+    engine.source_repo.add(
+        source_id="src_1",
+        session_id=state.session_id,
+        url="https://alpha.example.com",
+        title="SystemAlpha Docs",
+        domain="alpha.example.com",
+        canonical_key="alpha"
+    )
+    state.source_ids.append("src_1")
+
+    engine.doc_repo.add(
+        doc_id="doc_alpha",
+        source_id="src_1",
+        file_path=None,
+        content_hash="hash_alpha",
+        raw_text="SystemAlpha full raw text"
+    )
+
+    # Add 10 chunks for SystemAlpha
+    alpha_chunks = [
+        {
+            "chunk_id": f"chunk_alpha_{i}",
+            "doc_id": "doc_alpha",
+            "text": f"SystemAlpha metric {i}: throughput is {1000 + i} req/sec with low latency.",
+            "page": None,
+            "section": "Metrics",
+            "char_start": 0,
+            "char_end": 50,
+            "token_count": 10
+        }
+        for i in range(10)
+    ]
+    engine.chunk_repo.add_batch(alpha_chunks)
+
+    # Add 1 chunk for SystemBeta
+    beta_chunks = [
+        {
+            "chunk_id": "chunk_beta_1",
+            "doc_id": "doc_alpha",
+            "text": "SystemBeta metric: throughput is 950 req/sec with high stability.",
+            "page": None,
+            "section": "Metrics",
+            "char_start": 0,
+            "char_end": 50,
+            "token_count": 10
+        }
+    ]
+    engine.chunk_repo.add_batch(beta_chunks)
+
+    state.phase = ResearchPhase.EVALUATE
+    engine.save_state(state)
+    _ = engine.run_basic_answer(state)
+
+    assert len(mock_llm.call_history) == 1
+    prompt_sent = mock_llm.call_history[0]["prompt"]
+    assert "SystemAlpha metric" in prompt_sent
+    assert "SystemBeta metric" in prompt_sent
+
 
 

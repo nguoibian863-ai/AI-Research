@@ -44,6 +44,12 @@ from backend.retrieval.bm25 import BM25Index
 from backend.retrieval.embeddings import EmbeddingBackend, LocalHashEmbeddingBackend
 from backend.retrieval.faiss_index import FaissVectorIndex
 from backend.retrieval.hybrid import HybridRetriever, RetrievedChunk
+from backend.core.coverage import (
+    extract_core_entities,
+    check_entity_in_text,
+    evaluate_coverage,
+    GENERIC_RESEARCH_TERMS
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,15 +58,6 @@ BLOCKED_DOMAINS = {
     "tiktok.com", "quora.com", "youtube.com"
 }
 
-GENERIC_RESEARCH_TERMS = {
-    "the", "and", "for", "with", "from", "that", "this", "which", "what", "how",
-    "why", "where", "when", "does", "did", "are", "were", "been", "has", "have",
-    "had", "not", "but", "can", "could", "will", "would", "about", "into", "over",
-    "after", "compare", "comparison", "eval", "evaluation", "evaluating", "evaluate",
-    "benchmark", "benchmarks", "performance", "overview", "review", "summary",
-    "analysis", "study", "article", "report", "guide", "post", "blog", "paper", "papers",
-    "test", "tests", "testing"
-}
 
 
 class ResearchEngine:
@@ -294,7 +291,7 @@ class ResearchEngine:
                 f"Question: {state.goal}"
             )
             res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema)
-            budget.record_llm_call(tokens=res.total_tokens)
+            budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
 
             plan_data: ResearchPlanSchema = res.parsed
             tasks = [
@@ -348,7 +345,7 @@ class ResearchEngine:
                     f"Previously visited: {state.visited_queries}"
                 )
                 res = self.llm.structured_generate(prompt, schema=GeneratedQueriesSchema)
-                budget.record_llm_call(tokens=res.total_tokens)
+                budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
                 generated: GeneratedQueriesSchema = res.parsed
                 queries_to_run = [q.query for q in generated.queries]
 
@@ -386,22 +383,10 @@ class ResearchEngine:
                             logger.info(f"[{state.session_id}][SEARCH] Skipping blocked domain: {domain}")
                             continue
 
-                        # Relevance filter: whole-word matching against core entities of goal & query
-                        query_and_goal = f"{state.goal} {q}".lower()
-                        raw_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", query_and_goal))
-                        # Primary: core entities (excluding generic research terms and stop words)
-                        core_entities = {t for t in raw_tokens if t not in GENERIC_RESEARCH_TERMS and len(t) >= 3}
-                        if not core_entities:
-                            # Fallback if query/goal consists entirely of generic terms (e.g. minimal unit tests)
-                            basic_stops = {
-                                "the", "and", "for", "with", "from", "that", "this", "which", "what",
-                                "how", "why", "where", "when", "does", "did", "are", "were", "been"
-                            }
-                            core_entities = {t for t in raw_tokens if t not in basic_stops and len(t) >= 2}
-
-                        # Tokenize item title, snippet, and URL path into discrete whole words
-                        item_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", f"{item.title} {item.snippet} {url}".lower()))
-                        if core_entities and not (core_entities & item_tokens):
+                        # Relevance filter: whole-word matching against core entities of query
+                        query_entities = extract_core_entities(q)
+                        item_content = f"{item.title} {item.snippet} {url}"
+                        if query_entities and not any(check_entity_in_text(ent, item_content) for ent in query_entities):
                             logger.info(f"[{state.session_id}][SEARCH] Skipping irrelevant search result (no core entity match): '{item.title}'")
                             continue
 
@@ -600,15 +585,33 @@ class ResearchEngine:
         """
         Executes the RETRIEVE phase: builds hybrid BM25 + FAISS index from SQLite chunks
         and retrieves top-K chunks via Reciprocal Rank Fusion (RRF).
+        Performs entity-balanced multi-query retrieval so distinct entities are not crowded out.
         """
         try:
             self.state_machine.transition(state, ResearchPhase.RETRIEVE, reason="Retrieving relevant evidence chunks")
             target_query = query or state.goal
             k = top_k or self.limits.retrieval_top_k
-            results = self.retrieve_chunks(session_id=state.session_id, query=target_query, top_k=k)
+
+            # 1. Main query retrieval
+            primary_results = self.retrieve_chunks(session_id=state.session_id, query=target_query, top_k=k)
+            seen_ids = {c.chunk_id for c in primary_results}
+            combined_results = list(primary_results)
+
+            # 2. Entity-level queries for balanced coverage across distinct subjects
+            core_entities = extract_core_entities(state.goal)
+            if len(core_entities) > 1:
+                per_entity_k = max(2, (k + len(core_entities) - 1) // len(core_entities))
+                for ent in core_entities:
+                    ent_query = f"{ent} {target_query}"
+                    ent_results = self.retrieve_chunks(session_id=state.session_id, query=ent_query, top_k=per_entity_k)
+                    for c in ent_results:
+                        if c.chunk_id not in seen_ids:
+                            seen_ids.add(c.chunk_id)
+                            combined_results.append(c)
+
             self.save_state(state)
-            logger.info(f"[{state.session_id}][RETRIEVE] Retrieved {len(results)} chunks for query: '{target_query}'.")
-            return results
+            logger.info(f"[{state.session_id}][RETRIEVE] Retrieved {len(combined_results)} balanced chunks for query: '{target_query}'.")
+            return combined_results
         except Exception as e:
             self._handle_phase_error(state, e, "RETRIEVE")
             raise
@@ -621,29 +624,67 @@ class ResearchEngine:
     ) -> str:
         """
         Synthesizes a grounded initial answer from retrieved chunks or fetched sources.
-        Records unverified trajectory strictly in 'raw' partition (resolves P0 fake confidence).
-        Transitions to PARTIAL if no substantive evidence context was found.
+        Guarantees balanced context representation across core entities.
+        Transitions to PARTIAL and records missing entities if coverage is incomplete.
         """
         try:
             budget = self.get_budget_tracker(state.session_id)
             budget.assert_can_call_llm()
 
-            # Build context prioritizing precision retrieved chunks
+            core_entities = extract_core_entities(state.goal)
+            db_chunks = self.chunk_repo.get_by_session(state.session_id)
+            cov = evaluate_coverage(core_entities, db_chunks)
+
+            missing_entities = cov.get("missing", [])
+            if missing_entities:
+                state.error_message = f"Missing coverage: {', '.join(missing_entities)}"
+                logger.warning(f"[{state.session_id}][ANSWER] Incomplete entity coverage: {state.error_message}")
+
+            # Build balanced context prioritizing equal representation across core entities
+            cand_chunks: List[Any] = retrieved_chunks or db_chunks
+            selected_chunks: List[Any] = []
+
+            if cand_chunks and core_entities:
+                k_per_entity = max(1, (self.limits.retrieval_top_k + len(core_entities) - 1) // len(core_entities))
+                used_chunk_ids = set()
+
+                # Pass 1: Select up to k_per_entity chunks for each core entity
+                for ent in core_entities:
+                    ent_count = 0
+                    for c in cand_chunks:
+                        c_id = c.chunk_id if hasattr(c, "chunk_id") else c["chunk_id"]
+                        c_text = c.text if hasattr(c, "text") else c["text"]
+                        if c_id not in used_chunk_ids and check_entity_in_text(ent, c_text):
+                            selected_chunks.append(c)
+                            used_chunk_ids.add(c_id)
+                            ent_count += 1
+                            if ent_count >= k_per_entity:
+                                break
+
+                # Pass 2: Fill remaining slots up to retrieval_top_k
+                for c in cand_chunks:
+                    if len(selected_chunks) >= self.limits.retrieval_top_k:
+                        break
+                    c_id = c.chunk_id if hasattr(c, "chunk_id") else c["chunk_id"]
+                    if c_id not in used_chunk_ids:
+                        selected_chunks.append(c)
+                        used_chunk_ids.add(c_id)
+            elif cand_chunks:
+                selected_chunks = list(cand_chunks[:self.limits.retrieval_top_k])
+
             context_snippets = []
-            if retrieved_chunks:
-                for i, chunk in enumerate(retrieved_chunks[:self.limits.retrieval_top_k], start=1):
-                    src_url = chunk.metadata.get("url") or "local"
-                    sec_info = f" [Section: {chunk.section}, Page: {chunk.page}]" if chunk.section else ""
-                    context_snippets.append(f"--- Evidence [{i}] ({src_url}){sec_info} ---\n{chunk.text}\n")
+            if selected_chunks:
+                for i, c in enumerate(selected_chunks, start=1):
+                    c_text = c.text if hasattr(c, "text") else c["text"]
+                    c_sec = getattr(c, "section", None) or (c.get("section") if isinstance(c, dict) else "")
+                    c_page = getattr(c, "page", None) or (c.get("page") if isinstance(c, dict) else "")
+                    c_url = (getattr(c, "metadata", {}).get("url") if hasattr(c, "metadata") else (c.get("url") if isinstance(c, dict) else "local")) or "local"
+                    sec_info = f" [Section: {c_sec}, Page: {c_page}]" if c_sec else ""
+                    context_snippets.append(f"--- Evidence [{i}] ({c_url}){sec_info} ---\n{c_text}\n")
             elif fetched_docs:
                 for i, doc in enumerate(fetched_docs[:5], start=1):
                     snippet = doc.text[:1200]
                     context_snippets.append(f"--- Source [{i}] ({doc.url}) ---\n{snippet}\n")
-            else:
-                db_chunks = self.chunk_repo.get_by_session(state.session_id)
-                for i, c in enumerate(db_chunks[:self.limits.retrieval_top_k], start=1):
-                    sec_info = f" [Section: {c.get('section')}, Page: {c.get('page')}]" if c.get('section') else ""
-                    context_snippets.append(f"--- Evidence [{i}] ({c.get('url', '')}){sec_info} ---\n{c['text']}\n")
 
             full_context = "\n".join(context_snippets) if context_snippets else "No external documents retrieved."
 
@@ -658,10 +699,10 @@ class ResearchEngine:
             # Transition to WRITE phase
             self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
             res = self.llm.generate(prompt)
-            budget.record_llm_call(tokens=res.total_tokens)
+            budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
             answer = res.content.strip()
 
-            # Transition state to DONE (or PARTIAL if no evidence found or answer states insufficient info)
+            # Transition state to DONE (or PARTIAL if missing coverage or insufficient info)
             insufficient_phrases = [
                 "no information available",
                 "insufficient information",
@@ -679,6 +720,7 @@ class ResearchEngine:
                 and bool(state.source_ids)
                 and "no external documents retrieved" not in full_context.lower()
                 and not is_insufficient
+                and not bool(missing_entities)
             )
             target_phase = ResearchPhase.DONE if has_valid_evidence else ResearchPhase.PARTIAL
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
@@ -715,7 +757,7 @@ class ResearchEngine:
 
     def run_week1(self, session_or_goal: Union[ResearchState, str]) -> Dict[str, Any]:
         """
-        End-to-End Orchestrator with real EVALUATE loop, chunking, and hybrid retrieval:
+        End-to-End Orchestrator with real entity coverage check and iterative research loop:
         Question -> PLAN -> (SEARCH -> FETCH -> CLEAN -> RETRIEVE -> EVALUATE)* -> WRITE -> DONE / PARTIAL
         """
         if isinstance(session_or_goal, str):
@@ -738,8 +780,13 @@ class ResearchEngine:
 
             # Research Loop (enforcing max_research_steps and evaluate_next_step)
             while True:
-                # Search
-                urls = self.run_search_phase(state)
+                # Search: use open questions as targeted custom queries if available
+                search_queries = None
+                if state.open_questions:
+                    search_queries = [oq.text for oq in state.open_questions]
+                    logger.info(f"[{state.session_id}][SEARCH] Targeted search queries from open questions: {search_queries}")
+
+                urls = self.run_search_phase(state, custom_queries=search_queries)
 
                 # Fetch
                 new_docs = self.run_fetch_phase(state, urls=urls)
@@ -751,8 +798,43 @@ class ResearchEngine:
                 # Hybrid Retrieval
                 top_chunks = self.run_retrieve_phase(state, query=state.goal)
 
-                # Evaluate: Transition to EVALUATE and let Python determine termination
+                # Evaluate: Transition to EVALUATE
                 self.state_machine.transition(state, ResearchPhase.EVALUATE, reason="Evaluating research iteration")
+
+                # Core Entity Coverage Check
+                core_entities = extract_core_entities(state.goal)
+                db_chunks = self.chunk_repo.get_by_session(state.session_id)
+                cov = evaluate_coverage(core_entities, db_chunks)
+                logger.info(f"[{state.session_id}][EVALUATE] Entity coverage: {cov}")
+
+                # Update state.open_questions:
+                # 1. Filter out open questions for entities that are now covered
+                updated_open_questions = [
+                    oq for oq in state.open_questions
+                    if oq.derived_from_gap in cov["missing"]
+                ]
+                # 2. Add open questions for missing entities not yet tracked
+                tracked_gaps = {oq.derived_from_gap for oq in updated_open_questions}
+                for missing_ent in cov["missing"]:
+                    if missing_ent not in tracked_gaps:
+                        context_keywords = [
+                            w for w in re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", state.goal.lower())
+                            if w not in [e.lower() for e in core_entities if e != missing_ent]
+                            and w != missing_ent.lower()
+                            and w not in {"compare", "comparison", "vs", "versus", "between", "and", "the", "for", "with", "from"}
+                        ]
+                        ctx_str = " ".join(context_keywords[:2])
+                        q_text = f"{missing_ent} {ctx_str} benchmark".strip() if ctx_str else f"{missing_ent} benchmark"
+                        updated_open_questions.append(
+                            OpenQuestion(
+                                question_id=f"oq_{uuid.uuid4().hex[:8]}",
+                                text=q_text,
+                                priority=1,
+                                derived_from_gap=missing_ent
+                            )
+                        )
+                state.open_questions = updated_open_questions
+
                 next_phase = self.state_machine.evaluate_next_step(state)  # Increments state.step!
                 budget.step_count = state.step  # Synchronize budget tracker counter!
                 self.save_state(state)
@@ -782,8 +864,5 @@ class ResearchEngine:
                 "budget": budget.summary()
             }
         except Exception as e:
-            # Phase methods already handled their own failures (terminal state -> no-op here);
-            # this catches failures between phases (e.g. EVALUATE) so the session never hangs.
             self._handle_phase_error(state, e, "RUN_E2E")
-            # Re-raise so FastAPI handlers return 409, 429, 502, etc.
             raise

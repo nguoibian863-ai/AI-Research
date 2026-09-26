@@ -75,3 +75,46 @@ def test_invalid_json_raises_model_inference_error(fake_ollama):
 
     with pytest.raises(ModelInferenceError):
         backend.structured_generate("Plan this", schema=ResearchPlanSchema)
+
+
+def test_structured_generate_retries_and_repairs_on_validation_error(monkeypatch):
+    """
+    P1 Test: JSON retry/repair loop.
+    Verifies that structured_generate catches schema validation errors on attempt 1,
+    sends error feedback to the LLM in attempt 2, and successfully parses the repaired response.
+    Verifies calls_made=2 and total_tokens accumulates across both calls.
+    """
+    requests_received = []
+    responses = [
+        "{\"goal\": \"missing tasks\"}",  # Attempt 1: schema error (missing tasks)
+        PLAN_JSON                        # Attempt 2: valid JSON matching schema
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_received.append(json.loads(request.content))
+        resp_content = responses.pop(0)
+        return httpx.Response(200, json={
+            "response": resp_content,
+            "prompt_eval_count": 12,
+            "eval_count": 8
+        })
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        ollama_module.httpx, "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs)
+    )
+
+    backend = OllamaBackend(system_prefix="/no_think")
+    res = backend.structured_generate("Plan this task", schema=ResearchPlanSchema)
+
+    assert len(requests_received) == 2
+    assert res.calls_made == 2
+    assert res.parsed.tasks[0].task_id == "t1"
+    assert res.total_tokens == 40  # (12 + 8) * 2
+
+    # Verify attempt 2 prompt contained validation error feedback
+    second_request_prompt = requests_received[1]["prompt"]
+    assert "Your previous output failed schema validation" in second_request_prompt
+    assert "missing" in second_request_prompt.lower()
+

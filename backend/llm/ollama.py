@@ -101,50 +101,72 @@ class OllamaBackend(LLMBackend):
             f"JSON Schema: {json.dumps(schema_dict)}"
         )
 
-        payload = {
-            "model": kwargs.get("model", self.model),
-            "prompt": prompt,
-            "system": enriched_system,
-            "format": schema_dict,
-            "stream": False,
-            "options": {
-                "temperature": kwargs.get("temperature", self.temperature),
-                "num_predict": kwargs.get("num_predict", self.max_output_tokens),
-                "num_ctx": kwargs.get("num_ctx", self.context_window)
+        current_prompt = prompt
+        accumulated_prompt_tokens = 0
+        accumulated_eval_tokens = 0
+        calls_made = 0
+        last_raw_content = ""
+
+        for attempt in range(2):
+            calls_made += 1
+            payload = {
+                "model": kwargs.get("model", self.model),
+                "prompt": current_prompt,
+                "system": enriched_system,
+                "format": schema_dict,
+                "stream": False,
+                "options": {
+                    "temperature": kwargs.get("temperature", self.temperature),
+                    "num_predict": kwargs.get("num_predict", self.max_output_tokens),
+                    "num_ctx": kwargs.get("num_ctx", self.context_window)
+                }
             }
-        }
 
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                res = client.post(url, json=payload)
-                res.raise_for_status()
-                data = res.json()
+            try:
+                with httpx.Client(timeout=self.timeout) as client:
+                    res = client.post(url, json=payload)
+                    res.raise_for_status()
+                    data = res.json()
 
-            raw_content = strip_think_block(data.get("response", ""))
-            if raw_content.startswith("```json"):
-                raw_content = raw_content[7:]
-            if raw_content.startswith("```"):
-                raw_content = raw_content[3:]
-            if raw_content.endswith("```"):
-                raw_content = raw_content[:-3]
-            raw_content = raw_content.strip()
+                prompt_eval_count = data.get("prompt_eval_count", 0)
+                eval_count = data.get("eval_count", 0)
+                accumulated_prompt_tokens += prompt_eval_count
+                accumulated_eval_tokens += eval_count
 
-            parsed_instance = schema.model_validate_json(raw_content)
+                raw_content = strip_think_block(data.get("response", ""))
+                if raw_content.startswith("```json"):
+                    raw_content = raw_content[7:]
+                if raw_content.startswith("```"):
+                    raw_content = raw_content[3:]
+                if raw_content.endswith("```"):
+                    raw_content = raw_content[:-3]
+                raw_content = raw_content.strip()
+                last_raw_content = raw_content
 
-            prompt_eval_count = data.get("prompt_eval_count", 0)
-            eval_count = data.get("eval_count", 0)
+                parsed_instance = schema.model_validate_json(raw_content)
 
-            return LLMResponse(
-                content=raw_content,
-                parsed=parsed_instance,
-                prompt_tokens=prompt_eval_count,
-                completion_tokens=eval_count,
-                total_tokens=prompt_eval_count + eval_count,
-                model_name=self.model
-            )
-        except ValidationError as ve:
-            logger.error(f"Ollama structured output schema mismatch: {ve}. Content was: {raw_content}")
-            raise ModelInferenceError(f"Schema validation error: {ve}") from ve
-        except Exception as e:
-            logger.error(f"Ollama structured generation failed: {e}")
-            raise ModelInferenceError(f"Ollama call failed: {e}") from e
+                return LLMResponse(
+                    content=raw_content,
+                    parsed=parsed_instance,
+                    prompt_tokens=accumulated_prompt_tokens,
+                    completion_tokens=accumulated_eval_tokens,
+                    total_tokens=accumulated_prompt_tokens + accumulated_eval_tokens,
+                    calls_made=calls_made,
+                    model_name=self.model
+                )
+            except (ValidationError, json.JSONDecodeError) as ve:
+                if attempt == 0:
+                    logger.warning(f"Ollama structured output attempt 1 failed validation ({ve}). Retrying with error feedback...")
+                    current_prompt = (
+                        f"{prompt}\n\n"
+                        f"IMPORTANT: Your previous output failed schema validation:\n"
+                        f"{ve}\n"
+                        f"Please fix the error and output valid JSON strictly matching the schema."
+                    )
+                    continue
+                else:
+                    logger.error(f"Ollama structured output schema mismatch after retry: {ve}. Content was: {last_raw_content}")
+                    raise ModelInferenceError(f"Schema validation error after retry: {ve}") from ve
+            except Exception as e:
+                logger.error(f"Ollama structured generation failed: {e}")
+                raise ModelInferenceError(f"Ollama call failed: {e}") from e

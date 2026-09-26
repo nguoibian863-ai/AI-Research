@@ -44,7 +44,9 @@ class FakeFetchTool:
         self.doc_text = doc_text or (
             "CenterPoint: Center-based 3D Object Detection. "
             "CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark with 3D LiDAR. "
-            "PointPillars achieves 59.2 NDS with fast encoder."
+            "PointPillars achieves 59.2 NDS with fast encoder. "
+            "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. "
+            "FlashAttention-2 yields up to 2x speedup compared to FlashAttention-1."
         )
 
     def fetch(self, url: str):

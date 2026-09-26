@@ -1,4 +1,5 @@
 import logging
+import pytest
 import backend.main
 
 
@@ -71,3 +72,25 @@ def test_logging_configured_in_lifespan_only(isolated_engine, tmp_path, monkeypa
     finally:
         backend.main.app.dependency_overrides.clear()
         root.removeHandler(sentinel)
+
+
+def test_lifespan_eagerly_validates_engine_and_fails_on_broken_backend(monkeypatch, tmp_path):
+    """
+    P1 Test: Startup backend validation.
+    Verifies that FastAPI lifespan eagerly instantiates the ResearchEngine to fail-fast
+    at server startup if the embedding backend or database cannot be initialized.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(backend.main, "LOGS_DIR", tmp_path / "logs")
+
+    def _broken_engine_factory():
+        raise RuntimeError("Embedding model initialization failed: download error")
+
+    monkeypatch.setattr(backend.main, "get_research_engine", _broken_engine_factory)
+
+    backend.main.app.dependency_overrides.clear()
+
+    with pytest.raises(RuntimeError, match="Embedding model initialization failed"):
+        with TestClient(backend.main.app):
+            pass

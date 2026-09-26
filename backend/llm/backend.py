@@ -9,6 +9,7 @@ class LLMResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    calls_made: int = 1
     model_name: str = ""
 
 

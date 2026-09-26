@@ -75,9 +75,9 @@ class ExecutionBudgetTracker:
         self.assert_can_fetch()
         self.fetch_calls += 1
 
-    def record_llm_call(self, tokens: int = 0) -> None:
+    def record_llm_call(self, tokens: int = 0, count: int = 1) -> None:
         self.assert_can_call_llm()
-        self.llm_calls += 1
+        self.llm_calls += count
         self.total_tokens_consumed += tokens
 
     def can_search(self) -> bool:
