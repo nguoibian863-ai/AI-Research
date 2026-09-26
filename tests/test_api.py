@@ -94,3 +94,40 @@ def test_lifespan_eagerly_validates_engine_and_fails_on_broken_backend(monkeypat
     with pytest.raises(RuntimeError, match="Embedding model initialization failed"):
         with TestClient(backend.main.app):
             pass
+
+
+def test_show_session_script_renders_saved_session(tmp_path, monkeypatch):
+    """scripts/show_session.py lets the owner inspect results without a server or SQLite GUI."""
+    import importlib.util
+    from pathlib import Path
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.db.database import DatabaseManager
+    from backend.llm.mock import MockLLMBackend
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+    from tests.conftest import FakeSearchTool, FakeFetchTool
+
+    db = DatabaseManager(db_path=tmp_path / "show.db")
+    canned = {
+        "GeneratedQueriesSchema": {"queries": [{"query": "CenterPoint PointPillars nuScenes", "rationale": "r"}]},
+        "ExtractedEvidencesSchema": {"facts": [
+            {"statement": "CenterPoint achieves 67.3 NDS on nuScenes.", "subject": "CenterPoint", "predicate": "achieves",
+             "metric": "NDS", "value": "67.3", "raw_quote": "CenterPoint achieves 60.3 mAP and 67.3 NDS"}]},
+        "generate": "CenterPoint reaches 67.3 NDS [E1].",
+    }
+    engine = ResearchEngine(MockLLMBackend(canned), db, ResearchLimits(max_research_steps=1),
+                            FakeSearchTool(), FakeFetchTool(), embedding_backend=LocalHashEmbeddingBackend(64))
+    result = engine.run_week1("Compare CenterPoint and PointPillars on nuScenes")
+
+    spec = importlib.util.spec_from_file_location("show_session", Path("scripts/show_session.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    sessions = module.list_sessions(db)
+    assert sessions[0]["session_id"] == result["session_id"]
+
+    text = module.render_session(db, result["session_id"])
+    assert "Compare CenterPoint and PointPillars on nuScenes" in text
+    assert "CenterPoint achieves 60.3 mAP and 67.3 NDS" in text   # verbatim quote
+    assert "## Claims trong report" in text
+    assert "CenterPoint reaches 67.3 NDS [E1]" in text              # report body

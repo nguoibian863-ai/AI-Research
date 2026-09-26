@@ -42,6 +42,7 @@ python -m pytest -q                      # toàn bộ test (~3s, offline)
 python -m pytest -q -m "not slow"        # bỏ test cần mạng/model
 uvicorn backend.main:app --host 127.0.0.1 --port 8000   # hoặc scripts/start_backend.ps1 (Windows)
 python scripts/benchmark_ollama.py       # đo tokens/s, VRAM, JSON constrained decoding
+python scripts/show_session.py           # liệt kê session; thêm <session_id> hoặc --latest để xem chi tiết + xuất data/reports/<id>.md
 ```
 
 E2E thật (cần Ollama chạy local):

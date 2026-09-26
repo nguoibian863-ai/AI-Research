@@ -42,3 +42,6 @@ logs/*.log
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Local E2E outputs
+run*.json
