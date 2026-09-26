@@ -39,6 +39,12 @@ def test_strip_think_block():
     assert strip_think_block("plain answer") == "plain answer"
 
 
+def test_strip_think_block_with_prefilled_opening_tag():
+    # Observed with SmolLM3 GGUF on Ollama: reasoning text followed by a bare closing tag.
+    raw = "Okay, the user just wrote a greeting...\nAlright, that should cover it.\n</think>\n\nHello! How can I assist you today?"
+    assert strip_think_block(raw) == "Hello! How can I assist you today?"
+
+
 def test_system_prefix_sent_and_think_block_stripped(fake_ollama):
     backend = OllamaBackend(model="hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M", system_prefix="/no_think")
     fake_ollama["response"] = f"<think>\n\n</think>\n{PLAN_JSON}"

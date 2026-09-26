@@ -53,7 +53,11 @@ def no_think_system(model_name: str):
 
 
 def strip_think_block(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # The chat template may prefill "<think>", leaving only the closing tag in the output.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
 
 
 def run_benchmark(model_name: str = DEFAULT_MODEL):

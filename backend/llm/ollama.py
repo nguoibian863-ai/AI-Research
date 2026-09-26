@@ -11,10 +11,15 @@ logger = logging.getLogger(__name__)
 
 # Reasoning models (SmolLM3, Qwen3, DeepSeek-R1) may emit a <think> block before the answer.
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_CLOSE = "</think>"
 
 
 def strip_think_block(text: str) -> str:
-    return _THINK_BLOCK_RE.sub("", text).strip()
+    text = _THINK_BLOCK_RE.sub("", text)
+    # The chat template may prefill the opening <think> tag, so only "</think>" appears in the output.
+    if _THINK_CLOSE in text:
+        text = text.rsplit(_THINK_CLOSE, 1)[1]
+    return text.strip()
 
 
 class OllamaBackend(LLMBackend):
