@@ -192,3 +192,110 @@ def test_multi_step_e2e_terminates_at_max_steps(isolated_engine):
     assert result["step"] == 2  # Proves loop ran 2 times and stopped cleanly at max_research_steps!
     assert result["status"] in {"COMPLETED", "PARTIAL"}
 
+
+def test_invalid_transition_does_not_corrupt_db_session(client, isolated_engine):
+    """
+    Regression Test for P0 Bug: _handle_phase_error corrupting valid session.
+    1. Calling /plan on a session currently in SEARCH must return 409 Conflict AND keep phase SEARCH (not PARTIAL/FAILED).
+    2. Calling /run with session_id of an already DONE session must return 409 Conflict AND keep phase DONE.
+    """
+    # 1. Create and move session to SEARCH
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Test invariant protection",
+            "tasks": [{"task_id": "t1", "description": "task 1", "expected_evidence": "ev1"}],
+            "key_hypotheses": ["hyp1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "test query", "query_type": "evidence", "rationale": "r1"}]
+        }
+    }
+    isolated_engine.llm = MockLLMBackend(canned_responses=canned)
+
+    create_res = client.post("/api/research/session", json={"goal": "Test invariant protection"})
+    sid = create_res.json()["session_id"]
+
+    plan_res = client.post(f"/api/research/session/{sid}/plan")
+    assert plan_res.status_code == 200
+
+    search_res = client.post(f"/api/research/session/{sid}/search")
+    assert search_res.status_code == 200
+
+    # Verify session is currently in SEARCH
+    st_search = isolated_engine.load_state(sid)
+    assert st_search.phase == ResearchPhase.SEARCH
+
+    # Now illegally call /plan again on the SEARCH session
+    invalid_plan_res = client.post(f"/api/research/session/{sid}/plan")
+    assert invalid_plan_res.status_code == 409
+
+    # CRITICAL: Verify DB state was NOT corrupted to PARTIAL or FAILED!
+    st_after = isolated_engine.load_state(sid)
+    assert st_after.phase == ResearchPhase.SEARCH
+    assert st_after.status == ResearchStatus.RUNNING
+
+    # 2. Test calling /run on an already DONE session
+    st_after.phase = ResearchPhase.DONE
+    st_after.status = ResearchStatus.COMPLETED
+    isolated_engine.save_state(st_after)
+
+    invalid_run_res = client.post("/api/research/run", json={"session_id": sid})
+    assert invalid_run_res.status_code == 409
+
+    # CRITICAL: Terminal state invariant holds; remains DONE, not mutated to PARTIAL
+    st_done = isolated_engine.load_state(sid)
+    assert st_done.phase == ResearchPhase.DONE
+    assert st_done.status == ResearchStatus.COMPLETED
+
+
+def test_run_e2e_failing_llm_returns_502(client, isolated_engine):
+    """
+    Regression Test for P1 Bug: run_week1 returning HTTP 200 with {'error': ...}.
+    When LLM fails, POST /api/research/run must propagate exception so FastAPI returns HTTP 502.
+    """
+    class FailingLLM(MockLLMBackend):
+        def structured_generate(self, *args, **kwargs):
+            raise ModelInferenceError("Ollama crashed during inference")
+
+    isolated_engine.llm = FailingLLM()
+    res = client.post("/api/research/run", json={"goal": "Test failing model in /run"})
+    assert res.status_code == 502
+    assert "ModelInferenceError" in res.json()["error"]
+
+
+def test_budget_step_sync(client, isolated_engine):
+    """
+    Regression Test for P1 Bug: budget.step_count not synchronized with state.step.
+    """
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Test step sync",
+            "tasks": [{"task_id": "t1", "description": "sync step", "expected_evidence": "ev"}],
+            "key_hypotheses": ["h1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "query sync", "query_type": "evidence", "rationale": "r"}]
+        }
+    }
+    isolated_engine.llm = MockLLMBackend(canned_responses=canned)
+
+    res = client.post("/api/research/run", json={"goal": "Test step sync"})
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["step"] >= 1
+    assert data["budget"]["steps"] == data["step"]
+
+    # Verify tracker loaded from DB matches state.step
+    tracker = isolated_engine.get_budget_tracker(data["session_id"])
+    assert tracker.step_count == data["step"]
+
+
+def test_run_with_nonexistent_session_id_returns_404(client):
+    """
+    Verifies that calling /run with a nonexistent session_id returns 404 Not Found.
+    """
+    res = client.post("/api/research/run", json={"session_id": "sess_nonexistent_99999"})
+    assert res.status_code == 404
+
+

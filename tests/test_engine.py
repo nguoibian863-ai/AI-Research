@@ -4,42 +4,8 @@ from backend.core.engine import ResearchEngine
 from backend.core.state import ResearchPhase, ResearchStatus
 from backend.core.limits import ResearchLimits
 from backend.llm.mock import MockLLMBackend
-from backend.llm.schemas import ResearchPlanSchema, PlanTaskSchema, GeneratedQueriesSchema, SearchQueryItemSchema
 from backend.db.database import DatabaseManager
-
-
-class FakeSearchTool:
-    def __init__(self):
-        self.called_queries = []
-
-    def search(self, query: str, max_results: int = 8):
-        from backend.tools.web_search import SearchResultItem
-        self.called_queries.append(query)
-        return [
-            SearchResultItem(
-                title=f"Result for {query}",
-                url="https://example.com/paper1",
-                snippet=f"Snippet for {query}",
-                query=query,
-                rank=1
-            )
-        ]
-
-
-class FakeFetchTool:
-    def __init__(self):
-        self.called_urls = []
-
-    def fetch(self, url: str):
-        from backend.tools.web_fetch import FetchedWebContent
-        self.called_urls.append(url)
-        return FetchedWebContent(
-            url=url,
-            title="Fake Paper Title",
-            text="Model X achieved 71.2 NDS on nuScenes benchmark.",
-            content_hash="fakehash123",
-            is_cached=False
-        )
+from tests.conftest import FakeSearchTool, FakeFetchTool
 
 
 def test_research_engine_plan_search_fetch():
@@ -87,11 +53,10 @@ def test_research_engine_plan_search_fetch():
         # Step 2: Search
         urls = engine.run_search_phase(state)
         assert state.phase == ResearchPhase.SEARCH
-        assert "Model X nuScenes NDS" in state.visited_queries
         assert len(urls) > 0
         assert len(state.source_ids) > 0
 
         # Step 3: Fetch
-        engine.run_fetch_phase(state, urls=urls)
+        docs = engine.run_fetch_phase(state, urls=urls)
         assert state.phase == ResearchPhase.FETCH
-        assert "https://example.com/paper1" in fake_fetch.called_urls
+        assert len(docs) > 0

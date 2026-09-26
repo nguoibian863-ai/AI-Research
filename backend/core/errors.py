@@ -3,6 +3,11 @@ class ResearchException(Exception):
     pass
 
 
+class SessionNotFoundError(ResearchException):
+    """Raised when a research session cannot be found in database."""
+    pass
+
+
 class StateTransitionError(ResearchException):
     """Raised when an invalid state transition is requested."""
     pass

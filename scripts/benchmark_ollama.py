@@ -1,9 +1,10 @@
 """
 Ollama Local Benchmark Script
-Measures token generation speed (tokens/sec), latency, and verifies JSON schema constrained decoding.
+Measures token generation speed (tokens/sec), latency, VRAM allocation, and verifies JSON schema constrained decoding.
 """
 
 import time
+import subprocess
 import httpx
 import json
 
@@ -14,21 +15,51 @@ TEST_PROMPT = (
 )
 
 
+def get_vram_usage():
+    """Queries nvidia-smi for current GPU memory usage if available."""
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,nounits,noheader"],
+            encoding="utf-8"
+        ).strip()
+        used, total, util = output.split(",")
+        return f"{used.strip()} MB / {total.strip()} MB (GPU Util: {util.strip()}%)"
+    except Exception:
+        return "N/A (nvidia-smi not accessible or running on CPU)"
+
+
+def get_ollama_ps():
+    """Queries Ollama /api/ps endpoint to inspect loaded model VRAM footprint."""
+    try:
+        res = httpx.get(f"{OLLAMA_URL}/api/ps", timeout=5.0)
+        data = res.json().get("models", [])
+        if data:
+            for m in data:
+                size_vram_mb = m.get("size_vram", 0) / (1024 * 1024)
+                size_total_mb = m.get("size", 0) / (1024 * 1024)
+                return f"{m.get('name')}: VRAM {size_vram_mb:.1f} MB / Total {size_total_mb:.1f} MB"
+        return "No model actively loaded in Ollama VRAM"
+    except Exception:
+        return "Ollama ps not available"
+
+
 def run_benchmark(model_name: str = "smollm3:3b"):
     print(f"\n=======================================================")
-    print(f"Benchmarking Local Ollama Model: {model_name}")
+    print(f"Benchmarking Local Ollama Model: {model_name} (Profile: Laptop 4GB)")
     print(f"=======================================================")
 
-    # 1. Check server
+    # 1. Check server and models
     try:
         res = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5.0)
         models = [m["name"] for m in res.json().get("models", [])]
         print(f"Ollama server is active. Installed models: {', '.join(models)}")
         if model_name not in models and not any(m.startswith(model_name) for m in models):
-            print(f"[WARNING] Model '{model_name}' not found locally. Available models are listed above.")
+            print(f"[WARNING] Model '{model_name}' not found locally. Using installed model if available.")
     except Exception as e:
         print(f"[ERROR] Could not connect to Ollama server at {OLLAMA_URL}: {e}")
         return
+
+    print(f"Initial GPU Status: {get_vram_usage()}")
 
     # 2. Benchmark Raw Generation
     print(f"\n[Test 1] Raw Generation Speed Benchmark...")
@@ -59,6 +90,8 @@ def run_benchmark(model_name: str = "smollm3:3b"):
         print(f"  - Prompt Eval Tokens : {prompt_eval_count}")
         print(f"  - Generated Tokens   : {eval_count}")
         print(f"  - Generation Speed   : {tokens_per_sec:.2f} tokens/second")
+        print(f"  - Post-gen Ollama VRAM: {get_ollama_ps()}")
+        print(f"  - Post-gen GPU Memory : {get_vram_usage()}")
     except Exception as e:
         print(f"  - Benchmark failed: {e}")
 
@@ -101,5 +134,5 @@ def run_benchmark(model_name: str = "smollm3:3b"):
 
 if __name__ == "__main__":
     import sys
-    model = sys.argv[1] if len(sys.argv) > 1 else "qwen3:8b"
+    model = sys.argv[1] if len(sys.argv) > 1 else "smollm3:3b"
     run_benchmark(model)

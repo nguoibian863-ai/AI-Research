@@ -13,7 +13,12 @@ from backend.core.state import (
 from backend.core.limits import ResearchLimits
 from backend.core.budget import ExecutionBudgetTracker
 from backend.core.transitions import StateMachine
-from backend.core.errors import BudgetExceededError, StateTransitionError, ResearchException
+from backend.core.errors import (
+    BudgetExceededError,
+    StateTransitionError,
+    ResearchException,
+    SessionNotFoundError
+)
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ResearchPlanSchema, GeneratedQueriesSchema
 from backend.db.database import DatabaseManager
@@ -102,7 +107,7 @@ class ResearchEngine:
         """P0: Full state restoration directly from SQLite Source of Truth."""
         row = self.session_repo.get(session_id)
         if not row:
-            raise KeyError(f"Research session '{session_id}' not found in database.")
+            raise SessionNotFoundError(f"Research session '{session_id}' not found in database.")
 
         plan = None
         if row.get("plan_json"):
@@ -175,16 +180,33 @@ class ResearchEngine:
         )
 
     def _handle_phase_error(self, state: ResearchState, error: Exception, phase_name: str) -> None:
-        """Transitions state to FAILED or PARTIAL upon unhandled exception and saves error context."""
-        logger.error(f"[{state.session_id}][{phase_name}] Failure: {error}", exc_info=True)
+        """
+        Handles runtime failures while strictly preserving state machine invariants.
+        CRITICAL RULES:
+        1. Terminal states are immutable: If phase is DONE, PARTIAL, FAILED, or CANCELLED, do not touch state.phase!
+        2. Validation / Transition errors (e.g. StateTransitionError): The caller sent an invalid request.
+           Do NOT corrupt the session state in the database!
+        3. Runtime errors (e.g. ModelInferenceError, IO error): Transition cleanly via StateMachine
+           to FAILED or PARTIAL (if sources were collected), record error_message, and save state.
+           NEVER bypass the state machine with direct assignment!
+        """
+        logger.error(f"[{state.session_id}][{phase_name}] Failure: {error}")
+
+        # Rule 1 & 2: Do not alter state for client validation errors or if already terminal
+        if isinstance(error, StateTransitionError):
+            return
+
+        if state.phase in {ResearchPhase.DONE, ResearchPhase.PARTIAL, ResearchPhase.FAILED, ResearchPhase.CANCELLED}:
+            return
+
         state.error_message = str(error)
         target_phase = ResearchPhase.PARTIAL if state.source_ids else ResearchPhase.FAILED
         try:
-            self.state_machine.transition(state, target_phase, reason=f"Error in {phase_name}: {error}")
-        except Exception:
-            state.phase = target_phase
-            state.status = ResearchStatus.PARTIAL if target_phase == ResearchPhase.PARTIAL else ResearchStatus.FAILED
-        self.save_state(state)
+            self.state_machine.transition(state, target_phase, reason=f"Runtime error in {phase_name}: {error}")
+            self.save_state(state)
+        except Exception as transition_err:
+            logger.warning(f"[{state.session_id}] Could not transition to {target_phase}: {transition_err}")
+            self.save_state(state)
 
     def run_plan_phase(self, state: ResearchState) -> None:
         """Executes the PLAN phase with strict budget checks."""
@@ -461,6 +483,7 @@ class ResearchEngine:
                 # Evaluate: Transition to EVALUATE and let Python determine termination
                 self.state_machine.transition(state, ResearchPhase.EVALUATE, reason="Evaluating research iteration")
                 next_phase = self.state_machine.evaluate_next_step(state)  # Increments state.step!
+                budget.step_count = state.step  # Synchronize budget tracker counter!
                 self.save_state(state)
 
                 logger.info(f"[{state.session_id}][EVALUATE] Step {state.step}/{self.limits.max_research_steps}, next: {next_phase.value}")
@@ -486,14 +509,6 @@ class ResearchEngine:
                 "answer": answer,
                 "budget": budget.summary()
             }
-        except Exception as e:
-            self._handle_phase_error(state, e, "RUN_E2E")
-            return {
-                "session_id": state.session_id,
-                "goal": state.goal,
-                "phase": state.phase.value,
-                "status": state.status.value,
-                "step": state.step,
-                "error": state.error_message,
-                "budget": budget.summary()
-            }
+        except Exception:
+            # Let the specific phase failure propagate so FastAPI handlers return 409, 429, 502, etc.
+            raise

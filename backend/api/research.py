@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from backend.core.engine import ResearchEngine
 from backend.core.state import ResearchPhase, ResearchStatus
+from backend.core.errors import SessionNotFoundError
 
 router = APIRouter(prefix="/api/research", tags=["Research"])
 
@@ -45,7 +46,7 @@ def create_session(req: CreateSessionRequest, engine: ResearchEngine = Depends(g
 def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     try:
         state = engine.load_state(session_id)
-    except KeyError:
+    except (KeyError, SessionNotFoundError):
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     sources = engine.source_repo.get_by_session(session_id)
@@ -75,7 +76,7 @@ def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
 def run_plan(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     try:
         state = engine.load_state(session_id)
-    except KeyError:
+    except (KeyError, SessionNotFoundError):
         raise HTTPException(status_code=404, detail="Session not found")
 
     engine.run_plan_phase(state)
@@ -90,7 +91,7 @@ def run_plan(session_id: str, engine: ResearchEngine = Depends(get_engine)):
 def run_search(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     try:
         state = engine.load_state(session_id)
-    except KeyError:
+    except (KeyError, SessionNotFoundError):
         raise HTTPException(status_code=404, detail="Session not found")
 
     urls = engine.run_search_phase(state)
@@ -106,7 +107,7 @@ def run_search(session_id: str, engine: ResearchEngine = Depends(get_engine)):
 def run_fetch(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     try:
         state = engine.load_state(session_id)
-    except KeyError:
+    except (KeyError, SessionNotFoundError):
         raise HTTPException(status_code=404, detail="Session not found")
 
     docs = engine.run_fetch_phase(state)
@@ -122,7 +123,7 @@ def run_fetch(session_id: str, engine: ResearchEngine = Depends(get_engine)):
 def run_answer(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     try:
         state = engine.load_state(session_id)
-    except KeyError:
+    except (KeyError, SessionNotFoundError):
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Get fetched sources
@@ -151,12 +152,19 @@ def run_answer(session_id: str, engine: ResearchEngine = Depends(get_engine)):
 @router.post("/run")
 def run_end_to_end(req: RunResearchRequest, engine: ResearchEngine = Depends(get_engine)):
     """P0-3 & P0-4: End-to-End One-Click Execution (Question -> Plan -> Search -> Fetch -> Answer)"""
-    target = req.session_id or req.goal
-    if not target:
+    if req.session_id:
+        try:
+            state = engine.load_state(req.session_id)
+        except (KeyError, SessionNotFoundError):
+            raise HTTPException(status_code=404, detail=f"Session {req.session_id} not found")
+        result = engine.run_week1(state)
+        return result
+    elif req.goal:
+        result = engine.run_week1(req.goal)
+        return result
+    else:
         raise HTTPException(status_code=400, detail="Either 'goal' or 'session_id' must be provided.")
 
-    result = engine.run_week1(target)
-    return result
 
 
 @router.get("/trajectories/{partition}")
