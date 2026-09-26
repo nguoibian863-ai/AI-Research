@@ -1,0 +1,44 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Data & local stores (keep structure, ignore generated databases and caches)
+data/*.db
+data/*.sqlite
+data/pdf/*
+!data/pdf/.gitkeep
+data/web_cache/*
+!data/web_cache/.gitkeep
+data/indexes/*
+!data/indexes/.gitkeep
+data/evidence/*
+!data/evidence/.gitkeep
+data/reports/*
+!data/reports/.gitkeep
+data/trajectories/raw/*
+!data/trajectories/raw/.gitkeep
+data/trajectories/candidate/*
+!data/trajectories/candidate/.gitkeep
+data/trajectories/gold/*
+!data/trajectories/gold/.gitkeep
+data/trajectories/eval/*
+!data/trajectories/eval/.gitkeep
+
+# Logs
+logs/*.log
+
+# Environment variables
+.env
+.env.local
+
+# OS specific
+.DS_Store
+Thumbs.db

@@ -1,0 +1,48 @@
+system:
+  name: "Local Deep Research Agent"
+  version: "0.1.0"
+  env: "development"
+
+paths:
+  db_path: "data/research.db"
+  pdf_dir: "data/pdf"
+  web_cache_dir: "data/web_cache"
+  index_dir: "data/indexes"
+  evidence_dir: "data/evidence"
+  reports_dir: "data/reports"
+  trajectories_dir: "data/trajectories"
+  logs_dir: "logs"
+
+llm:
+  default_provider: "ollama"  # ollama | llama_cpp | mock
+  ollama:
+    base_url: "http://127.0.0.1:11434"
+    model: "qwen3:8b"
+    timeout_seconds: 120
+    temperature: 0.1
+  llama_cpp:
+    base_url: "http://127.0.0.1:8080"
+    model: "smollm3-3b"
+  context_window: 4096
+  max_output_tokens: 1024
+
+limits:
+  max_research_steps: 5
+  max_search_calls: 12
+  max_fetch_calls: 20
+  max_search_results: 8
+  max_sources_per_run: 15
+  max_total_chunks: 300
+  max_chunk_tokens: 600
+  max_evidence_items: 30
+  retrieval_top_k: 5
+  max_llm_calls: 30
+  max_runtime_seconds: 600
+
+token_budget:
+  planner: 1800
+  query_generator: 1000
+  extractor: 3000
+  gap_evaluator: 2000
+  verifier: 2000
+  writer: 6000
