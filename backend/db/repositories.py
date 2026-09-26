@@ -102,11 +102,14 @@ class SourceRepository:
     def add(self, source_id: str, session_id: str, url: str, title: str, domain: str,
             source_type: str = "web", canonical_key: Optional[str] = None, authors: Optional[List[str]] = None,
             published_at: Optional[str] = None, credibility_score: Optional[float] = None,
-            credibility_details: Optional[Dict[str, Any]] = None) -> None:
+            credibility_details: Optional[Dict[str, Any]] = None,
+            goal_entities: Optional[List[str]] = None) -> None:
         authors_json = json.dumps(authors or [])
         if credibility_score is None:
             from backend.sources.credibility import score_source_credibility
-            cred_res = score_source_credibility(url=url, title=title, domain=domain, published_at=published_at)
+            cred_res = score_source_credibility(
+                url=url, title=title, domain=domain, published_at=published_at, goal_entities=goal_entities
+            )
             credibility_score = cred_res["score"]
             credibility_details = cred_res
         credibility_details_json = json.dumps(credibility_details or {})
@@ -292,7 +295,7 @@ class EvidenceRepository:
             SELECT e.evidence_id, e.session_id, e.raw_evidence_id, e.subject, e.predicate,
                    e.object_json, e.confidence, e.created_at,
                    r.raw_quote, r.page, r.section, r.char_start, r.char_end, r.chunk_id,
-                   s.source_id, s.url, s.title as source_title
+                   s.source_id, s.url, s.title as source_title, s.credibility_score as source_score
             FROM evidences e
             JOIN raw_evidences r ON e.raw_evidence_id = r.raw_evidence_id
             JOIN sources s ON r.source_id = s.source_id

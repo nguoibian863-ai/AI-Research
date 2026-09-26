@@ -834,7 +834,10 @@ def test_uncited_numeric_report_creates_unsupported_claim_and_forces_partial(tmp
     unsupported = [c for c in claims if c["status"] == "UNSUPPORTED"]
 
     assert len(supported) >= 1
-    assert supported[0]["verification"]["verified"] is True
+    # CITED = cited + numerically consistent, but not verified until entailment runs (plan 24)
+    assert supported[0]["verification"]["verified"] is False
+    assert supported[0]["verification"]["entailment"] == "PENDING"
+    assert supported[0]["verification"]["numeric_match"] is True
     assert supported[0]["evidence_ids"][0].startswith("evi_")
 
     assert len(unsupported) >= 1
@@ -1120,38 +1123,137 @@ def test_cross_domain_benchmarks_and_syntactic_context_extraction():
 
 
 def test_source_credibility_scoring_plan_14():
-    from backend.sources.credibility import score_source_credibility
+    from backend.sources.credibility import score_source_credibility, MIN_SOURCE_SCORE
 
-    # Academic primary paper (arXiv)
+    goal_entities = ["yolov8", "rt-detr"]
+
+    # Academic primary paper (arXiv) naming a goal entity
     arxiv_res = score_source_credibility(
         url="https://arxiv.org/abs/2304.08069",
-        title="DETRs Beat YOLOs on Real-time Object Detection",
-        text="We report extensive benchmark results and experiments on COCO val2017."
+        title="RT-DETR: DETRs Beat YOLOs on Real-time Object Detection",
+        goal_entities=goal_entities
     )
     assert arxiv_res["tier"] == "TIER_1_ACADEMIC"
     assert arxiv_res["authority"] == 1.0
     assert arxiv_res["primary_source"] == 1.0
-    assert arxiv_res["score"] >= 0.85
+    assert 0 <= arxiv_res["score"] <= 100
+    assert arxiv_res["score"] >= 80
 
-    # Official open source repository
-    gh_res = score_source_credibility(
-        url="https://github.com/open-mmlab/OpenPCDet",
-        title="OpenPCDet Toolbox",
-        text="OpenPCDet is an open source 3D object detection codebase with reproducible benchmarks."
-    )
-    assert gh_res["tier"] == "TIER_2_OFFICIAL"
-    assert gh_res["reproducibility"] == 1.0
-    assert gh_res["score"] >= 0.80
-
-    # Third-party community blog
+    # Third-party community blog scores lower than the primary paper
     blog_res = score_source_credibility(
-        url="https://medium.com/@random_user/my-thoughts-on-yolo",
-        title="My Thoughts on YOLO",
-        text="In my opinion, YOLO is cool."
+        url="https://medium.com/@random_user/yolov8-vs-rt-detr",
+        title="YOLOv8 vs RT-DETR: my thoughts",
+        goal_entities=goal_entities
     )
     assert blog_res["tier"] == "TIER_3_COMMUNITY_BLOG"
-    assert blog_res["authority"] == 0.50
-    assert blog_res["score"] <= 0.60
+    assert blog_res["score"] < arxiv_res["score"]
+
+    # Social media stays below the fetch threshold even when it names the entities
+    social_res = score_source_credibility(
+        url="https://www.linkedin.com/posts/someone_yolov8-rt-detr",
+        title="YOLOv8 and RT-DETR hot take",
+        goal_entities=goal_entities
+    )
+    assert social_res["tier"] == "SOCIAL"
+    assert social_res["score"] < MIN_SOURCE_SCORE
 
 
+def test_credibility_domain_matching_is_not_substring():
+    from backend.sources.credibility import score_source_credibility
+
+    spoofed_code_host = score_source_credibility(url="https://github.com.evil.io/x")
+    assert spoofed_code_host["tier"] != "CODE_HOST"
+
+    lookalike_academic = score_source_credibility(url="https://pacm.org/x")
+    assert lookalike_academic["tier"] != "TIER_1_ACADEMIC"
+
+    real_subdomain = score_source_credibility(url="https://dl.acm.org/doi/10.1145/123")
+    assert real_subdomain["tier"] == "TIER_1_ACADEMIC"
+
+
+def test_code_host_is_primary_only_for_goal_entity_repo():
+    from backend.sources.credibility import score_source_credibility
+
+    goal_entities = ["yolov8", "rt-detr"]
+    own_repo = score_source_credibility(
+        url="https://github.com/lyuwenyu/RT-DETR", title="RT-DETR official", goal_entities=goal_entities
+    )
+    random_fork = score_source_credibility(
+        url="https://github.com/randomuser/detector-fork", title="My detector fork", goal_entities=goal_entities
+    )
+    ieee_paper = score_source_credibility(
+        url="https://ieeexplore.ieee.org/document/123", title="YOLOv8 and RT-DETR evaluation", goal_entities=goal_entities
+    )
+    assert own_repo["primary_source"] == 1.0
+    assert random_fork["primary_source"] < 1.0
+    assert random_fork["score"] < ieee_paper["score"]
+
+
+def test_comparison_operands_are_never_context_entities():
+    from backend.core.coverage import extract_context_entities, extract_core_entities
+
+    def required(goal):
+        ctx = extract_context_entities(goal)
+        return [e for e in extract_core_entities(goal) if e not in ctx]
+
+    assert required("Compare Rust with Go for backend services") == ["rust", "go"]
+    assert required("How does CenterPoint perform in comparison with PointPillars") == ["centerpoint", "pointpillars"]
+    assert required("Compare FastAPI with Django on PyPy") == ["fastapi", "django"]
+    assert extract_context_entities("Compare FastAPI with Django on PyPy") == {"pypy"}
+
+
+def test_search_skips_low_credibility_source_and_evidence_carries_score(tmp_path):
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.core.state import ResearchPhase
+    from backend.db.database import DatabaseManager
+    from backend.llm.mock import MockLLMBackend
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+    from backend.tools.web_search import SearchResultItem
+    from backend.evidence.verifier import CitationVerifier
+    from tests.conftest import FakeFetchTool
+
+    class MixedSearchTool:
+        def search(self, query, max_results=8):
+            return [
+                SearchResultItem(title="CenterPoint and PointPillars hot take",
+                                 url="https://www.linkedin.com/posts/someone_centerpoint-pointpillars",
+                                 snippet="CenterPoint vs PointPillars opinions"),
+                SearchResultItem(title="CenterPoint: Center-based 3D Object Detection and Tracking",
+                                 url="https://arxiv.org/abs/2006.11275",
+                                 snippet="CenterPoint and PointPillars results on nuScenes"),
+            ]
+
+    engine = ResearchEngine(
+        llm=MockLLMBackend(),
+        db=DatabaseManager(db_path=tmp_path / "cred.db"),
+        limits=ResearchLimits(),
+        search_tool=MixedSearchTool(),
+        fetch_tool=FakeFetchTool(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=128)
+    )
+    state = engine.create_session("Compare CenterPoint and PointPillars on nuScenes")
+    state.phase = ResearchPhase.PLAN
+    engine.save_state(state)
+
+    found = engine.run_search_phase(state, custom_queries=["CenterPoint PointPillars nuScenes"])
+    assert found == ["https://arxiv.org/abs/2006.11275"]
+
+    sources = engine.source_repo.get_by_session(state.session_id)
+    assert len(sources) == 1
+    assert sources[0]["credibility_score"] >= 80
+
+    # Evidence joined with its source exposes source_score, and the writer prompt shows it
+    engine.raw_evidence_repo.add(
+        raw_evidence_id="revi_1", session_id=state.session_id, source_id=sources[0]["source_id"],
+        raw_quote="CenterPoint achieves 67.3 NDS on nuScenes", chunk_id=None
+    )
+    engine.evidence_repo.add(
+        evidence_id="evi_1", session_id=state.session_id, raw_evidence_id="revi_1",
+        subject="CenterPoint", predicate="achieves",
+        object_data={"statement": "CenterPoint achieves 67.3 NDS on nuScenes."}, confidence=1.0
+    )
+    evidence = engine.evidence_repo.get_full_evidence_by_session(state.session_id)
+    assert evidence[0]["source_score"] == sources[0]["credibility_score"]
+    assert "Source score:" in CitationVerifier.format_evidence_for_prompt(evidence)
 

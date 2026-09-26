@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS sources (
     source_type TEXT DEFAULT 'web',
     domain TEXT,
     canonical_key TEXT,
-    credibility_score REAL DEFAULT 0.5,
+    credibility_score REAL,
     credibility_details_json TEXT,
     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
@@ -202,6 +202,6 @@ class DatabaseManager:
             cursor_src = conn.execute("PRAGMA table_info(sources)")
             existing_src_cols = {row["name"] for row in cursor_src.fetchall()}
             if "credibility_score" not in existing_src_cols:
-                conn.execute("ALTER TABLE sources ADD COLUMN credibility_score REAL DEFAULT 0.5")
+                conn.execute("ALTER TABLE sources ADD COLUMN credibility_score REAL")
             if "credibility_details_json" not in existing_src_cols:
                 conn.execute("ALTER TABLE sources ADD COLUMN credibility_details_json TEXT")

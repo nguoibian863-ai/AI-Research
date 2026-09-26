@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-26, commit `4f3872c`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-26, sau commit sửa context entity + credibility (xem `git log`).
 
 ## Tiến độ
 
@@ -8,11 +8,11 @@
 |---|---|---|
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
-| 3 — Evidence Engine | ~88% | Numeric check cho câu có `[E#]` đã có; credibility score đã tính nhưng **chưa được dùng**; **chưa chạy E2E thật sau các bản sửa** |
+| 3 — Evidence Engine | ~92% | Numeric check, credibility score (lọc trước FETCH, truyền vào writer) đã có; **chưa chạy E2E thật sau các bản sửa** |
 | 4 — Verification + UI | chưa bắt đầu | |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 71 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 75 passed + 1 skipped (test FastEmbed cần mạng).
 
 ## Đã giải quyết ở `4f3872c`
 
@@ -21,16 +21,19 @@ Test: 71 passed + 1 skipped (test FastEmbed cần mạng).
 - Năm (2019…) và số đếm nhỏ không đơn vị không còn gây `PARTIAL`.
 - Danh sách benchmark mở rộng (CSDL, LLM, phần cứng) + nhận diện context entity theo giới từ.
 
+## Đã giải quyết (review 4f3872c)
+
+- Context entity không còn nuốt đối thủ so sánh: bỏ `with`, bỏ qua "in comparison with", operand trước mệnh đề ngữ cảnh luôn là thực thể bắt buộc.
+- Credibility score thang 0–100 theo plan 14.1 (authority 30, primary_source 30, directness 20, recency 10, independence 10); so khớp domain theo host/subdomain; mạng xã hội < 40; repo code chỉ là primary khi owner/repo trùng thực thể của goal.
+- Source < `min_source_score` (40) bị bỏ trước FETCH; evidence mang `source_score`; writer thấy evidence điểm cao trước và thấy điểm trong prompt.
+- Claim `CITED` không còn `verified: True` (entailment `PENDING`); lý do PARTIAL không còn ghi "no valid citations" khi câu có citation nhưng sai số.
+
 ## Vấn đề còn mở (ưu tiên từ trên xuống)
 
-1. **`extract_context_entities` nuốt mất đối thủ so sánh.** Giới từ `with`/`in` quá rộng: "Compare Rust **with Go**" → `go` bị coi là context; "in comparison **with PointPillars**" → `pointpillars` bị loại khỏi coverage, còn `perform` lại thành thực thể bắt buộc.
-2. **Credibility score chưa được dùng**: không lọc trước FETCH, không truyền vào evidence/writer (tiêu chí nghiệm thu Tuần 3: "source < 40 không bị fetch").
-3. Thang điểm 0–1 trong khi plan dùng 0–100; điểm thấp nhất có thể đạt ~0.56 nên ngưỡng 0.40 không bao giờ kích hoạt; `facebook.com` (0.67) cao hơn blog Medium (0.58).
-4. So khớp domain bằng chuỗi con: `github.com.evil.io` và `pacm.org` được xếp hạng như GitHub/ACM. Repo GitHub bất kỳ (0.90) cao hơn bài IEEE (0.89).
-5. Lý do PARTIAL gây hiểu nhầm: câu có citation nhưng sai số → vẫn ghi thêm "Report contains no valid citations".
-6. `CITED` vẫn kèm `verified: True` dù chưa qua entailment (plan mục 24).
-7. Chưa có lần chạy E2E thật sau khi sửa Tuần 3 (lần gần nhất `sess_ebc602b16c47`: 0 evidence).
-8. Chưa ghi trajectory cho `query_generation` / `evidence_extraction` (plan 43.1).
+1. **Chưa có lần chạy E2E thật sau khi sửa Tuần 3** (lần gần nhất `sess_ebc602b16c47`: 0 evidence). Cần chạy 2–3 câu hỏi ở lĩnh vực khác nhau để đóng Tuần 3.
+2. Forum/Q&A (reddit, stackoverflow) có nhắc đúng thực thể vẫn đạt ~45 điểm và được fetch — theo dõi qua chạy thật.
+3. Chưa ghi trajectory cho `query_generation` / `evidence_extraction` (plan 43.1).
+4. Entailment verifier (NLI model, plan 23) và reranker cross-encoder (18.1) — Tuần 4.
 
 ## Lịch sử kết quả chạy thật
 

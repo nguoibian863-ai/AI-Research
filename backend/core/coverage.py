@@ -47,6 +47,7 @@ GENERIC_RESEARCH_TERMS = {
     "validate", "validates", "validated", "validating", "validation",
     "find", "finds", "found", "finding", "findings",
     "detail", "details", "detailed",
+    "perform", "performs", "performed", "performing", "compared", "compares", "contrast", "versus",
     "like", "such", "than", "more", "most", "less", "least",
     "of", "to", "in", "on", "at", "by", "as", "is", "it", "an", "or", "we",
     "do", "so", "no", "if", "my", "up", "out", "off", "all", "any", "some",
@@ -150,27 +151,54 @@ DATASET_BENCHMARK_TERMS = {
 }
 
 
+# Prepositions that introduce experimental context (dataset, benchmark, hardware).
+# 'with' is deliberately excluded: "Compare Rust with Go" names a comparison operand, not context.
+CONTEXT_PREPOSITION_RE = re.compile(r"\b(?:on|in|using|across|under)\s+([^,.;:!?\n]+)", re.IGNORECASE)
+
+# Phrases like "in comparison with X" introduce an operand, not context.
+NON_CONTEXT_PHRASE_RE = re.compile(
+    r"^(?:comparison|contrast|relation|terms|addition|order|place|favou?r|lieu)\b", re.IGNORECASE
+)
+
+# Words that introduce a comparison operand ("A vs B", "A with B", "A and B").
+COMPARISON_OPERAND_RE = re.compile(r"\b(?:vs\.?|versus|against|with|and|or)\s+([A-Za-z0-9_][A-Za-z0-9_.-]*)", re.IGNORECASE)
+
+
 def extract_context_entities(text: str) -> Set[str]:
     """
     Extracts benchmark, dataset, or environmental context entities that follow
-    prepositions like 'on', 'in', 'using', 'across', 'under', 'with' in research goals.
+    'on', 'in', 'using', 'across', 'under' in research goals.
     E.g. in 'Compare Postgres and MySQL on TPC-C', 'tpc-c' is a context entity.
     Also handles conjunctions like 'on MMLU and GSM8K'.
+
+    Comparison operands are never context: 'with' is not a context preposition,
+    'in comparison with X' is skipped, and any entity introduced by vs/with/and/or
+    before the context clause stays a required entity.
     """
     if not text:
         return set()
-    context_ents = set()
-    # Match clause after prepositions up to punctuation or end of string
-    matches = re.findall(
-        r"\b(?:on|in|using|across|under|with)\s+([^,.;:!?\n]+)",
-        text,
-        re.IGNORECASE
-    )
-    for m in matches:
-        sub_tokens = extract_core_entities(m)
-        for tok in sub_tokens:
+    context_ents: Set[str] = set()
+    first_context_start = None
+
+    for m in CONTEXT_PREPOSITION_RE.finditer(text):
+        clause = m.group(1).strip()
+        if NON_CONTEXT_PHRASE_RE.match(clause):
+            continue
+        if first_context_start is None:
+            first_context_start = m.start()
+        for tok in extract_core_entities(clause):
             context_ents.add(tok.lower())
-    return context_ents
+
+    if not context_ents:
+        return context_ents
+
+    # Entities named as comparison operands before the context clause are compared subjects
+    head = text[:first_context_start]
+    operands = {
+        op.lower().rstrip(".")
+        for op in COMPARISON_OPERAND_RE.findall(head)
+    }
+    return {e for e in context_ents if e not in operands}
 
 
 METRIC_UNITS_RE = re.compile(

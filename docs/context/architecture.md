@@ -10,7 +10,7 @@ Question
 → loop (tối đa max_research_steps):
     SEARCH    open_questions (nếu có) hoặc LLM sinh 2–4 query ngắn
               → lọc domain chặn → lọc liên quan (core entities, whole-word)
-              → dedup canonical key → lưu sources
+              → dedup canonical key → source_score (0–100, bỏ nếu < 40) → lưu sources
     FETCH     HTML → HTMLCleaner (trafilatura) | PDF → PDFFetchTool (PyMuPDF, page-aware)
               → documents → SectionAwareChunker → chunks (≤ max_total_chunks)
     CLEAN     chunk các document chưa có chunk
@@ -45,7 +45,7 @@ Offset bất biến: `document.text[chunk.char_start:chunk.char_end] == chunk.te
 
 ## Chưa có (theo plan)
 
-- Source credibility scoring (mục 14.1), OpenAlex/arXiv provider (12.5)
+- OpenAlex/arXiv provider (12.5)
 - Cross-encoder reranker (18.1), NLI entailment verifier (23), numeric check cho câu có `[E#]` (24)
 - Writer theo section (27.1), UI (29)
 - Trajectory cho `query_generation` / `evidence_extraction` (43.1), `training/` (45.4)

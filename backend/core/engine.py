@@ -57,6 +57,7 @@ from backend.core.coverage import (
 from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
 from backend.sources.dedup import compute_canonical_key
+from backend.sources.credibility import score_source_credibility
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,13 @@ class ResearchEngine:
         self._llm = val
         if hasattr(self, "evidence_extractor") and self.evidence_extractor is not None:
             self.evidence_extractor.llm = val
+
+    @staticmethod
+    def _goal_subject_entities(goal: str) -> List[str]:
+        """Core entities of the goal that are compared subjects (datasets/benchmarks/context excluded)."""
+        context = set(DATASET_BENCHMARK_TERMS) | extract_context_entities(goal)
+        subjects = [e for e in extract_core_entities(goal) if e not in context]
+        return subjects or extract_core_entities(goal)
 
     def get_session_retriever(self, session_id: str) -> HybridRetriever:
         """Returns or creates an isolated HybridRetriever per session."""
@@ -370,6 +378,7 @@ class ResearchEngine:
 
             existing_urls = self.source_repo.get_urls_by_session(state.session_id)
             found_urls: List[str] = []
+            goal_entities = self._goal_subject_entities(state.goal)
 
             for q in queries_to_run:
                 if not budget.can_search():
@@ -416,6 +425,18 @@ class ResearchEngine:
                             continue
 
                         if url not in existing_urls and url not in found_urls:
+                            # Plan 14.2: score source before fetching; low-credibility sources are skipped
+                            cred = score_source_credibility(
+                                url=url, title=item.title, domain=domain, text=item.snippet,
+                                goal_entities=goal_entities
+                            )
+                            if cred["score"] < self.limits.min_source_score:
+                                logger.info(
+                                    f"[{state.session_id}][SEARCH] Skipping low-credibility source "
+                                    f"(score {cred['score']} < {self.limits.min_source_score}, {cred['tier']}): {url}"
+                                )
+                                continue
+
                             found_urls.append(url)
                             existing_urls.add(url)
                             source_id = f"src_{uuid.uuid4().hex[:8]}"
@@ -426,7 +447,9 @@ class ResearchEngine:
                                 url=url,
                                 title=item.title,
                                 domain=domain,
-                                canonical_key=canonical_k
+                                canonical_key=canonical_k,
+                                credibility_score=cred["score"],
+                                credibility_details=cred
                             )
 
             self.save_state(state)
@@ -492,7 +515,8 @@ class ResearchEngine:
                             canonical_key=compute_canonical_key(url, fetched.title or url),
                             authors=authors_list,
                             published_at=pub_date,
-                            source_type="pdf" if is_pdf_url else "web"
+                            source_type="pdf" if is_pdf_url else "web",
+                            goal_entities=self._goal_subject_entities(state.goal)
                         )
                         if source_id not in state.source_ids:
                             state.source_ids.append(source_id)
@@ -821,6 +845,8 @@ class ResearchEngine:
                 evidence_items = self.evidence_repo.get_full_evidence_by_session(state.session_id)
 
             if evidence_items:
+                # Plan 14.2: writer sees higher-credibility evidence first; same list backs [E#] indices below
+                evidence_items = sorted(evidence_items, key=lambda ev: -(ev.get("source_score") or 0.0))
                 evidence_prompt_text = CitationVerifier.format_evidence_for_prompt(evidence_items)
                 prompt = (
                     f"You are a Research Analyst. Provide a clear, factual, and strictly grounded research answer to the question "
@@ -919,14 +945,15 @@ class ResearchEngine:
                             )
                             numeric_mismatch_claims_count += 1
                         else:
-                            # Fully grounded citation (status="CITED", verified=True)
+                            # Cited and numerically consistent; entailment check is pending (plan 23/24)
                             self.claim_repo.add(
                                 claim_id=claim_id,
                                 session_id=state.session_id,
                                 text=sent,
                                 evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
                                 verification={
-                                    "verified": True,
+                                    "verified": False,
+                                    "entailment": "PENDING",
                                     "numeric_match": True,
                                     "citation_indices": valid_cites_in_sent,
                                     "citation_index": valid_cites_in_sent[0],
@@ -958,10 +985,7 @@ class ResearchEngine:
 
             # Evidence-based entity coverage check:
             # Each core entity in research goal must have at least 1 verified atomic evidence item!
-            context_entities = set(DATASET_BENCHMARK_TERMS) | extract_context_entities(state.goal)
-            goal_core_entities = [e for e in extract_core_entities(state.goal) if e not in context_entities]
-            if not goal_core_entities:
-                goal_core_entities = extract_core_entities(state.goal)
+            goal_core_entities = self._goal_subject_entities(state.goal)
 
             ev_coverage = evaluate_evidence_coverage(goal_core_entities, evidence_items)
             missing_evidence_entities = ev_coverage["missing"] if len(goal_core_entities) > 1 else []
@@ -999,7 +1023,7 @@ class ResearchEngine:
                     partial_reasons.append("No verified atomic evidence extracted")
                 if missing_evidence_entities:
                     partial_reasons.append(f"Missing evidence for: {', '.join(missing_evidence_entities)}")
-                if supported_claims_count == 0 and evidence_items:
+                if supported_claims_count == 0 and numeric_mismatch_claims_count == 0 and evidence_items:
                     partial_reasons.append("Report contains no valid citations")
                 if numeric_mismatch_claims_count > 0:
                     partial_reasons.append("Report contains numeric claims mismatched with cited evidence")

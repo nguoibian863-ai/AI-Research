@@ -11,6 +11,7 @@ class ResearchLimits(BaseModel):
     max_chunk_tokens: int = Field(default=600, description="Chunk length limit in tokens")
     max_evidence_items: int = Field(default=30, description="Max atomic evidence items stored")
     retrieval_top_k: int = Field(default=5, description="Number of chunks retrieved per query")
+    min_source_score: float = Field(default=40.0, description="Sources scoring below this (0-100, plan 14.2) are not fetched")
     max_llm_calls: int = Field(default=30, description="Max LLM inferences allowed per run")
     max_runtime_seconds: int = Field(default=600, description="Hard timeout for total research run in seconds")
     llm_context: int = Field(default=4096, description="Target LLM context window")

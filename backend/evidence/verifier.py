@@ -33,6 +33,9 @@ class CitationVerifier:
             if page is not None and page != "":
                 loc_parts.append(f"Page: {page}")
             loc_str = f" ({', '.join(loc_parts)})" if loc_parts else ""
+            source_score = ev.get("source_score")
+            if source_score is not None:
+                loc_str += f" [Source score: {source_score:.0f}/100]"
 
             lines.append(
                 f"[E{i}] {statement}\n"
