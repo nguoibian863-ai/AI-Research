@@ -830,7 +830,7 @@ def test_uncited_numeric_report_creates_unsupported_claim_and_forces_partial(tmp
 
     # Verify claim lineage in DB
     claims = engine.claim_repo.get_by_session(result["session_id"])
-    supported = [c for c in claims if c["status"] == "SUPPORTED"]
+    supported = [c for c in claims if c["status"] == "CITED"]
     unsupported = [c for c in claims if c["status"] == "UNSUPPORTED"]
 
     assert len(supported) >= 1
@@ -890,5 +890,268 @@ def test_evidence_based_entity_coverage_triggers_partial_when_one_entity_lacks_e
     assert result["phase"] == "PARTIAL"
     assert result["status"] == "PARTIAL"
     assert "Missing evidence for: pointpillars" in result["error_message"]
+
+
+def test_cited_sentence_with_mismatched_numbers_triggers_numeric_mismatch_and_partial(tmp_path: Path):
+    """
+    Scenario 4: Report cites [E1] but contains fabricated metric (95.0 NDS)
+    not found in the verbatim quote (which has 67.3 NDS).
+    Must mark claim as NUMERIC_MISMATCH, verified=False, and force session to PARTIAL!
+    """
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Evaluate CenterPoint detection",
+            "tasks": [{"task_id": "t1", "description": "nuScenes test", "expected_evidence": "NDS"}],
+            "key_hypotheses": ["detection"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "CenterPoint nuScenes", "query_type": "evidence", "rationale": "r"}]
+        },
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "NDS",
+                    "value": "67.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        },
+        # LLM cites [E1] but fabricates a 95.0 NDS metric!
+        "generate": "CenterPoint reaches 95.0 NDS on nuScenes benchmark [E1]."
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "scenario_4_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Evaluate CenterPoint detection")
+
+    assert result["phase"] == "PARTIAL"
+    assert result["status"] == "PARTIAL"
+    assert "Report contains numeric claims mismatched with cited evidence" in result["error_message"]
+
+    claims = engine.claim_repo.get_by_session(result["session_id"])
+    mismatch_claims = [c for c in claims if c["status"] == "NUMERIC_MISMATCH"]
+    assert len(mismatch_claims) == 1
+    assert mismatch_claims[0]["verification"]["verified"] is False
+    assert mismatch_claims[0]["verification"]["numeric_match"] is False
+    assert "95.0" in mismatch_claims[0]["verification"]["mismatched_numbers"]
+
+
+def test_sentence_citing_multiple_evidences_deduplicates_to_single_claim(tmp_path: Path):
+    """
+    Ensures that when a sentence cites multiple evidences (e.g. [E1] and [E2]),
+    it is stored as ONE single claim record with evidence_ids=[E1, E2] rather than duplicating.
+    """
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Evaluate CenterPoint detection",
+            "tasks": [{"task_id": "t1", "description": "task", "expected_evidence": "ev"}],
+            "key_hypotheses": ["h1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "CenterPoint", "query_type": "evidence", "rationale": "r"}]
+        },
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                },
+                {
+                    "statement": "CenterPoint achieves 67.3 NDS.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "NDS",
+                    "value": "67.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark.",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        },
+        # Sentence citing both [E1] and [E2]
+        "generate": "CenterPoint achieves 60.3 mAP [E1] and 67.3 NDS on the benchmark [E2]."
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "dedup_claims_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Evaluate CenterPoint detection")
+    assert result["phase"] == "DONE"
+
+    claims = engine.claim_repo.get_by_session(result["session_id"])
+    assert len(claims) == 1
+    assert claims[0]["status"] == "CITED"
+    assert len(claims[0]["evidence_ids"]) == 2
+    assert claims[0]["verification"]["citation_indices"] == [1, 2]
+
+
+def test_year_and_small_integer_counts_do_not_trigger_uncited_claims(tmp_path: Path):
+    """
+    Ensures that calendar years (e.g. 2019) and small count integers without units (e.g. '2 models', '3 stages')
+    do NOT trigger uncited numeric claim penalties or false PARTIAL transitions.
+    """
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Evaluate CenterPoint detection",
+            "tasks": [{"task_id": "t1", "description": "task", "expected_evidence": "ev"}],
+            "key_hypotheses": ["h1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "CenterPoint", "query_type": "evidence", "rationale": "r"}]
+        },
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        },
+        # Sentence contains year 2019 and small counts 2 and 3 without metric units
+        "generate": "In 2019, researchers evaluated 2 models across 3 experimental phases. CenterPoint achieves 60.3 mAP [E1]."
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "year_filter_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Evaluate CenterPoint detection")
+    assert result["phase"] == "DONE"
+    assert result["status"] == "COMPLETED"
+
+    claims = engine.claim_repo.get_by_session(result["session_id"])
+    unsupported = [c for c in claims if c["status"] == "UNSUPPORTED"]
+    assert len(unsupported) == 0
+
+
+def test_cross_domain_benchmarks_and_syntactic_context_extraction():
+    from backend.core.coverage import extract_context_entities, extract_core_entities
+    from backend.evidence.extractor import verify_atomic_fact
+    from backend.llm.schemas import AtomicFactItemSchema
+
+    # 1. Database benchmark extraction
+    g1 = "Compare PostgreSQL and MySQL on TPC-C"
+    ctx1 = extract_context_entities(g1)
+    assert "tpc-c" in ctx1 or "tpcc" in ctx1
+
+    # 2. LLM benchmark extraction
+    g2 = "Evaluate Llama 3 vs Qwen 2 on MMLU and GSM8K"
+    ctx2 = extract_context_entities(g2)
+    assert "mmlu" in ctx2
+    assert "gsm8k" in ctx2
+
+    # 3. Systems benchmark extraction with 'using'
+    g3 = "Compare RocksDB and LevelDB using db_bench"
+    ctx3 = extract_context_entities(g3)
+    assert "db_bench" in ctx3
+
+    # 4. verify_atomic_fact allows context entity from goal across domains
+    fact = AtomicFactItemSchema(
+        statement="PostgreSQL achieves 12500 tpmC on TPC-C benchmark.",
+        subject="PostgreSQL",
+        predicate="achieves",
+        metric="tpmC",
+        value="12500",
+        raw_quote="PostgreSQL achieves 12500 tpmC on TPC-C benchmark",
+        confidence=0.98
+    )
+    is_valid, reason = verify_atomic_fact(
+        fact=fact,
+        target_chunk={"text": "In our evaluation, PostgreSQL achieves 12500 tpmC on TPC-C benchmark."},
+        verified_quote="PostgreSQL achieves 12500 tpmC on TPC-C benchmark",
+        goal="Compare PostgreSQL and MySQL on TPC-C",
+        goal_entities=extract_core_entities("Compare PostgreSQL and MySQL on TPC-C")
+    )
+    assert is_valid is True
+    assert reason == "VERIFIED"
+
+
+def test_source_credibility_scoring_plan_14():
+    from backend.sources.credibility import score_source_credibility
+
+    # Academic primary paper (arXiv)
+    arxiv_res = score_source_credibility(
+        url="https://arxiv.org/abs/2304.08069",
+        title="DETRs Beat YOLOs on Real-time Object Detection",
+        text="We report extensive benchmark results and experiments on COCO val2017."
+    )
+    assert arxiv_res["tier"] == "TIER_1_ACADEMIC"
+    assert arxiv_res["authority"] == 1.0
+    assert arxiv_res["primary_source"] == 1.0
+    assert arxiv_res["score"] >= 0.85
+
+    # Official open source repository
+    gh_res = score_source_credibility(
+        url="https://github.com/open-mmlab/OpenPCDet",
+        title="OpenPCDet Toolbox",
+        text="OpenPCDet is an open source 3D object detection codebase with reproducible benchmarks."
+    )
+    assert gh_res["tier"] == "TIER_2_OFFICIAL"
+    assert gh_res["reproducibility"] == 1.0
+    assert gh_res["score"] >= 0.80
+
+    # Third-party community blog
+    blog_res = score_source_credibility(
+        url="https://medium.com/@random_user/my-thoughts-on-yolo",
+        title="My Thoughts on YOLO",
+        text="In my opinion, YOLO is cool."
+    )
+    assert blog_res["tier"] == "TIER_3_COMMUNITY_BLOG"
+    assert blog_res["authority"] == 0.50
+    assert blog_res["score"] <= 0.60
+
 
 

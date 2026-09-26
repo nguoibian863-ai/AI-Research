@@ -6,7 +6,9 @@ from backend.db.database import DatabaseManager
 from backend.db.repositories import RawEvidenceRepository, EvidenceRepository
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema
-from backend.core.coverage import extract_core_entities, check_entity_in_text, DATASET_BENCHMARK_TERMS
+from backend.core.coverage import (
+    extract_core_entities, check_entity_in_text, DATASET_BENCHMARK_TERMS, extract_context_entities
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +115,8 @@ def verify_atomic_fact(
     target_chunk: Dict[str, Any],
     verified_quote: str,
     min_quote_len: int = 15,
-    goal_entities: Optional[List[str]] = None
+    goal_entities: Optional[List[str]] = None,
+    goal: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
     Python-based rule verification for atomic facts (Anti-hallucination guardrail).
@@ -130,6 +133,11 @@ def verify_atomic_fact(
     quote_lower = verified_quote.lower()
     chunk_text = target_chunk.get("text", "")
     chunk_text_lower = chunk_text.lower()
+
+    # Pre-calculate domain benchmark & syntactic context entities
+    context_entities = set(DATASET_BENCHMARK_TERMS)
+    if goal:
+        context_entities |= extract_context_entities(goal)
 
     # 1. Subject verification: subject must be grounded in quote or chunk
     if fact.subject:
@@ -175,6 +183,8 @@ def verify_atomic_fact(
             for ent in stmt_entities:
                 if ent in subj_lower or subj_lower in ent:
                     continue
+                if ent in context_entities:
+                    continue
                 # If statement makes a comparison with another entity, that entity MUST be in the verbatim quote
                 if not check_entity_in_text(ent, quote_lower):
                     return False, f"UNSUPPORTED_COMPARISON: comparative statement mentions entity '{ent}' not found in verbatim quote"
@@ -184,8 +194,8 @@ def verify_atomic_fact(
             for ent in goal_entities:
                 if ent in subj_lower or subj_lower in ent:
                     continue
-                # Skip datasets/benchmarks - they provide experimental context, not competitor assertions
-                if ent in DATASET_BENCHMARK_TERMS:
+                # Skip datasets/benchmarks & contextual entities - they provide experimental context, not competitor assertions
+                if ent in context_entities:
                     continue
                 if check_entity_in_text(ent, stmt_lower):
                     # For non-dataset competitor entities, must be grounded in quote or chunk
@@ -302,7 +312,7 @@ class EvidenceExtractor:
 
                 # Check if matched_quote itself satisfies rule verification
                 is_valid, reject_reason = verify_atomic_fact(
-                    fact, target_chunk, matched_quote, min_quote_len=15, goal_entities=goal_entities
+                    fact, target_chunk, matched_quote, min_quote_len=15, goal_entities=goal_entities, goal=goal
                 )
                 verified_verbatim_quote = matched_quote
                 final_start, final_end = start_idx, end_idx
@@ -311,7 +321,7 @@ class EvidenceExtractor:
                     # Sentence expansion: expand quote to full sentence boundaries for rich context & grounding
                     exp_start, exp_end, expanded_quote = expand_quote_to_sentence(start_idx, end_idx, c_text)
                     is_valid_exp, reject_reason_exp = verify_atomic_fact(
-                        fact, target_chunk, expanded_quote, min_quote_len=15, goal_entities=goal_entities
+                        fact, target_chunk, expanded_quote, min_quote_len=15, goal_entities=goal_entities, goal=goal
                     )
                     if is_valid_exp:
                         verified_verbatim_quote = expanded_quote

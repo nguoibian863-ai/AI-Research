@@ -132,11 +132,97 @@ def evaluate_coverage(entities: List[str], chunks: List[Dict[str, Any]]) -> Dict
 
 
 DATASET_BENCHMARK_TERMS = {
+    # Computer Vision
     "nuscenes", "coco", "kitti", "imagenet", "waymo", "cityscapes", "voc",
     "pascal", "glue", "squad", "cifar", "cifar10", "cifar100", "mnist",
     "lvis", "wider", "mot17", "mot20", "bdd100k", "argoverse", "shapenet",
-    "scanrefer", "scannet", "sunrgbd", "tum", "kitti360"
+    "scanrefer", "scannet", "sunrgbd", "tum", "kitti360",
+    # Database / Systems
+    "tpcc", "tpc-c", "tpch", "tpc-h", "ycsb", "sysbench", "chbenchmark",
+    "ch-benchmark", "linkbench", "graph500", "db_bench", "dbbench",
+    # LLM / NLP
+    "mmlu", "gsm8k", "humaneval", "arc", "hellaswag", "math", "winogrande",
+    "drop", "truthfulqa", "alpacaeval", "mt-bench", "mtbench", "swe-bench",
+    "swebench", "superglue",
+    # CPU / Hardware / Compute
+    "spec", "specint", "specfp", "specrate", "coremark", "cinebench",
+    "geekbench", "mlperf", "linpack", "stream"
 }
+
+
+def extract_context_entities(text: str) -> Set[str]:
+    """
+    Extracts benchmark, dataset, or environmental context entities that follow
+    prepositions like 'on', 'in', 'using', 'across', 'under', 'with' in research goals.
+    E.g. in 'Compare Postgres and MySQL on TPC-C', 'tpc-c' is a context entity.
+    Also handles conjunctions like 'on MMLU and GSM8K'.
+    """
+    if not text:
+        return set()
+    context_ents = set()
+    # Match clause after prepositions up to punctuation or end of string
+    matches = re.findall(
+        r"\b(?:on|in|using|across|under|with)\s+([^,.;:!?\n]+)",
+        text,
+        re.IGNORECASE
+    )
+    for m in matches:
+        sub_tokens = extract_core_entities(m)
+        for tok in sub_tokens:
+            context_ents.add(tok.lower())
+    return context_ents
+
+
+METRIC_UNITS_RE = re.compile(
+    r"^(?:\s*(?:%|ms|s|fps|map|nds|ap|gb|mb|kb|ghz|mhz|tpmc|ops/s|qps|queries/s|tokens/s|tok/s|times|x|parameters|param|layers|b|m|k))\b",
+    re.IGNORECASE
+)
+
+
+def extract_substantive_numbers(text: str) -> List[str]:
+    """
+    Extracts substantive numeric metrics from sentence text while ignoring:
+    1. Citation brackets like [E1], [E2]
+    2. URLs (e.g. arxiv IDs in https://...)
+    3. Model/hardware identifiers (e.g. 3D, 2D, YOLOv8, GPT-4, A100)
+    4. 4-digit calendar years (1900-2099) without metric units
+    5. Standalone small integer counts (1-5) without metric units (e.g. '2 models', '3 stages')
+    """
+    if not text:
+        return []
+
+    # 1. Strip citations and URLs
+    clean_text = re.sub(r"\[E\d+\]", " ", text)
+    clean_text = re.sub(r"https?://\S+", " ", clean_text)
+
+    # 2. Mask out model / hardware / dimension tokens like 3D, 2D, YOLOv8, A100, GPT-4
+    clean_text = re.sub(r"\b\d+[dD]\b", " ", clean_text)
+    clean_text = re.sub(r"\b[a-zA-Z]+[-_]?\d+[a-zA-Z0-9_-]*\b", " ", clean_text)
+
+    substantive = []
+    for m in re.finditer(r"\b\d+(?:\.\d+)?\b", clean_text):
+        num_str = m.group(0)
+
+        # Floating point decimals (e.g. 60.3, 0.99, 95.0, 10.0) are always substantive
+        if "." in num_str:
+            substantive.append(num_str)
+            continue
+
+        val = int(num_str)
+        trailing_text = clean_text[m.end():m.end() + 20]
+        has_metric_unit = bool(METRIC_UNITS_RE.search(trailing_text))
+
+        # Ignore 4-digit calendar years (e.g. 2019, 2024) unless directly attached to a metric unit
+        if 1900 <= val <= 2099 and not has_metric_unit:
+            continue
+
+        # Ignore small integer counts (1-5) if they have no metric units (e.g. '2 models', '3 steps')
+        if 1 <= val <= 5 and not has_metric_unit:
+            continue
+
+        substantive.append(num_str)
+
+    return substantive
 
 
 def evaluate_evidence_coverage(

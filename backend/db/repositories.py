@@ -101,15 +101,22 @@ class SourceRepository:
 
     def add(self, source_id: str, session_id: str, url: str, title: str, domain: str,
             source_type: str = "web", canonical_key: Optional[str] = None, authors: Optional[List[str]] = None,
-            published_at: Optional[str] = None) -> None:
+            published_at: Optional[str] = None, credibility_score: Optional[float] = None,
+            credibility_details: Optional[Dict[str, Any]] = None) -> None:
         authors_json = json.dumps(authors or [])
+        if credibility_score is None:
+            from backend.sources.credibility import score_source_credibility
+            cred_res = score_source_credibility(url=url, title=title, domain=domain, published_at=published_at)
+            credibility_score = cred_res["score"]
+            credibility_details = cred_res
+        credibility_details_json = json.dumps(credibility_details or {})
         with self.db.session() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO sources (source_id, session_id, url, title, authors_json, published_at, source_type, domain, canonical_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO sources (source_id, session_id, url, title, authors_json, published_at, source_type, domain, canonical_key, credibility_score, credibility_details_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (source_id, session_id, url, title, authors_json, published_at, source_type, domain, canonical_key)
+                (source_id, session_id, url, title, authors_json, published_at, source_type, domain, canonical_key, credibility_score, credibility_details_json)
             )
 
     def get_by_session(self, session_id: str) -> List[Dict[str, Any]]:

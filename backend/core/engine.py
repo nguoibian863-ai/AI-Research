@@ -50,7 +50,9 @@ from backend.core.coverage import (
     evaluate_coverage,
     evaluate_evidence_coverage,
     GENERIC_RESEARCH_TERMS,
-    DATASET_BENCHMARK_TERMS
+    DATASET_BENCHMARK_TERMS,
+    extract_context_entities,
+    extract_substantive_numbers
 )
 from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
@@ -849,7 +851,8 @@ class ResearchEngine:
             # Append Evidence & Provenance Table and populate claims lineage if evidence items exist
             claims_json = "[]"
             supported_claims_count = 0
-            unsupported_numeric_claims_count = 0
+            numeric_mismatch_claims_count = 0
+            uncited_numeric_claims_count = 0
 
             if evidence_items:
                 augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(raw_report, evidence_items)
@@ -880,55 +883,90 @@ class ResearchEngine:
 
                     cited_tokens = re.findall(r"\[E(\d+)\]", sent)
                     valid_cites_in_sent = [int(t) for t in cited_tokens if 1 <= int(t) <= len(evidence_items)]
-
-                    # Check for numeric metrics in the sentence (excluding [E#] citation brackets and URLs)
-                    sent_no_cites = re.sub(r"\[E\d+\]", "", sent)
-                    sent_no_cites = re.sub(r"https?://\S+", "", sent_no_cites)
-                    has_numbers = bool(re.search(r"\b\d+(?:\.\d+)?\b", sent_no_cites))
+                    substantive_numbers = extract_substantive_numbers(sent)
 
                     if valid_cites_in_sent:
-                        for c_idx in valid_cites_in_sent:
-                            ev = evidence_items[c_idx - 1]
-                            claim_id = f"clm_{uuid.uuid4().hex[:8]}"
+                        cited_evs = [evidence_items[c_idx - 1] for c_idx in valid_cites_in_sent]
+                        combined_quotes = " ".join(
+                            f"{ev.get('exact_quote', '')} {ev.get('raw_quote', '')}" for ev in cited_evs
+                        )
+
+                        # Plan 24: Numeric Verification for Cited Sentences
+                        # Check that every substantive number in the sentence appears in at least one cited quote
+                        mismatched_numbers = []
+                        for num in substantive_numbers:
+                            num_pattern = rf"(?<![a-zA-Z0-9_.])(?<!\d){re.escape(num)}(?!\d)(?![a-zA-Z0-9_.])"
+                            if not re.search(num_pattern, combined_quotes) and num not in combined_quotes:
+                                mismatched_numbers.append(num)
+
+                        claim_id = f"clm_{uuid.uuid4().hex[:8]}"
+                        if mismatched_numbers:
+                            # Numeric Mismatch detected in cited sentence!
                             self.claim_repo.add(
                                 claim_id=claim_id,
                                 session_id=state.session_id,
-                                text=sent,  # The actual sentence from the report!
-                                evidence_ids=[ev.get("evidence_id")],
+                                text=sent,
+                                evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
+                                verification={
+                                    "verified": False,
+                                    "numeric_match": False,
+                                    "citation_indices": valid_cites_in_sent,
+                                    "citation_index": valid_cites_in_sent[0],
+                                    "mismatched_numbers": mismatched_numbers,
+                                    "reason": f"Numbers {mismatched_numbers} not found in cited evidence quotes"
+                                },
+                                status="NUMERIC_MISMATCH"
+                            )
+                            numeric_mismatch_claims_count += 1
+                        else:
+                            # Fully grounded citation (status="CITED", verified=True)
+                            self.claim_repo.add(
+                                claim_id=claim_id,
+                                session_id=state.session_id,
+                                text=sent,
+                                evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
                                 verification={
                                     "verified": True,
-                                    "citation_index": c_idx,
-                                    "quote": ev.get("exact_quote"),
-                                    "source_id": ev.get("source_id")
+                                    "numeric_match": True,
+                                    "citation_indices": valid_cites_in_sent,
+                                    "citation_index": valid_cites_in_sent[0],
+                                    "quote": cited_evs[0].get("exact_quote"),
+                                    "source_id": cited_evs[0].get("source_id")
                                 },
-                                status="SUPPORTED"
+                                status="CITED"
                             )
                             supported_claims_count += 1
-                    elif has_numbers:
-                        # Sentence contains numbers/metrics but has NO valid citation!
+                    elif substantive_numbers:
+                        # Sentence contains substantive metrics/numbers but has NO citation!
                         claim_id = f"clm_{uuid.uuid4().hex[:8]}"
                         self.claim_repo.add(
                             claim_id=claim_id,
                             session_id=state.session_id,
                             text=sent,  # The actual uncited sentence from the report!
                             evidence_ids=[],
-                            verification={"verified": False, "reason": "Uncited numeric claim"},
+                            verification={
+                                "verified": False,
+                                "numeric_match": False,
+                                "unsupported_numbers": substantive_numbers,
+                                "reason": "Uncited substantive numeric claim"
+                            },
                             status="UNSUPPORTED"
                         )
-                        unsupported_numeric_claims_count += 1
+                        uncited_numeric_claims_count += 1
             else:
                 answer = raw_report
 
             # Evidence-based entity coverage check:
             # Each core entity in research goal must have at least 1 verified atomic evidence item!
-            goal_core_entities = [e for e in extract_core_entities(state.goal) if e not in DATASET_BENCHMARK_TERMS]
+            context_entities = set(DATASET_BENCHMARK_TERMS) | extract_context_entities(state.goal)
+            goal_core_entities = [e for e in extract_core_entities(state.goal) if e not in context_entities]
             if not goal_core_entities:
                 goal_core_entities = extract_core_entities(state.goal)
 
             ev_coverage = evaluate_evidence_coverage(goal_core_entities, evidence_items)
             missing_evidence_entities = ev_coverage["missing"] if len(goal_core_entities) > 1 else []
 
-            # Transition state to DONE (or PARTIAL if missing coverage, 0 evidence, uncited numbers, or insufficient info)
+            # Transition state to DONE (or PARTIAL if missing coverage, 0 evidence, uncited/mismatched numbers, or insufficient info)
             insufficient_phrases = [
                 "no information available",
                 "insufficient information",
@@ -941,6 +979,7 @@ class ResearchEngine:
             answer_lower = answer.lower()
             is_insufficient = any(phrase in answer_lower for phrase in insufficient_phrases)
 
+            total_unsupported_numeric = numeric_mismatch_claims_count + uncited_numeric_claims_count
             has_valid_evidence = (
                 bool(context_snippets or evidence_items)
                 and bool(state.source_ids)
@@ -950,7 +989,7 @@ class ResearchEngine:
                 and not bool(missing_evidence_entities)
                 and len(evidence_items) > 0
                 and supported_claims_count > 0
-                and unsupported_numeric_claims_count == 0
+                and total_unsupported_numeric == 0
             )
 
             # Record transparent reasons if transitioning to PARTIAL
@@ -962,7 +1001,9 @@ class ResearchEngine:
                     partial_reasons.append(f"Missing evidence for: {', '.join(missing_evidence_entities)}")
                 if supported_claims_count == 0 and evidence_items:
                     partial_reasons.append("Report contains no valid citations")
-                if unsupported_numeric_claims_count > 0:
+                if numeric_mismatch_claims_count > 0:
+                    partial_reasons.append("Report contains numeric claims mismatched with cited evidence")
+                if uncited_numeric_claims_count > 0:
                     partial_reasons.append("Report contains unsupported numeric claims without citations")
                 if is_insufficient:
                     partial_reasons.append("Insufficient information in gathered context")
