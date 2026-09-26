@@ -225,14 +225,15 @@ class RawEvidenceRepository:
 
     def add(self, raw_evidence_id: str, session_id: str, source_id: str, raw_quote: str,
             page: Optional[int] = None, section: Optional[str] = None,
-            char_start: Optional[int] = None, char_end: Optional[int] = None) -> None:
+            char_start: Optional[int] = None, char_end: Optional[int] = None,
+            chunk_id: Optional[str] = None) -> None:
         with self.db.session() as conn:
             conn.execute(
                 """
-                INSERT INTO raw_evidences (raw_evidence_id, session_id, source_id, raw_quote, page, section, char_start, char_end)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO raw_evidences (raw_evidence_id, session_id, source_id, raw_quote, page, section, char_start, char_end, chunk_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (raw_evidence_id, session_id, source_id, raw_quote, page, section, char_start, char_end)
+                (raw_evidence_id, session_id, source_id, raw_quote, page, section, char_start, char_end, chunk_id)
             )
 
     def get(self, raw_evidence_id: str) -> Optional[Dict[str, Any]]:
@@ -277,6 +278,27 @@ class EvidenceRepository:
         with self.db.session() as conn:
             cur = conn.execute("SELECT evidence_id FROM evidences WHERE session_id = ?", (session_id,))
             return [row["evidence_id"] for row in cur.fetchall()]
+
+    def get_full_evidence_by_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            query = """
+            SELECT e.evidence_id, e.session_id, e.raw_evidence_id, e.subject, e.predicate,
+                   e.object_json, e.confidence, e.created_at,
+                   r.raw_quote, r.page, r.section, r.char_start, r.char_end, r.chunk_id,
+                   s.source_id, s.url, s.title as source_title
+            FROM evidences e
+            JOIN raw_evidences r ON e.raw_evidence_id = r.raw_evidence_id
+            JOIN sources s ON r.source_id = s.source_id
+            WHERE e.session_id = ?
+            ORDER BY e.created_at ASC
+            """
+            cur = conn.execute(query, (session_id,))
+            rows = []
+            for row in cur.fetchall():
+                item = dict(row)
+                item["object_data"] = json.loads(item["object_json"]) if item.get("object_json") else {}
+                rows.append(item)
+            return rows
 
 
 class ClaimRepository:

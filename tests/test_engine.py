@@ -380,8 +380,8 @@ def test_entity_balanced_context_generation(tmp_path):
     engine.save_state(state)
     _ = engine.run_basic_answer(state)
 
-    assert len(mock_llm.call_history) == 1
-    prompt_sent = mock_llm.call_history[0]["prompt"]
+    synthesis_call = next(c for c in mock_llm.call_history if "schema" not in c)
+    prompt_sent = synthesis_call["prompt"]
     assert "SystemAlpha metric" in prompt_sent
     assert "SystemBeta metric" in prompt_sent
 

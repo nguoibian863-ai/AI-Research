@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS raw_evidences (
     raw_evidence_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
+    chunk_id TEXT,
     raw_quote TEXT NOT NULL,
     page INTEGER,
     section TEXT,
@@ -190,3 +191,8 @@ class DatabaseManager:
             for col_name, col_type in needed_columns.items():
                 if col_name not in existing_columns:
                     conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
+
+            cursor_re = conn.execute("PRAGMA table_info(raw_evidences)")
+            existing_re_cols = {row["name"] for row in cursor_re.fetchall()}
+            if "chunk_id" not in existing_re_cols:
+                conn.execute("ALTER TABLE raw_evidences ADD COLUMN chunk_id TEXT")

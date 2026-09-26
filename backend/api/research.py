@@ -56,6 +56,7 @@ def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
 
     sources = engine.source_repo.get_by_session(session_id)
     raw_evidences = engine.raw_evidence_repo.get_by_session(session_id)
+    evidences = engine.evidence_repo.get_full_evidence_by_session(session_id)
     report = engine.report_repo.get_by_session(session_id)
     budget = engine.get_budget_tracker(session_id)
     chunks_count = engine.chunk_repo.count_by_session(session_id)
@@ -74,8 +75,40 @@ def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
         },
         "sources": sources,
         "raw_evidences": raw_evidences,
+        "evidences": evidences,
         "report": report,
         "budget": budget.summary()
+    }
+
+
+@router.get("/session/{session_id}/evidence")
+def get_session_evidence(session_id: str, engine: ResearchEngine = Depends(get_engine)):
+    try:
+        _ = engine.load_state(session_id)
+    except (KeyError, SessionNotFoundError):
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    evidence = engine.evidence_repo.get_full_evidence_by_session(session_id)
+    return {
+        "session_id": session_id,
+        "evidence_count": len(evidence),
+        "evidence": evidence
+    }
+
+
+@router.post("/session/{session_id}/extract")
+def run_extract(session_id: str, engine: ResearchEngine = Depends(get_engine)):
+    try:
+        state = engine.load_state(session_id)
+    except (KeyError, SessionNotFoundError):
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    evidence_items = engine.run_extract_phase(state)
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "evidence_count": len(evidence_items),
+        "evidence": evidence_items
     }
 
 

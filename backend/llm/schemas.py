@@ -29,11 +29,13 @@ class GeneratedQueriesSchema(BaseModel):
 
 
 class AtomicFactItemSchema(BaseModel):
+    statement: str = Field(default="", description="Concise 1-sentence factual statement summarizing this finding or metric")
     subject: str = Field(description="Entity or model being discussed, e.g. 'Model X'")
     predicate: str = Field(description="Action or relationship, e.g. 'achieved', 'uses', 'outperformed'")
     metric: Optional[str] = Field(None, description="Metric name if numeric, e.g. 'NDS', 'mAP', 'Accuracy'")
     value: Optional[str] = Field(None, description="Metric value, e.g. '71.2', '84.5%'")
     raw_quote: str = Field(description="Exact verbatim quote from the text chunk without alteration")
+    chunk_id: Optional[str] = Field(None, description="ID of chunk where quote appears")
     confidence: float = Field(default=0.95, description="Confidence in this atomic extraction (0.0 to 1.0)")
 
 

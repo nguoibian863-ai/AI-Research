@@ -50,6 +50,8 @@ from backend.core.coverage import (
     evaluate_coverage,
     GENERIC_RESEARCH_TERMS
 )
+from backend.evidence.extractor import EvidenceExtractor
+from backend.evidence.verifier import CitationVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +75,7 @@ class ResearchEngine:
         chunker: Optional[SectionAwareChunker] = None,
         hybrid_retriever: Optional[HybridRetriever] = None
     ):
-        self.llm = llm
+        self._llm = llm
         self.db = db
         self.limits = limits or ResearchLimits()
         self.state_machine = StateMachine(limits=self.limits)
@@ -100,9 +102,21 @@ class ResearchEngine:
         self.claim_repo = ClaimRepository(self.db)
         self.report_repo = ReportRepository(self.db)
         self.trajectory_repo = TrajectoryRepository(self.db)
+        self.evidence_extractor = EvidenceExtractor(llm=self.llm, db=self.db)
+        self.citation_verifier = CitationVerifier()
 
         # Session Budget Trackers (cached in-memory, backed by SQLite)
         self._budget_trackers: Dict[str, ExecutionBudgetTracker] = {}
+
+    @property
+    def llm(self) -> Optional[LLMBackend]:
+        return self._llm
+
+    @llm.setter
+    def llm(self, val: Optional[LLMBackend]) -> None:
+        self._llm = val
+        if hasattr(self, "evidence_extractor") and self.evidence_extractor is not None:
+            self.evidence_extractor.llm = val
 
     def get_session_retriever(self, session_id: str) -> HybridRetriever:
         """Returns or creates an isolated HybridRetriever per session."""
@@ -616,6 +630,54 @@ class ResearchEngine:
             self._handle_phase_error(state, e, "RETRIEVE")
             raise
 
+    def run_extract_phase(
+        self,
+        state: ResearchState,
+        chunks: Optional[List[Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Executes the EXTRACT phase: extracts 3-5 atomic evidence items from chunks
+        with strict quote invariance verification against source texts.
+        """
+        try:
+            budget = self.get_budget_tracker(state.session_id)
+            self.state_machine.transition(state, ResearchPhase.EXTRACT, reason="Extracting atomic evidence from chunks")
+
+            cand_chunks = chunks or self.chunk_repo.get_by_session(state.session_id)
+            if not cand_chunks:
+                logger.warning(f"[{state.session_id}][EXTRACT] No chunks available for evidence extraction.")
+                self.save_state(state)
+                return []
+
+            normalized_chunks = []
+            for c in cand_chunks:
+                if isinstance(c, dict):
+                    normalized_chunks.append(c)
+                else:
+                    normalized_chunks.append({
+                        "chunk_id": getattr(c, "chunk_id", ""),
+                        "text": getattr(c, "text", ""),
+                        "section": getattr(c, "section", ""),
+                        "page": getattr(c, "page", None),
+                        "char_start": getattr(c, "char_start", 0),
+                        "char_end": getattr(c, "char_end", 0),
+                        "url": getattr(c, "metadata", {}).get("url") if hasattr(c, "metadata") else "local",
+                        "source_title": getattr(c, "metadata", {}).get("title") if hasattr(c, "metadata") else ""
+                    })
+
+            evidence_items = self.evidence_extractor.extract_from_chunks(
+                session_id=state.session_id,
+                goal=state.goal,
+                chunks=normalized_chunks,
+                max_evidence=5
+            )
+            self.save_state(state)
+            logger.info(f"[{state.session_id}][EXTRACT] Extracted {len(evidence_items)} verified atomic evidence items.")
+            return evidence_items
+        except Exception as e:
+            self._handle_phase_error(state, e, "EXTRACT")
+            raise
+
     def run_basic_answer(
         self,
         state: ResearchState,
@@ -623,8 +685,8 @@ class ResearchEngine:
         retrieved_chunks: Optional[List[RetrievedChunk]] = None
     ) -> str:
         """
-        Synthesizes a grounded initial answer from retrieved chunks or fetched sources.
-        Guarantees balanced context representation across core entities.
+        Synthesizes a grounded research report from verified atomic evidence and retrieved chunks.
+        Enforces strict citation referencing [E1], [E2] and appends Evidence & Provenance Table.
         Transitions to PARTIAL and records missing entities if coverage is incomplete.
         """
         try:
@@ -688,19 +750,66 @@ class ResearchEngine:
 
             full_context = "\n".join(context_snippets) if context_snippets else "No external documents retrieved."
 
-            prompt = (
-                f"You are a Research Analyst. Provide a clear, factual, and grounded answer to the question "
-                f"based strictly on the gathered context.\n\n"
-                f"Question: {state.goal}\n\n"
-                f"Gathered Evidence Context:\n{full_context}\n\n"
-                f"Synthesize the key findings, metrics, and comparisons directly addressing the question."
-            )
+            # Retrieve or eagerly extract atomic evidence items
+            evidence_items = self.evidence_repo.get_full_evidence_by_session(state.session_id)
+            if not evidence_items and selected_chunks:
+                normalized_selected = []
+                for c in selected_chunks:
+                    if isinstance(c, dict):
+                        normalized_selected.append(c)
+                    else:
+                        normalized_selected.append({
+                            "chunk_id": getattr(c, "chunk_id", ""),
+                            "text": getattr(c, "text", ""),
+                            "section": getattr(c, "section", ""),
+                            "page": getattr(c, "page", None),
+                            "char_start": getattr(c, "char_start", 0),
+                            "char_end": getattr(c, "char_end", 0),
+                            "url": getattr(c, "metadata", {}).get("url") if hasattr(c, "metadata") else "local",
+                            "source_title": getattr(c, "metadata", {}).get("title") if hasattr(c, "metadata") else ""
+                        })
+                _ = self.evidence_extractor.extract_from_chunks(
+                    session_id=state.session_id,
+                    goal=state.goal,
+                    chunks=normalized_selected,
+                    max_evidence=5
+                )
+                evidence_items = self.evidence_repo.get_full_evidence_by_session(state.session_id)
+
+            if evidence_items:
+                evidence_prompt_text = CitationVerifier.format_evidence_for_prompt(evidence_items)
+                prompt = (
+                    f"You are a Research Analyst. Provide a clear, factual, and strictly grounded research answer to the question "
+                    f"based on the verified atomic evidence items below.\n\n"
+                    f"Question: {state.goal}\n\n"
+                    f"VERIFIED EVIDENCE ITEMS:\n{evidence_prompt_text}\n\n"
+                    f"CRITICAL CITATION RULES:\n"
+                    f"1. For every substantive claim, metric, or finding, you MUST explicitly cite the supporting evidence using [E1], [E2], etc.\n"
+                    f"2. Example: 'Model A achieves 60.3 mAP [E1], whereas Model B achieves 59.2 mAP [E2].'\n"
+                    f"3. Do NOT make claims that cannot be grounded in the provided evidence.\n\n"
+                    f"Synthesize the key findings, comparisons, and metrics directly addressing the question with strict [E#] citations."
+                )
+            else:
+                prompt = (
+                    f"You are a Research Analyst. Provide a clear, factual, and grounded answer to the question "
+                    f"based strictly on the gathered context.\n\n"
+                    f"Question: {state.goal}\n\n"
+                    f"Gathered Evidence Context:\n{full_context}\n\n"
+                    f"Synthesize the key findings, metrics, and comparisons directly addressing the question."
+                )
 
             # Transition to WRITE phase
             self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
             res = self.llm.generate(prompt)
             budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
             answer = res.content.strip()
+
+            # Append Evidence & Provenance Table if evidence items were extracted
+            claims_json = "[]"
+            if evidence_items:
+                augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(answer, evidence_items)
+                answer = augmented_answer
+                claims_json = json.dumps(citation_stats.get("valid_indices", []))
 
             # Transition state to DONE (or PARTIAL if missing coverage or insufficient info)
             insufficient_phrases = [
@@ -716,7 +825,7 @@ class ResearchEngine:
             is_insufficient = any(phrase in answer_lower for phrase in insufficient_phrases)
 
             has_valid_evidence = (
-                bool(context_snippets)
+                bool(context_snippets or evidence_items)
                 and bool(state.source_ids)
                 and "no external documents retrieved" not in full_context.lower()
                 and not is_insufficient
@@ -726,7 +835,6 @@ class ResearchEngine:
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
             self.save_state(state)
 
-
             # Save report
             report_id = f"rep_{uuid.uuid4().hex[:8]}"
             self.report_repo.create(
@@ -734,6 +842,7 @@ class ResearchEngine:
                 session_id=state.session_id,
                 title=f"Research: {state.goal[:60]}",
                 content_markdown=answer,
+                claims_json=claims_json,
                 status=state.status.value
             )
 
@@ -846,7 +955,13 @@ class ResearchEngine:
                 else:
                     break
 
-            # 4. Answer
+            # 4. Extract atomic evidence & Answer
+            if top_chunks:
+                try:
+                    self.run_extract_phase(state, chunks=top_chunks)
+                except Exception as extract_err:
+                    logger.warning(f"[{state.session_id}][E2E] Extract phase encountered issue ({extract_err}), continuing to WRITE.")
+
             answer = self.run_basic_answer(state, fetched_docs=docs, retrieved_chunks=top_chunks)
 
             return {
@@ -860,6 +975,7 @@ class ResearchEngine:
                 "sources_count": len(state.source_ids),
                 "documents_fetched": len(docs),
                 "chunks_count": self.chunk_repo.count_by_session(state.session_id),
+                "evidence_count": len(self.evidence_repo.get_by_session(state.session_id)),
                 "answer": answer,
                 "budget": budget.summary()
             }

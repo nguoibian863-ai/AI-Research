@@ -36,11 +36,18 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 - **Automated Test Coverage:** 46/46 tests passing in ~2s with isolated fixtures and air-gapped test container safety.
 - **Review & Validation:** see [`docs/week2_review.md`](docs/week2_review.md).
 
-### 📅 Weeks 3–5: Evidence, Verification, UI & Benchmark (Roadmap)
-- [ ] Atomic evidence extraction (1 Fact = 1 Evidence) and Provenance.
-- [ ] Gap Evaluator and iterative search loop termination.
+### ✅ Week 3: Atomic Evidence Extraction & Grounded Citations (Vertical Slice Passed)
+- **Atomic Evidence Extraction (`EvidenceExtractor`):** Extracts structured atomic facts (1 Fact = 1 Evidence: Subject, Predicate, Metric, Value, Confidence) grounded directly in retrieved chunks.
+- **Quote Invariance Anti-Hallucination Guardrail (`find_quote_in_text`):** Strict verbatim quote verification using 3-level matching (exact substring, case-insensitive, whitespace-normalized regex). Drops any fabricated quote before SQLite persistence.
+- **Relational Evidence & Provenance Storage:** Persistent SQLite linking `chunks` → `raw_evidences` (immutable quote, section, page, char offsets) → `evidences` (structured fact tuple) → `sources` (URL, title, metadata).
+- **Strict Report Citations (`CitationVerifier`):** Guides report synthesizer to cite supporting evidence using `[E1]`, `[E2]`, etc. Parses and validates citation indices, checks citation rate, and automatically appends a rich Markdown `Evidence & Provenance Table`.
+- **REST Endpoints:** `POST /api/research/session/{id}/extract` and `GET /api/research/session/{id}/evidence`.
+- **Automated Test Coverage:** 54/54 tests passing in ~2.5s with zero network dependencies.
+- **Review & Validation:** see [`docs/week3_review.md`](docs/week3_review.md).
+
+### 📅 Weeks 4–5: Verification, UI & Benchmark (Roadmap)
+- [ ] Evidence Graph & N-way Conflict Matrix.
 - [ ] 3-Layer Verification: Source Integrity, Rule-based Numeric Integrity, Semantic Claim Entailment.
-- [ ] Grounded Report Writer with claim-to-source click navigation.
 - [ ] Next.js Frontend with Click-to-Verify citations.
 - [ ] Benchmark 100 research tasks, metrics logging, and clean gold trajectory generation.
 
