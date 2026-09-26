@@ -322,26 +322,26 @@ class CompositeSearchProvider(BaseSearchProvider):
         if not self.providers:
             return []
 
-        # Determine quota per provider (ensure each provider can contribute)
-        per_provider = max(2, limit // len(self.providers) + 1)
-
-        # Call providers concurrently to minimize search latency
-        provider_results: Dict[str, List[SearchResultItem]] = {}
+        # Call providers concurrently asking each up to limit.
+        # If any provider fails or is rate-limited, other providers can fill the quota.
+        # Index results by provider position to prevent name collision (Issue 5)
+        provider_results: Dict[int, List[SearchResultItem]] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self.providers))) as executor:
-            future_to_provider = {
-                executor.submit(p.search, query, per_provider): p.name
-                for p in self.providers
+            future_to_idx = {
+                executor.submit(p.search, query, limit): idx
+                for idx, p in enumerate(self.providers)
             }
-            for future in concurrent.futures.as_completed(future_to_provider):
-                p_name = future_to_provider[future]
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                p_name = self.providers[idx].name
                 try:
-                    provider_results[p_name] = future.result()
+                    provider_results[idx] = future.result()
                 except Exception as e:
-                    logger.error(f"[CompositeSearchProvider] Provider {p_name} failed: {e}")
-                    provider_results[p_name] = []
+                    logger.error(f"[CompositeSearchProvider] Provider {p_name} (#{idx}) failed: {e}")
+                    provider_results[idx] = []
 
         # Round-robin interleaving across providers preserving configured priority order
-        lists = [provider_results.get(p.name, []) for p in self.providers]
+        lists = [provider_results.get(idx, []) for idx in range(len(self.providers))]
         max_len = max((len(l) for l in lists), default=0)
 
         combined: List[SearchResultItem] = []

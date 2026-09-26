@@ -565,6 +565,15 @@ class ResearchEngine:
                     if fetched and getattr(fetched, "is_pdf", False):
                         fetched = self.pdf_tool.fetch(url)
                         is_pdf_url = True
+                    elif (not fetched or not fetched.text) and "arxiv.org/html/" in url:
+                        # Fallback arXiv /html/ to /pdf/ if /html/ gives 404/empty (Issue 1)
+                        arxiv_m = re.search(r"arxiv\.org/html/(\d{4}\.\d{4,5}(?:v\d+)?)", url)
+                        if arxiv_m:
+                            pdf_url = f"https://arxiv.org/pdf/{arxiv_m.group(1)}.pdf"
+                            logger.info(f"[{state.session_id}][FETCH] arXiv HTML unavailable for {url}, falling back to PDF: {pdf_url}")
+                            fetched = self.pdf_tool.fetch(pdf_url)
+                            if fetched and fetched.text:
+                                is_pdf_url = True
 
                 if fetched and fetched.text:
                     fetched_documents.append(fetched)

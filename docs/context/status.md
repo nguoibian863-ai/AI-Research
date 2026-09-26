@@ -12,7 +12,7 @@
 | 4 — Verification + UI | 🟢 bắt đầu | Đã có Session Viewer (/ui). Còn: NLI, writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 90 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 95 passed + 1 skipped (test FastEmbed cần mạng).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -66,16 +66,19 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 - **Version hóa prompt trích xuất evidence**: Lưu `prompt_version="v1.2"` cùng toàn văn prompt trong payload của `evidence_extraction` trajectory phục vụ huấn luyện SFT/DPO.
 - **Dự trữ thời gian WRITE & dừng sớm EXTRACT**: Dự trữ tối thiểu 90s cho pha WRITE; dừng vòng lặp chunk nếu thời gian còn lại < 120s hoặc khi đã có ≥ 3 evidence bao quát tất cả thực thể so sánh.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống) — review `a05af31`
+## Đã giải quyết (review `a05af31`)
 
-1. **URL arXiv `/html/` có thể 404 với paper cũ**: bản HTML của arXiv chủ yếu có cho paper nộp từ khoảng cuối 2023 trở đi. RT-DETR (2304.08069) và các paper cũ khác có thể không có bản HTML, khi đó `raise_for_status` làm mất nguồn. Cần fallback `/html/` → `/pdf/` khi fetch lỗi, hoặc dùng thẳng `/pdf/` vì đã có `PDFFetchTool` đọc theo từng trang.
-2. **Dừng sớm EXTRACT không bao giờ chạy với goal có dataset**: trong extractor, `extract_core_entities(goal)` trả về `['yolov8', 'rt-detr', 'coco']`. Vì không evidence nào có subject là COCO nên điều kiện "phủ đủ mọi thực thể" luôn sai. Cần dùng thực thể so sánh (bỏ context entity, như `_goal_subject_entities` trong engine) và `subject_matches_entity`.
-3. **Mức dự trữ WRITE nhỏ hơn thời gian một lần gọi EXTRACT**: một chunk tốn khoảng 100s (8.5 phút cho 5 chunk). Chỉ cần còn 121s là vẫn bắt đầu chunk mới, xong chunk thì WRITE chỉ còn khoảng 20s. Nên tính theo thời gian thực đo của chunk trước (`remaining < reserve + last_chunk_duration`) và đưa ngưỡng vào `ResearchLimits` thay vì hard-code.
-4. **Composite search không bù chỗ trống**: nếu OpenAlex bị 429 hoặc DuckDuckGo bị chặn, mỗi provider chỉ được `per_provider=3` nên kết quả chỉ còn 3 thay vì 8. Trước bản sửa, arXiv một mình vẫn trả đủ 8, nên đây là thụt lùi khi mạng xấu. Cần gọi xin thêm (hoặc xin dư) từ provider còn hoạt động.
-5. Kết quả được gom theo `p.name`, nên hai provider trùng tên sẽ ghi đè nhau (nhẹ, provider thật có tên khác nhau).
-6. **Thiếu test hồi quy** cho mức dự trữ WRITE và cho dừng sớm EXTRACT (CLAUDE.md yêu cầu mọi bản sửa có test).
-7. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
-8. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+- **arXiv `/html/` tự động fallback sang `/pdf/` khi 404/rỗng**: Trong `run_fetch_phase`, nếu fetch URL `/html/` trả về None hoặc không có text, hệ thống tự động fallback sang fetch bản `/pdf/` tương ứng qua `PDFFetchTool` (kèm test).
+- **Dừng sớm EXTRACT hoạt động chuẩn xác với goal có dataset**: Trong `EvidenceExtractor`, chuyển sang dùng `_extract_goal_subject_entities` (loại bỏ context entities như `coco`, `nuscenes`, `tpc-c`) và so khớp linh hoạt `subject_matches_entity` (kèm test).
+- **Dự trữ WRITE động và cấu hình qua `ResearchLimits`**: Bổ sung `write_reserved_seconds` vào `ResearchLimits` (mặc định 90.0s) và cộng dồn thời gian đo thực tế của chunk trước (`last_chunk_duration`), đảm bảo EXTRACT ngắt kịp thời trước khi WRITE bị đói thời gian (kèm test).
+- **Composite search bù chỗ trống khi provider lỗi**: Gọi đồng thời các provider với `limit` đầy đủ thay vì chia nhỏ; các kết quả được xếp xen kẽ round-robin. Nếu OpenAlex bị 429 hoặc DuckDuckGo bị chặn, các provider còn lại tự động bù đủ số lượng kết quả yêu cầu (kèm test).
+- **Tránh trùng lặp tên provider**: Gom kết quả theo index vị trí thay vì `p.name`.
+- **Bổ sung 4 regression test mới**: Đạt 95 passed + 1 skipped.
+
+## Vấn đề còn mở (ưu tiên từ trên xuống)
+
+1. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
+2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
 
 ## Lịch sử kết quả chạy thật
 

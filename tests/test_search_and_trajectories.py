@@ -285,3 +285,164 @@ def test_trajectory_logging_query_generation_and_evidence_extraction(isolated_en
     q_lines = [json.loads(line) for line in q_file.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(q_lines) == 1
     assert q_lines[0]["payload"]["query_origin"] == "llm"
+
+
+def test_composite_search_fills_quota_when_providers_fail_or_empty():
+    """Verifies that composite search compensates when some providers fail (Issue 4 & 5 fix)."""
+    class GoodProvider:
+        name = "arxiv"
+        def search(self, query, max_results=8):
+            return [
+                SearchResultItem(title=f"Arxiv {i}", url=f"https://arxiv.org/html/2301.000{i}", snippet="Paper", source_type="paper")
+                for i in range(1, 9)
+            ]
+
+    class FailingProvider:
+        name = "openalex"
+        def search(self, query, max_results=8):
+            raise RuntimeError("API timeout")
+
+    class EmptyProvider:
+        name = "duckduckgo"
+        def search(self, query, max_results=8):
+            return []  # e.g. Rate-limited
+
+    composite = CompositeSearchProvider(providers=[GoodProvider(), FailingProvider(), EmptyProvider()], max_results=6)
+    results = composite.search("Object detection")
+
+    # Even though 2 of 3 providers failed/empty, the working provider fills the quota (6 results)
+    assert len(results) == 6
+    assert all(r.source_type == "paper" for r in results)
+
+
+def test_extract_early_stopping_on_comparative_subjects_with_dataset_goal(isolated_engine):
+    """Verifies early stop triggers when compared subjects are covered, ignoring dataset entity (Issue 2 fix)."""
+    engine = isolated_engine
+    goal = "Compare YOLOv8 and RT-DETR accuracy and latency on COCO"
+    session_id = "sess_early_stop_test"
+
+    engine.session_repo.create(session_id, goal, phase="EXTRACT", status="PENDING")
+    engine.source_repo.add(
+        source_id="s1", session_id=session_id, url="https://arxiv.org/abs/2304.08069",
+        title="Paper", source_type="paper", domain="arxiv.org", canonical_key="arxiv:2304.08069"
+    )
+
+    chunk1 = {"chunk_id": "c1", "text": "YOLOv8 achieves 53.9 mAP on COCO val2017. YOLOv8 processes frames at 280 FPS on T4 GPU.", "source_id": "s1"}
+    chunk2 = {"chunk_id": "c2", "text": "RT-DETR-R50 achieves 53.1 mAP with 108 FPS.", "source_id": "s1"}
+    chunk3 = {"chunk_id": "c3", "text": "Another document about detectors.", "source_id": "s1"}
+
+    fact1 = AtomicFactItemSchema(
+        statement="YOLOv8 achieves 53.9 mAP on COCO val2017.",
+        subject="YOLOv8",
+        predicate="achieves",
+        metric="mAP",
+        value="53.9",
+        raw_quote="YOLOv8 achieves 53.9 mAP on COCO val2017."
+    )
+    fact2 = AtomicFactItemSchema(
+        statement="YOLOv8 processes frames at 280 FPS on T4 GPU.",
+        subject="YOLOv8",
+        predicate="processes",
+        metric="FPS",
+        value="280",
+        raw_quote="YOLOv8 processes frames at 280 FPS on T4 GPU."
+    )
+    fact3 = AtomicFactItemSchema(
+        statement="RT-DETR-R50 achieves 53.1 mAP with 108 FPS.",
+        subject="RT-DETR-R50",
+        predicate="achieves",
+        metric="mAP",
+        value="53.1",
+        raw_quote="RT-DETR-R50 achieves 53.1 mAP with 108 FPS."
+    )
+
+    # Chunk 1 returns 2 facts (YOLOv8), Chunk 2 returns 1 fact (RT-DETR-R50)
+    mock_res_c1 = MagicMock()
+    mock_res_c1.parsed = ExtractedEvidencesSchema(facts=[fact1, fact2])
+    mock_res_c1.calls_made = 1
+    mock_res_c1.total_tokens = 100
+
+    mock_res_c2 = MagicMock()
+    mock_res_c2.parsed = ExtractedEvidencesSchema(facts=[fact3])
+    mock_res_c2.calls_made = 1
+    mock_res_c2.total_tokens = 100
+
+    # Chunk 3 should never be called
+    mock_res_c3 = MagicMock()
+    mock_res_c3.parsed = ExtractedEvidencesSchema(facts=[])
+
+    engine.evidence_extractor.llm.structured_generate = MagicMock(side_effect=[mock_res_c1, mock_res_c2, mock_res_c3])
+
+    extracted = engine.evidence_extractor.extract_from_chunks(
+        session_id="sess_early_stop_test",
+        goal=goal,
+        chunks=[chunk1, chunk2, chunk3],
+        max_evidence=10
+    )
+
+    # 3 facts collected, both yolov8 and rt-detr covered -> stops early!
+    assert len(extracted) == 3
+    # LLM was only called 2 times, chunk 3 was skipped!
+    assert engine.evidence_extractor.llm.structured_generate.call_count == 2
+
+
+def test_extract_write_reservation_dynamic(isolated_engine):
+    """Verifies that extraction stops early when remaining time is insufficient for WRITE (Issue 3 fix)."""
+    engine = isolated_engine
+    goal = "Compare PostgreSQL and MySQL on TPC-C"
+
+    chunk1 = {"chunk_id": "c1", "text": "PostgreSQL achieves 1000 TPS on TPC-C benchmark.", "source_id": "s1"}
+    chunk2 = {"chunk_id": "c2", "text": "MySQL achieves 950 TPS on TPC-C benchmark.", "source_id": "s1"}
+
+    # Mock budget tracker where elapsed time is 480s out of 600s -> remaining = 120s
+    # write_reserved_seconds = 90.0, last_chunk_duration = 80.0 -> needs 170s > 120s
+    mock_tracker = MagicMock()
+    mock_tracker.can_call_llm.return_value = True
+    mock_tracker.limits.max_runtime_seconds = 600
+    mock_tracker.limits.write_reserved_seconds = 90.0
+    mock_tracker.elapsed_seconds = 480.0
+
+    engine.evidence_extractor.llm.structured_generate = MagicMock()
+
+    extracted = engine.evidence_extractor.extract_from_chunks(
+        session_id="sess_reserve_test",
+        goal=goal,
+        chunks=[chunk1, chunk2],
+        budget_tracker=mock_tracker,
+        max_evidence=5
+    )
+
+    # Stopped before even starting chunk 1!
+    assert len(extracted) == 0
+    assert engine.evidence_extractor.llm.structured_generate.call_count == 0
+
+
+def test_arxiv_html_fallback_to_pdf_in_fetch(isolated_engine):
+    """Verifies that 404/empty arXiv HTML automatically falls back to PDF (Issue 1 fix)."""
+    engine = isolated_engine
+    state = ResearchState(session_id="sess_fetch_fb", goal="Compare YOLO and DETR", phase=ResearchPhase.SEARCH)
+    engine.session_repo.create(state.session_id, state.goal, phase="SEARCH", status="PENDING")
+
+    url = "https://arxiv.org/html/2304.08069v1"
+
+    # HTML fetch fails (e.g. 404)
+    engine.fetch_tool.fetch = MagicMock(return_value=None)
+
+    # PDF fetch succeeds
+    from backend.tools.pdf_fetch import FetchedPDFContent
+    pdf_mock = FetchedPDFContent(
+        url="https://arxiv.org/pdf/2304.08069v1.pdf",
+        title="DETRs Beat YOLOs",
+        text="Real-time DETR achieves SOTA results on COCO benchmark.",
+        content_hash="hash123",
+        pages_count=10,
+        file_path="data/pdf/dummy.pdf"
+    )
+    engine.pdf_tool.fetch = MagicMock(return_value=pdf_mock)
+
+    docs = engine.run_fetch_phase(state, urls=[url])
+
+    assert len(docs) == 1
+    assert docs[0].text == pdf_mock.text
+    engine.pdf_tool.fetch.assert_called_once_with("https://arxiv.org/pdf/2304.08069v1.pdf")
+

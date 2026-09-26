@@ -1,4 +1,5 @@
 import re
+import time
 import uuid
 import logging
 from typing import List, Dict, Any, Optional, Tuple
@@ -11,6 +12,20 @@ from backend.core.coverage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_goal_subject_entities(goal: str) -> List[str]:
+    """Extract comparative subjects from goal, filtering out datasets/benchmarks/context (Issue 2)."""
+    context = set(DATASET_BENCHMARK_TERMS) | extract_context_entities(goal)
+    subjects = [e for e in extract_core_entities(goal) if e not in context]
+    return subjects or extract_core_entities(goal)
+
+
+def subject_matches_entity(subject: str, entity: str) -> bool:
+    """Check if fact subject refers to goal subject entity (Issue 2)."""
+    s = (subject or "").lower()
+    e = (entity or "").lower()
+    return check_entity_in_text(e, s) or check_entity_in_text(s, e) or e in s or s in e
 
 
 def find_quote_in_text(quote: str, text: str) -> Optional[Tuple[int, int, str]]:
@@ -333,9 +348,10 @@ class EvidenceExtractor:
         verified_evidence: List[Dict[str, Any]] = []
         seen_quotes = set()
         goal_entities = extract_core_entities(goal) if goal else []
+        goal_subjects = _extract_goal_subject_entities(goal) if goal else []
+        last_chunk_duration = 80.0  # Initial estimated chunk extraction duration
 
         # Iterate over candidate chunks (up to 5 chunks)
-        WRITE_RESERVED_SECONDS = 90.0
         for i, target_chunk in enumerate(chunks[:5], start=1):
             if len(verified_evidence) >= max_evidence:
                 break
@@ -343,24 +359,23 @@ class EvidenceExtractor:
                 if not budget_tracker.can_call_llm():
                     logger.warning(f"[{session_id}][EXTRACT] LLM budget exhausted. Stopping extraction.")
                     break
-                # Reserve time for WRITE phase (report synthesis + claim entailment verification)
+                # Reserve time for WRITE phase from limits + dynamic last chunk duration (Issue 3)
+                write_reserve = getattr(budget_tracker.limits, "write_reserved_seconds", 90.0)
+                needed_time = write_reserve + last_chunk_duration
                 remaining_sec = budget_tracker.limits.max_runtime_seconds - budget_tracker.elapsed_seconds
-                if remaining_sec < (WRITE_RESERVED_SECONDS + 30.0):
+                if remaining_sec < needed_time:
                     logger.warning(
                         f"[{session_id}][EXTRACT] Remaining runtime ({remaining_sec:.1f}s) insufficient for further "
-                        f"chunk extraction while reserving {WRITE_RESERVED_SECONDS}s for WRITE. Stopping EXTRACT early."
+                        f"chunk extraction (needs {needed_time:.1f}s: {write_reserve:.1f}s reserve + "
+                        f"{last_chunk_duration:.1f}s chunk estimate). Stopping EXTRACT early."
                     )
                     break
 
-            # Early stop if we already have sufficient comparative evidence for all entities
-            if len(verified_evidence) >= 3 and goal_entities:
-                covered_subjects = {
-                    e["subject"].lower() for e in verified_evidence
-                    if any(check_entity_in_text(ent, e["subject"].lower()) for ent in goal_entities)
-                }
-                if all(any(ent in s for s in covered_subjects) for ent in goal_entities):
+            # Early stop if we already have sufficient comparative evidence for all compared subjects (Issue 2)
+            if len(verified_evidence) >= 3 and goal_subjects:
+                if all(any(subject_matches_entity(e["subject"], ent) for e in verified_evidence) for ent in goal_subjects):
                     logger.info(
-                        f"[{session_id}][EXTRACT] All goal entities {goal_entities} covered with {len(verified_evidence)} "
+                        f"[{session_id}][EXTRACT] All goal subject entities {goal_subjects} covered with {len(verified_evidence)} "
                         f"verified evidence items. Stopping extraction early to conserve budget."
                     )
                     break
@@ -402,6 +417,7 @@ class EvidenceExtractor:
                 f"{c_text}\n"
             )
 
+            chunk_start = time.time()
             try:
                 if budget_tracker:
                     budget_tracker.assert_can_call_llm()
@@ -415,6 +431,10 @@ class EvidenceExtractor:
             except Exception as e:
                 logger.warning(f"[{session_id}][EXTRACT] Extraction call failed for chunk {c_id} ({e}).")
                 continue
+            finally:
+                duration = time.time() - chunk_start
+                if duration > 5.0:
+                    last_chunk_duration = duration
 
             for fact in extracted_facts:
                 candidate_quote = fact.raw_quote.strip() if fact.raw_quote else ""
