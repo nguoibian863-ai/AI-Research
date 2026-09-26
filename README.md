@@ -20,6 +20,7 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 - **P1 Robust Error Handling & HTTP Statuses:** Engine transitions to `FAILED` or `PARTIAL` on exceptions, recording `error_message`. FastAPI maps `StateTransitionError` → 409 Conflict, `BudgetExceededError` → 429, `ModelInferenceError` → 502, `KeyError` → 404.
 - **P1 Observability & Local Logging:** Dual output to console and `logs/research.log` tagged with `[sess_xxx][PHASE]`, configured in the FastAPI lifespan (no import-time side effects).
 - **P2 Benchmark & Isolated Test Suite:** 27/27 automated tests passing in ~0.6s with zero external network dependencies and temporary DB fixtures; added `scripts/benchmark_ollama.py`.
+- **Review & real-model results:** see [`docs/week1_review.md`](docs/week1_review.md) (SmolLM3-3B: 68 tok/s, 2.2 GB VRAM; known search-quality issues to fix before Week 2).
 
 ### ⏳ Week 2: Parsing & Hybrid Retrieval (In Progress)
 - [ ] PyMuPDF page-aware and section-aware PDF text extraction.
