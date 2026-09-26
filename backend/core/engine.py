@@ -346,7 +346,7 @@ class ResearchEngine:
                 f"3. Compare CPU overhead, space amplification, and P99 latency on high-iops NVMe storage.\n\n"
                 f"Question: {state.goal}"
             )
-            res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema)
+            res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema, num_predict=512)
             budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
 
             plan_data: ResearchPlanSchema = res.parsed
@@ -404,7 +404,7 @@ class ResearchEngine:
                     f"Plan: {state.plan.model_dump_json() if state.plan else ''}\n"
                     f"Previously visited: {state.visited_queries}"
                 )
-                res = self.llm.structured_generate(prompt, schema=GeneratedQueriesSchema)
+                res = self.llm.structured_generate(prompt, schema=GeneratedQueriesSchema, num_predict=256)
                 budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
                 generated: GeneratedQueriesSchema = res.parsed
                 queries_to_run = [q.query for q in generated.queries]
@@ -1049,7 +1049,7 @@ class ResearchEngine:
 
             # Transition to WRITE phase
             self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
-            res = self.llm.generate(prompt)
+            res = self.llm.generate(prompt, num_predict=768)
             budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
             raw_report = self._normalize_citations(res.content.strip(), len(evidence_items) if evidence_items else 0)
 

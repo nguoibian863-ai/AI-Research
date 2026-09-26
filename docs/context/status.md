@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-26, sau review `8467f2d`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `73d8ee9`.
 
 ## Tiến độ
 
@@ -12,7 +12,7 @@
 | 4 — Verification + UI | 🟢 bắt đầu | Đã có Session Viewer (/ui). Còn: NLI, writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 94 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 97 passed (hoặc 96 passed + 1 skipped nếu chưa tải cache FastEmbed).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -75,16 +75,24 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 - **Tránh trùng lặp tên provider**: Gom kết quả theo index vị trí thay vì `p.name`.
 - **Bổ sung 4 regression test mới**: Đạt 95 passed + 1 skipped.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống) — review `fcc3dc7` + `8467f2d`
+## Đã giải quyết (review `73d8ee9`)
 
-1. **`context_window: 2048` sát giới hạn**: `num_ctx` gồm cả prompt lẫn output. Prompt EXTRACT khoảng 300 token hướng dẫn cộng chunk tới 600 token ước lượng (số liệu dạng bảng thường tốn token hơn), còn `num_predict` vẫn là 1024. Tổng có thể vượt 2048, khiến Ollama âm thầm cắt đầu prompt (mất hướng dẫn) hoặc output JSON bị cắt giữa chừng rồi phải retry. Prompt WRITE có 5 quote cũng gần ngưỡng. Nên đặt `num_predict` theo từng loại call (EXTRACT khoảng 512, WRITE khoảng 768) và kiểm tra `ước lượng prompt + num_predict ≤ num_ctx` trước khi gọi. `ResearchLimits.llm_context` (4096) và `scripts/benchmark_ollama.py` (`num_ctx` 4096) chưa đồng bộ với config.
-2. **Hàm `subject_matches_entity` bị định nghĩa trùng và lỏng hơn** trong `extractor.py` (có thêm điều kiện `s in e` / `e in s`). Kết quả: subject `DETR` được tính là phủ RT-DETR, `YOLO` hoặc `v8` được tính là phủ YOLOv8, nên dừng sớm EXTRACT có thể kích hoạt khi chưa có evidence của đúng model. Nên dùng lại `backend.core.coverage.subject_matches_entity` (không có lỗi này).
-3. **2/4 test mới không tái hiện lỗi** (vẫn pass trên code `a05af31`):
-   - `test_composite_search_fills_quota_when_providers_fail_or_empty`: provider giả bỏ qua `max_results`.
-   - `test_extract_write_reservation_dynamic`: kịch bản còn lại 120s không phân biệt được ngưỡng cũ và mới. Nên dùng khoảng 130s: code cũ vẫn chạy chunk, code mới phải dừng.
-4. `status.md` ghi 95 passed, chạy thực tế là 94 passed + 1 skipped.
-5. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
-6. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+- **Giới hạn context_window 2048 & token clamping**:
+  - Đồng bộ cấu hình `context_window: 2048` trên `config/settings.yaml`, `ResearchLimits.llm_context`, `OllamaBackend`, và `scripts/benchmark_ollama.py`.
+  - Cắt ngắn văn bản chunk đầu vào tối đa 2400 ký tự (~600 token) trong `EvidenceExtractor` để đảm bảo vừa context window.
+  - Phân bổ `num_predict` theo loại tác vụ: EXTRACT (512), PLAN (512), SEARCH (256), WRITE (768).
+  - Bổ sung guardrail an toàn trong `OllamaBackend._resolve_context_and_predict`: tự động ước lượng token của prompt + system và clamp `num_predict` sao cho tổng không vượt `num_ctx`, loại bỏ nguy cơ Ollama âm thầm truncate prompt hoặc output JSON bị ngắt giữa chừng.
+- **Chuẩn hoá subject matching trong EXTRACT**:
+  - Thay thế hàm định nghĩa lỏng `subject_matches_entity` trong `extractor.py` bằng hàm chuẩn từ `backend.core.coverage`, ngăn chặn các tên họ chung như `DETR`, `YOLO`, `v8` thỏa mãn bao phủ sai mục tiêu so sánh cụ thể (`rt-detr`, `yolov8`).
+- **Thắt chặt và bổ sung regression test**:
+  - Sửa `test_composite_search_fills_quota_when_providers_fail_or_empty`: provider giả tôn trọng tham số `max_results`, fail trên code cũ nếu quota không được bù đủ.
+  - Sửa `test_extract_write_reservation_dynamic`: kiểm tra thời gian còn lại 130s (`elapsed_seconds = 470.0`), phân biệt rõ ngưỡng cũ (120s) và ngưỡng động mới (170s).
+  - Bổ sung 2 regression test mới: `test_subject_matches_entity_strict_semantics` và `test_ollama_backend_clamps_predict_to_stay_within_context`.
+
+## Vấn đề còn mở (ưu tiên từ trên xuống)
+
+1. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
+2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
 
 ## Lịch sử kết quả chạy thật
 

@@ -8,7 +8,8 @@ from backend.db.repositories import RawEvidenceRepository, EvidenceRepository, T
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema
 from backend.core.coverage import (
-    extract_core_entities, check_entity_in_text, DATASET_BENCHMARK_TERMS, extract_context_entities
+    extract_core_entities, check_entity_in_text, DATASET_BENCHMARK_TERMS, extract_context_entities,
+    subject_matches_entity
 )
 
 logger = logging.getLogger(__name__)
@@ -19,13 +20,6 @@ def _extract_goal_subject_entities(goal: str) -> List[str]:
     context = set(DATASET_BENCHMARK_TERMS) | extract_context_entities(goal)
     subjects = [e for e in extract_core_entities(goal) if e not in context]
     return subjects or extract_core_entities(goal)
-
-
-def subject_matches_entity(subject: str, entity: str) -> bool:
-    """Check if fact subject refers to goal subject entity (Issue 2)."""
-    s = (subject or "").lower()
-    e = (entity or "").lower()
-    return check_entity_in_text(e, s) or check_entity_in_text(s, e) or e in s or s in e
 
 
 def find_quote_in_text(quote: str, text: str) -> Optional[Tuple[int, int, str]]:
@@ -387,6 +381,9 @@ class EvidenceExtractor:
             sec_info = f", Section: '{c_sec}'" if c_sec else ""
             page_info = f", Page: {c_page}" if c_page else ""
             c_text = target_chunk.get("text", "").strip()
+            # Ensure chunk text does not exceed ~600 tokens for 2048 context (Issue 1)
+            if len(c_text) > 2400:
+                c_text = c_text[:2400]
 
             if len(c_text) < 20:
                 continue
@@ -421,7 +418,7 @@ class EvidenceExtractor:
             try:
                 if budget_tracker:
                     budget_tracker.assert_can_call_llm()
-                res = self.llm.structured_generate(prompt, schema=ExtractedEvidencesSchema)
+                res = self.llm.structured_generate(prompt, schema=ExtractedEvidencesSchema, num_predict=512)
                 if budget_tracker:
                     calls = getattr(res, "calls_made", 1)
                     tokens = getattr(res, "total_tokens", 0)

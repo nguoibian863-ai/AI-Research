@@ -292,9 +292,10 @@ def test_composite_search_fills_quota_when_providers_fail_or_empty():
     class GoodProvider:
         name = "arxiv"
         def search(self, query, max_results=8):
+            # Respect requested max_results: if caller requests 3, return 3; if 6, return 6
             return [
                 SearchResultItem(title=f"Arxiv {i}", url=f"https://arxiv.org/html/2301.000{i}", snippet="Paper", source_type="paper")
-                for i in range(1, 9)
+                for i in range(1, max_results + 1)
             ]
 
     class FailingProvider:
@@ -394,13 +395,14 @@ def test_extract_write_reservation_dynamic(isolated_engine):
     chunk1 = {"chunk_id": "c1", "text": "PostgreSQL achieves 1000 TPS on TPC-C benchmark.", "source_id": "s1"}
     chunk2 = {"chunk_id": "c2", "text": "MySQL achieves 950 TPS on TPC-C benchmark.", "source_id": "s1"}
 
-    # Mock budget tracker where elapsed time is 480s out of 600s -> remaining = 120s
-    # write_reserved_seconds = 90.0, last_chunk_duration = 80.0 -> needs 170s > 120s
+    # Remaining time is 130s (600 - 470).
+    # On old code: threshold was 120s (90 + 30), so 130s did NOT stop (bug).
+    # On new code: threshold is 170s (90 + 80), so 130s stops cleanly before chunk 1.
     mock_tracker = MagicMock()
     mock_tracker.can_call_llm.return_value = True
     mock_tracker.limits.max_runtime_seconds = 600
     mock_tracker.limits.write_reserved_seconds = 90.0
-    mock_tracker.elapsed_seconds = 480.0
+    mock_tracker.elapsed_seconds = 470.0
 
     engine.evidence_extractor.llm.structured_generate = MagicMock()
 
@@ -415,6 +417,38 @@ def test_extract_write_reservation_dynamic(isolated_engine):
     # Stopped before even starting chunk 1!
     assert len(extracted) == 0
     assert engine.evidence_extractor.llm.structured_generate.call_count == 0
+
+
+def test_subject_matches_entity_strict_semantics():
+    """Verifies subject matching prevents family names (DETR, YOLO) from falsely covering specific models (Issue 2)."""
+    from backend.core.coverage import subject_matches_entity
+
+    # Broad parent names must NOT match specific models
+    assert not subject_matches_entity("DETR", "rt-detr")
+    assert not subject_matches_entity("YOLO", "yolov8")
+    assert not subject_matches_entity("v8", "yolov8")
+
+    # Target models and variant suffixes MUST match
+    assert subject_matches_entity("RT-DETR-R50", "rt-detr")
+    assert subject_matches_entity("RT-DETR", "rt-detr")
+    assert subject_matches_entity("YOLOv8", "yolov8")
+    assert subject_matches_entity("YOLOv8n", "yolov8")
+    assert subject_matches_entity("YOLOv8-L", "yolov8")
+
+
+def test_ollama_backend_clamps_predict_to_stay_within_context():
+    """Verifies OllamaBackend clamps num_predict so prompt + predict <= context_window (Issue 1)."""
+    from backend.llm.ollama import OllamaBackend
+    backend = OllamaBackend(context_window=2048, max_output_tokens=1024)
+
+    # Prompt of ~1714 tokens (6000 chars)
+    long_prompt = "test " * 1200
+    num_ctx, num_predict = backend._resolve_context_and_predict(long_prompt, None, {})
+
+    assert num_ctx == 2048
+    # num_predict must be clamped from 1024 so prompt (~1714) + num_predict <= 2048
+    assert num_predict < 1024
+    assert num_predict + int(len(long_prompt) / 3.5) <= 2048
 
 
 def test_arxiv_html_fallback_to_pdf_in_fetch(isolated_engine):

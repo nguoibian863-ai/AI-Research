@@ -15,5 +15,5 @@ class ResearchLimits(BaseModel):
     max_llm_calls: int = Field(default=30, description="Max LLM inferences allowed per run")
     max_runtime_seconds: int = Field(default=600, description="Hard timeout for total research run in seconds")
     write_reserved_seconds: float = Field(default=90.0, description="Minimum runtime reserved for WRITE phase")
-    llm_context: int = Field(default=4096, description="Target LLM context window")
+    llm_context: int = Field(default=2048, description="Target LLM context window")
     max_output_tokens: int = Field(default=1024, description="Max token generation limit")

@@ -22,6 +22,13 @@ def strip_think_block(text: str) -> str:
     return text.strip()
 
 
+def estimate_token_count(text: str) -> int:
+    """Estimates token count with character heuristics (~3.5 chars/token)."""
+    if not text:
+        return 0
+    return max(1, int(len(text) / 3.5))
+
+
 class OllamaBackend(LLMBackend):
     def __init__(
         self,
@@ -29,7 +36,7 @@ class OllamaBackend(LLMBackend):
         model: str = "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M",
         timeout: float = 120.0,
         temperature: float = 0.1,
-        context_window: int = 4096,
+        context_window: int = 2048,
         max_output_tokens: int = 1024,
         system_prefix: Optional[str] = None
     ):
@@ -46,19 +53,44 @@ class OllamaBackend(LLMBackend):
         parts = [p for p in (self.system_prefix, system_prompt) if p]
         return "\n".join(parts) if parts else None
 
+    def _resolve_context_and_predict(
+        self, prompt: str, system: Optional[str], kwargs: Dict[str, Any]
+    ) -> tuple[int, int]:
+        num_ctx = kwargs.get("num_ctx", self.context_window)
+        num_predict = kwargs.get("num_predict", self.max_output_tokens)
+        est_prompt = estimate_token_count(prompt) + (estimate_token_count(system) if system else 0)
+
+        # Guardrail: check prompt + num_predict <= num_ctx (Issue 1)
+        if est_prompt + num_predict > num_ctx:
+            available = num_ctx - est_prompt
+            if available < 128:
+                logger.warning(
+                    f"[OllamaBackend] Prompt is large (~{est_prompt} tokens) for num_ctx={num_ctx}. "
+                    f"Clamping num_predict from {num_predict} to 128."
+                )
+                num_predict = 128
+            else:
+                logger.info(
+                    f"[OllamaBackend] Adjusting num_predict from {num_predict} to {available} "
+                    f"so prompt (~{est_prompt}) + output <= num_ctx ({num_ctx})."
+                )
+                num_predict = available
+        return num_ctx, num_predict
+
     def generate(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
         url = f"{self.base_url}/api/generate"
+        system = self._build_system(system_prompt)
+        num_ctx, num_predict = self._resolve_context_and_predict(prompt, system, kwargs)
         payload = {
             "model": kwargs.get("model", self.model),
             "prompt": prompt,
             "stream": False,
             "options": {
                 "temperature": kwargs.get("temperature", self.temperature),
-                "num_predict": kwargs.get("num_predict", self.max_output_tokens),
-                "num_ctx": kwargs.get("num_ctx", self.context_window)
+                "num_predict": num_predict,
+                "num_ctx": num_ctx
             }
         }
-        system = self._build_system(system_prompt)
         if system:
             payload["system"] = system
 
@@ -100,6 +132,7 @@ class OllamaBackend(LLMBackend):
             "Do not include markdown codeblocks or preamble.\n"
             f"JSON Schema: {json.dumps(schema_dict)}"
         )
+        num_ctx, num_predict = self._resolve_context_and_predict(prompt, enriched_system, kwargs)
 
         current_prompt = prompt
         accumulated_prompt_tokens = 0
@@ -117,8 +150,8 @@ class OllamaBackend(LLMBackend):
                 "stream": False,
                 "options": {
                     "temperature": kwargs.get("temperature", self.temperature),
-                    "num_predict": kwargs.get("num_predict", self.max_output_tokens),
-                    "num_ctx": kwargs.get("num_ctx", self.context_window)
+                    "num_predict": num_predict,
+                    "num_ctx": num_ctx
                 }
             }
 

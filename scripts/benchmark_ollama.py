@@ -89,7 +89,7 @@ def run_benchmark(model_name: str = DEFAULT_MODEL):
         "options": {
             "temperature": 0.1,
             "num_predict": 512,
-            "num_ctx": 4096
+            "num_ctx": 2048
         }
     }
 
@@ -134,7 +134,7 @@ def run_benchmark(model_name: str = DEFAULT_MODEL):
         "options": {
             "temperature": 0.1,
             "num_predict": 128,
-            "num_ctx": 4096
+            "num_ctx": 2048
         }
     }
 
