@@ -22,6 +22,15 @@ class SessionRepository:
                 (session_id, goal, plan_json, phase, status)
             )
 
+    def list_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "SELECT session_id, goal, phase, status, step, error_message, created_at, updated_at "
+                "FROM sessions ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (limit,)
+            )
+            return [dict(row) for row in cur.fetchall()]
+
     def get(self, session_id: str) -> Optional[Dict[str, Any]]:
         with self.db.session() as conn:
             cur = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))

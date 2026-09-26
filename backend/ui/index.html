@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Session Viewer</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --border: #e3e2dd;
+    --accent: #2f5bd3; --done: #1f7a4d; --partial: #a36400; --failed: #b3261e; --code: #f0efea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --text: #ecebe6; --muted: #a09f98; --border: #33322f;
+      --accent: #7ea2ff; --done: #5cc48f; --partial: #f0b24a; --failed: #ff8a80; --code: #2a2a27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
+           display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 17px; margin: 0; }
+  header span { color: var(--muted); font-size: 13px; }
+  .layout { display: grid; grid-template-columns: 340px 1fr; min-height: calc(100vh - 52px); }
+  aside { border-right: 1px solid var(--border); background: var(--panel); overflow-y: auto; }
+  main { padding: 20px 28px; overflow-x: hidden; }
+  .session { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .session:hover, .session.active { background: var(--code); }
+  .session .goal { font-weight: 600; font-size: 14px; }
+  .session .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+           border: 1px solid currentColor; }
+  .DONE, .COMPLETED, .CITED { color: var(--done); }
+  .PARTIAL, .NUMERIC_MISMATCH, .UNSUPPORTED { color: var(--partial); }
+  .FAILED, .CANCELLED { color: var(--failed); }
+  h2 { font-size: 20px; margin: 0 0 6px; }
+  h3 { font-size: 15px; margin: 24px 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .reason { color: var(--partial); margin: 6px 0; }
+  .muted { color: var(--muted); }
+  .grid { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  a { color: var(--accent); word-break: break-all; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
+  .card .title { font-weight: 600; }
+  blockquote { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--accent); background: var(--code); }
+  pre.report { white-space: pre-wrap; word-wrap: break-word; background: var(--panel); border: 1px solid var(--border);
+               border-radius: 8px; padding: 14px; font: 13px/1.5 ui-monospace, Consolas, monospace; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+  @media (max-width: 800px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--border); }
+    main { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Research Session Viewer</h1>
+  <span>chỉ đọc · dữ liệu từ SQLite qua /api/research</span>
+</header>
+<div class="layout">
+  <aside id="sessions"><div class="empty">Đang tải…</div></aside>
+  <main id="detail"><div class="empty">Chọn một session bên trái.</div></main>
+</div>
+<script>
+"use strict";
+// All values from the API come from fetched web pages: render with textContent only, never as HTML.
+const API = "/api/research";
+
+function el(tag, props, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === null || v === undefined) continue;
+    if (k === "text") node.textContent = String(v);
+    else if (k === "className") node.className = v;
+    else if (k === "onclick") node.addEventListener("click", v);
+    else node.setAttribute(k, String(v));
+  }
+  for (const c of children) if (c) node.append(c);
+  return node;
+}
+
+function safeLink(url, label) {
+  const u = String(url || "");
+  if (!/^https?:\/\//i.test(u)) return el("span", { text: label || u || "local" });
+  return el("a", { href: u, target: "_blank", rel: "noopener noreferrer", text: label || u });
+}
+
+function badge(value) {
+  const v = String(value || "");
+  return el("span", { className: "badge " + v.replace(/[^A-Z_]/g, ""), text: v });
+}
+
+async function getJSON(path) {
+  const res = await fetch(API + path);
+  if (!res.ok) throw new Error(res.status + " " + res.statusText);
+  return res.json();
+}
+
+async function loadSessions() {
+  const aside = document.getElementById("sessions");
+  try {
+    const data = await getJSON("/sessions?limit=100");
+    aside.replaceChildren();
+    if (!data.sessions.length) { aside.append(el("div", { className: "empty", text: "Chưa có session nào." })); return; }
+    for (const s of data.sessions) {
+      const item = el("div", { className: "session", "data-id": s.session_id, onclick: () => { location.hash = s.session_id; } },
+        el("div", { className: "goal", text: s.goal }),
+        el("div", { className: "meta" }, badge(s.phase), el("span", { text: String(s.created_at || "").slice(0, 19) }))
+      );
+      aside.append(item);
+    }
+    highlight();
+  } catch (e) {
+    aside.replaceChildren(el("div", { className: "empty", text: "Không tải được danh sách: " + e.message }));
+  }
+}
+
+function highlight() {
+  const id = decodeURIComponent(location.hash.slice(1));
+  for (const n of document.querySelectorAll(".session")) n.classList.toggle("active", n.dataset.id === id);
+}
+
+async function loadDetail() {
+  highlight();
+  const id = decodeURIComponent(location.hash.slice(1));
+  const main = document.getElementById("detail");
+  if (!id) return;
+  main.replaceChildren(el("div", { className: "empty", text: "Đang tải…" }));
+  try {
+    const d = await getJSON("/session/" + encodeURIComponent(id));
+    main.replaceChildren(...renderSession(d));
+    window.scrollTo(0, 0);
+  } catch (e) {
+    main.replaceChildren(el("div", { className: "empty", text: "Không tải được session: " + e.message }));
+  }
+}
+
+function renderSession(d) {
+  const s = d.session, b = d.budget || {};
+  const out = [];
+  out.push(el("h2", { text: s.goal }));
+  out.push(el("div", { className: "grid" },
+    badge(s.phase),
+    el("span", { text: "Session: " + s.session_id }),
+    el("span", { text: "Step: " + s.step }),
+    el("span", { text: "Chunks: " + (s.chunks_count ?? 0) })
+  ));
+  if (s.error_message) out.push(el("div", { className: "reason", text: "Lý do: " + s.error_message }));
+  out.push(el("div", { className: "grid" },
+    el("span", { text: "Search " + (b.search_calls ?? "-") }),
+    el("span", { text: "Fetch " + (b.fetch_calls ?? "-") }),
+    el("span", { text: "LLM " + (b.llm_calls ?? "-") }),
+    el("span", { text: "Tokens " + (b.tokens_consumed ?? "-") })
+  ));
+
+  // Sources
+  const sources = [...(d.sources || [])].sort((a, z) => (z.credibility_score ?? -1) - (a.credibility_score ?? -1));
+  out.push(el("h3", { text: `Nguồn (${sources.length})` }));
+  if (sources.length) {
+    const tbody = el("tbody");
+    for (const src of sources) {
+      const score = typeof src.credibility_score === "number" ? src.credibility_score.toFixed(0) : "-";
+      let tier = "";
+      try { tier = JSON.parse(src.credibility_details_json || "{}").tier || ""; } catch (_) {}
+      tbody.append(el("tr", {},
+        el("td", { className: "num", text: score }),
+        el("td", { text: tier || src.source_type || "" }),
+        el("td", {}, el("div", { text: src.title || "" }), safeLink(src.url))
+      ));
+    }
+    out.push(el("table", {}, el("thead", {}, el("tr", {},
+      el("th", { text: "Điểm" }), el("th", { text: "Loại" }), el("th", { text: "Nguồn" }))), tbody));
+  } else out.push(el("div", { className: "muted", text: "Không có nguồn." }));
+
+  // Evidence
+  const evidence = d.evidences || [];
+  out.push(el("h3", { text: `Evidence đã kiểm chứng (${evidence.length})` }));
+  if (!evidence.length) out.push(el("div", { className: "muted", text: "Không có evidence nào được lưu." }));
+  evidence.forEach((ev, i) => {
+    const loc = [ev.section, ev.page ? "page " + ev.page : ""].filter(Boolean).join(", ");
+    const score = typeof ev.source_score === "number" ? ` · source ${ev.source_score.toFixed(0)}/100` : "";
+    out.push(el("div", { className: "card" },
+      el("div", { className: "title", text: `[E${i + 1}] ${ev.subject || ""} — ${ev.statement || ""}` }),
+      el("blockquote", { text: `"${ev.raw_quote || ev.exact_quote || ""}"` }),
+      el("div", { className: "muted" }, safeLink(ev.url, ev.source_title || ev.url),
+        el("span", { text: (loc ? " (" + loc + ")" : "") + score }))
+    ));
+  });
+
+  // Claims
+  const claims = d.claims || [];
+  out.push(el("h3", { text: `Claims trong report (${claims.length})` }));
+  if (!claims.length) out.push(el("div", { className: "muted", text: "Không có claim." }));
+  for (const c of claims) {
+    const v = c.verification || {};
+    const note = v.reason || (v.mismatched_numbers ? "Số không khớp: " + v.mismatched_numbers.join(", ") : "");
+    out.push(el("div", { className: "card" },
+      badge(c.status), el("span", { text: " " + (c.text || "") }),
+      note ? el("div", { className: "muted", text: note }) : null
+    ));
+  }
+
+  // Report
+  out.push(el("h3", { text: "Report" }));
+  const report = d.report && d.report.content_markdown;
+  out.push(report ? el("pre", { className: "report", text: report })
+                  : el("div", { className: "muted", text: "Chưa có report (session chưa chạy tới WRITE)." }));
+  return out;
+}
+
+window.addEventListener("hashchange", loadDetail);
+loadSessions().then(loadDetail);
+</script>
+</body>
+</html>

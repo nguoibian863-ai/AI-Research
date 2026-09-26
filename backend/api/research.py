@@ -47,6 +47,14 @@ def create_session(req: CreateSessionRequest, engine: ResearchEngine = Depends(g
     )
 
 
+@router.get("/sessions")
+def list_sessions(limit: int = 50, engine: ResearchEngine = Depends(get_engine)):
+    """Read-only list of recent sessions (Session Viewer, plan 29.0)."""
+    limit = max(1, min(limit, 200))
+    sessions = engine.session_repo.list_recent(limit=limit)
+    return {"count": len(sessions), "sessions": sessions}
+
+
 @router.get("/session/{session_id}")
 def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
     try:
@@ -69,6 +77,7 @@ def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
             "phase": state.phase.value,
             "status": state.status.value,
             "step": state.step,
+            "error_message": state.error_message,
             "plan": state.plan.model_dump() if state.plan else None,
             "visited_queries": state.visited_queries,
             "open_questions": [q.model_dump() for q in state.open_questions],

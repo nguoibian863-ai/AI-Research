@@ -131,3 +131,30 @@ def test_show_session_script_renders_saved_session(tmp_path, monkeypatch):
     assert "CenterPoint achieves 60.3 mAP and 67.3 NDS" in text   # verbatim quote
     assert "## Claims trong report" in text
     assert "CenterPoint reaches 67.3 NDS [E1]" in text              # report body
+
+
+def test_session_viewer_page_and_list_endpoint(client, isolated_engine):
+    """Session Viewer (plan 29.0): /ui serves a static read-only page; /sessions lists recent sessions."""
+    from pathlib import Path
+
+    ui = client.get("/ui")
+    assert ui.status_code == 200
+    assert "text/html" in ui.headers["content-type"]
+    assert "Research Session Viewer" in ui.text
+
+    # Page must never inject fetched web content as HTML (XSS from scraped pages)
+    page_source = Path("backend/ui/index.html").read_text(encoding="utf-8")
+    assert "innerHTML" not in page_source
+    assert "insertAdjacentHTML" not in page_source
+
+    first = client.post("/api/research/session", json={"goal": "First goal"}).json()["session_id"]
+    second = client.post("/api/research/session", json={"goal": "Second goal"}).json()["session_id"]
+
+    listing = client.get("/api/research/sessions").json()
+    ids = [s["session_id"] for s in listing["sessions"]]
+    assert listing["count"] == 2
+    assert ids[0] == second and ids[1] == first  # newest first
+    assert {"goal", "phase", "status", "created_at"} <= set(listing["sessions"][0])
+
+    detail = client.get(f"/api/research/session/{first}").json()
+    assert "error_message" in detail["session"]

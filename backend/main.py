@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List, Optional
 import yaml
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.core.engine import ResearchEngine
 from backend.core.limits import ResearchLimits
@@ -184,6 +184,15 @@ app.add_middleware(
 )
 
 app.include_router(research_router)
+
+
+UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
+
+
+@app.get("/ui", include_in_schema=False)
+def session_viewer():
+    """Read-only Session Viewer (plan 29.0): static page that calls the /api/research read endpoints."""
+    return FileResponse(UI_INDEX, media_type="text/html")
 
 
 @app.get("/health")
