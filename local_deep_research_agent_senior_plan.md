@@ -1177,6 +1177,54 @@ Không được viết chắc chắn khi evidence thiếu.
 
 # 29. UI
 
+UI làm theo 2 giai đoạn: viewer chỉ đọc ngay khi có dữ liệu thật (phục vụ nghiệm thu), UI đầy đủ ở Tuần 4.
+
+## 29.0 Giai đoạn 1 — Session Viewer (chỉ đọc, làm ngay sau Tuần 3)
+
+Mục đích: xem kết quả đã lưu trong SQLite bằng trình duyệt để nghiệm thu sau mỗi lần chạy E2E, thay cho terminal/`scripts/show_session.py`.
+
+```text
+Công nghệ:
+1 file HTML tĩnh + JavaScript thuần, do FastAPI phục vụ tại /ui
+không Node.js, không build step, không thêm dependency
+
+Dữ liệu:
+dùng lại API đã có
+GET /api/research/session/{id}
+GET /api/research/session/{id}/claims
++ 1 endpoint liệt kê session (GET /api/research/sessions)
+```
+
+Nội dung:
+
+```text
+Danh sách session (goal, phase, thời gian)
+→ chọn 1 session:
+   Phase / status + lý do PARTIAL
+   Budget đã dùng
+   Sources (kèm source_score, tier)
+   Evidence (quote nguyên văn, URL, section, page)
+   Claims (CITED / UNSUPPORTED / NUMERIC_MISMATCH)
+   Report + Evidence & Provenance Table
+```
+
+Ràng buộc:
+
+- chỉ đọc: không chạy research, không sửa dữ liệu;
+- chỉ bind `127.0.0.1` như backend;
+- render text bằng `textContent` (không `innerHTML` với dữ liệu từ web) để tránh XSS từ nội dung trang đã fetch;
+- có test cho route `/ui` và endpoint liệt kê session.
+
+Acceptance:
+
+- mở `http://127.0.0.1:8000/ui` xem được mọi session đã chạy;
+- mỗi evidence hiển thị đủ quote + URL + vị trí;
+- lý do PARTIAL hiển thị rõ.
+
+## 29.1 Giai đoạn 2 — UI đầy đủ (Tuần 4)
+
+Thay thế hoặc mở rộng viewer; thêm Research Input, Progress theo phase thật, Rejected Evidence, Click-to-Verify.
+
 ## Tech Stack
 
 ```text
@@ -1542,6 +1590,7 @@ Question
 - source dedupe;
 - source credibility scoring (mục 14.1);
 - OpenAlex / arXiv search provider (mục 12.5);
+- Session Viewer chỉ đọc tại `/ui` (mục 29.0) để nghiệm thu bằng trình duyệt;
 - Evidence Store;
 - Gap Evaluator;
 - open questions;
@@ -1570,7 +1619,7 @@ Question
 - contradiction handling;
 - claim store;
 - grounded writer theo từng section (mục 27.1);
-- Next.js UI;
+- Next.js UI (mở rộng từ Session Viewer mục 29.0);
 - progress view;
 - evidence view (kèm rejected evidence);
 - click-to-source.
@@ -1642,7 +1691,7 @@ Question
 
 ## P2
 
-- UI
+- UI đầy đủ (mục 29.1); Session Viewer chỉ đọc (mục 29.0) là P1 vì phục vụ nghiệm thu
 - GitHub search
 - local cache optimization
 - report formatting (Markdown/HTML export, citation styles)
