@@ -1,7 +1,7 @@
 import re
 import uuid
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from backend.parsing.html_cleaner import CleanedDocument, ParsedSection
 
@@ -39,154 +39,194 @@ class SectionAwareChunker:
         """Chunks a cleaned document into section-aware chunks respecting max tokens & overlap."""
         chunks: List[ParsedChunk] = []
         chunk_idx = 0
+        full_text = document.text or ""
 
         # If document has no pre-detected sections, treat the entire text as one section
         sections = document.sections
-        if not sections and document.text.strip():
+        if not sections and full_text.strip():
             sections = [
                 ParsedSection(
                     title=document.title or "General",
-                    content=document.text,
+                    content=full_text,
                     page=1,
+                    page_start=1,
+                    page_end=1,
                     char_start=0,
-                    char_end=len(document.text)
+                    char_end=len(full_text),
+                    blocks=[{"text": full_text, "page": 1, "char_start": 0, "char_end": len(full_text)}]
                 )
             ]
 
         for sec in sections:
-            sec_chunks = self._chunk_section(doc_id=doc_id, section=sec, start_idx=chunk_idx)
+            sec_chunks = self._chunk_section(doc_id=doc_id, section=sec, full_text=full_text, start_idx=chunk_idx)
             chunks.extend(sec_chunks)
             chunk_idx += len(sec_chunks)
 
         logger.info(f"[SectionAwareChunker] Generated {len(chunks)} chunks for doc {doc_id}.")
         return chunks
 
-    def _chunk_section(self, doc_id: str, section: ParsedSection, start_idx: int) -> List[ParsedChunk]:
+    def _chunk_section(self, doc_id: str, section: ParsedSection, full_text: str, start_idx: int) -> List[ParsedChunk]:
         """Splits a single section into chunks while keeping section context and page attribution."""
         content = section.content.strip()
         if not content:
             return []
 
-        # Split section into paragraphs
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
-        if not paragraphs:
-            paragraphs = [content]
+        # Ensure we have blocks with page and char offset info
+        blocks = section.blocks
+        if not blocks:
+            # Reconstruct blocks from section content
+            blocks = []
+            sec_start = section.char_start
+            paras = [p.strip() for p in re.split(r"\n\s*\n", section.content) if p.strip()]
+            if not paras:
+                paras = [content]
+            cursor = sec_start
+            for p in paras:
+                pos = full_text.find(p, cursor)
+                if pos == -1:
+                    pos = cursor
+                blocks.append({
+                    "text": p,
+                    "page": section.page or 1,
+                    "char_start": pos,
+                    "char_end": pos + len(p)
+                })
+                cursor = pos + len(p)
 
         section_chunks: List[ParsedChunk] = []
-        curr_paras: List[str] = []
+        curr_blocks: List[Dict[str, Any]] = []
         curr_tokens = 0
-        running_char_offset = section.char_start
 
-        def flush_chunk(paras: List[str], chunk_num: int) -> Optional[ParsedChunk]:
-            if not paras:
+        def emit_chunk(b_list: List[Dict[str, Any]], chunk_num: int) -> Optional[ParsedChunk]:
+            if not b_list:
                 return None
-            chunk_text = "\n\n".join(paras).strip()
-            if not chunk_text:
+            c_start = b_list[0]["char_start"]
+            c_end = b_list[-1]["char_end"]
+            chunk_text = full_text[c_start:c_end]
+            if not chunk_text.strip():
                 return None
             t_count = self.estimate_tokens(chunk_text)
-            c_start = section.char_start + content.find(paras[0]) if paras[0] in content else running_char_offset
-            c_end = c_start + len(chunk_text)
             return ParsedChunk(
                 chunk_id=f"chk_{doc_id}_{chunk_num:03d}",
                 doc_id=doc_id,
                 text=chunk_text,
-                page=section.page or 1,
+                page=b_list[0].get("page", section.page or 1),
                 section=section.title,
                 char_start=c_start,
                 char_end=c_end,
                 token_count=t_count
             )
 
-        for para in paragraphs:
-            para_tokens = self.estimate_tokens(para)
+        for b in blocks:
+            b_text = b["text"]
+            b_tokens = self.estimate_tokens(b_text)
 
-            # If a single paragraph is larger than max_chunk_tokens, split it by sentences
-            if para_tokens > self.max_chunk_tokens:
-                # Flush existing buffer first
-                if curr_paras:
-                    c = flush_chunk(curr_paras, start_idx + len(section_chunks))
+            # If a single block exceeds max_chunk_tokens, split it by sentence
+            if b_tokens > self.max_chunk_tokens:
+                if curr_blocks:
+                    c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
                     if c:
                         section_chunks.append(c)
-                    curr_paras = []
+                    curr_blocks = []
                     curr_tokens = 0
 
-                sub_chunks = self._chunk_large_paragraph(doc_id, section, para, start_idx + len(section_chunks))
+                sub_chunks = self._chunk_large_block(doc_id, section, b, full_text, start_idx + len(section_chunks))
                 section_chunks.extend(sub_chunks)
                 continue
 
-            if curr_tokens + para_tokens > self.max_chunk_tokens and curr_paras:
-                # Flush current chunk
-                c = flush_chunk(curr_paras, start_idx + len(section_chunks))
+            if curr_tokens + b_tokens > self.max_chunk_tokens and curr_blocks:
+                c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
                 if c:
                     section_chunks.append(c)
 
-                # Implement overlap: take trailing sentences or words from last paragraph
-                overlap_text = self._get_overlap_text(curr_paras[-1])
-                curr_paras = [overlap_text, para] if overlap_text else [para]
-                curr_tokens = self.estimate_tokens("\n\n".join(curr_paras))
+                # Check if last block can be kept as overlap
+                last_b = curr_blocks[-1]
+                last_b_tokens = self.estimate_tokens(last_b["text"])
+                if last_b_tokens <= self.chunk_overlap_tokens:
+                    curr_blocks = [last_b, b]
+                    curr_tokens = last_b_tokens + b_tokens
+                else:
+                    curr_blocks = [b]
+                    curr_tokens = b_tokens
             else:
-                curr_paras.append(para)
-                curr_tokens += para_tokens
+                curr_blocks.append(b)
+                curr_tokens += b_tokens
 
-        # Flush final remaining paragraphs
-        if curr_paras:
-            c = flush_chunk(curr_paras, start_idx + len(section_chunks))
+        if curr_blocks:
+            c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
             if c:
                 section_chunks.append(c)
 
         return section_chunks
 
-    def _chunk_large_paragraph(self, doc_id: str, section: ParsedSection, para: str, start_num: int) -> List[ParsedChunk]:
-        """Splits an oversized paragraph into sentence-level chunks."""
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
-        if not sentences:
-            sentences = [para]
+    def _chunk_large_block(self, doc_id: str, section: ParsedSection, block: Dict[str, Any], full_text: str, start_num: int) -> List[ParsedChunk]:
+        """Splits an oversized block into sentence-level chunks with exact char offsets."""
+        b_text = block["text"]
+        b_start = block["char_start"]
+        b_page = block.get("page", section.page or 1)
+
+        matches = list(re.finditer(r"(?<=[.!?])\s+", b_text))
+        sentence_spans = []
+        last_idx = 0
+        for m in matches:
+            sentence_spans.append((last_idx, m.start()))
+            last_idx = m.end()
+        if last_idx < len(b_text):
+            sentence_spans.append((last_idx, len(b_text)))
+
+        if not sentence_spans:
+            sentence_spans = [(0, len(b_text))]
 
         chunks: List[ParsedChunk] = []
-        curr_sentences: List[str] = []
+        curr_spans = []
         curr_tokens = 0
 
-        for sent in sentences:
-            s_tokens = self.estimate_tokens(sent)
-            if curr_tokens + s_tokens > self.max_chunk_tokens and curr_sentences:
-                chunk_text = " ".join(curr_sentences).strip()
-                chunks.append(ParsedChunk(
-                    chunk_id=f"chk_{doc_id}_{start_num + len(chunks):03d}",
-                    doc_id=doc_id,
-                    text=chunk_text,
-                    page=section.page or 1,
-                    section=section.title,
-                    char_start=section.char_start,
-                    char_end=section.char_start + len(chunk_text),
-                    token_count=self.estimate_tokens(chunk_text)
-                ))
-                # Carry overlap
-                overlap = curr_sentences[-1] if len(curr_sentences) > 1 else ""
-                curr_sentences = [overlap, sent] if overlap else [sent]
-                curr_tokens = self.estimate_tokens(" ".join(curr_sentences))
-            else:
-                curr_sentences.append(sent)
-                curr_tokens += s_tokens
-
-        if curr_sentences:
-            chunk_text = " ".join(curr_sentences).strip()
-            chunks.append(ParsedChunk(
-                chunk_id=f"chk_{doc_id}_{start_num + len(chunks):03d}",
+        def emit_sentence_chunk(spans: List[tuple], chunk_idx: int) -> Optional[ParsedChunk]:
+            if not spans:
+                return None
+            start_in_b = spans[0][0]
+            end_in_b = spans[-1][1]
+            abs_start = b_start + start_in_b
+            abs_end = b_start + end_in_b
+            chunk_text = full_text[abs_start:abs_end]
+            if not chunk_text.strip():
+                return None
+            return ParsedChunk(
+                chunk_id=f"chk_{doc_id}_{chunk_idx:03d}",
                 doc_id=doc_id,
                 text=chunk_text,
-                page=section.page or 1,
+                page=b_page,
                 section=section.title,
-                char_start=section.char_start,
-                char_end=section.char_start + len(chunk_text),
+                char_start=abs_start,
+                char_end=abs_end,
                 token_count=self.estimate_tokens(chunk_text)
-            ))
+            )
+
+        for span in sentence_spans:
+            s_text = b_text[span[0]:span[1]]
+            s_tokens = self.estimate_tokens(s_text)
+
+            if curr_tokens + s_tokens > self.max_chunk_tokens and curr_spans:
+                c = emit_sentence_chunk(curr_spans, start_num + len(chunks))
+                if c:
+                    chunks.append(c)
+
+                last_span = curr_spans[-1]
+                last_tokens = self.estimate_tokens(b_text[last_span[0]:last_span[1]])
+                if last_tokens <= self.chunk_overlap_tokens:
+                    curr_spans = [last_span, span]
+                    curr_tokens = last_tokens + s_tokens
+                else:
+                    curr_spans = [span]
+                    curr_tokens = s_tokens
+            else:
+                curr_spans.append(span)
+                curr_tokens += s_tokens
+
+        if curr_spans:
+            c = emit_sentence_chunk(curr_spans, start_num + len(chunks))
+            if c:
+                chunks.append(c)
 
         return chunks
 
-    def _get_overlap_text(self, text: str) -> str:
-        """Extracts the tail portion of text matching roughly chunk_overlap_tokens."""
-        words = text.split()
-        target_words = int(self.chunk_overlap_tokens / 1.3)
-        if len(words) <= target_words:
-            return text
-        return " ".join(words[-target_words:])

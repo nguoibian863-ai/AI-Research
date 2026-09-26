@@ -11,8 +11,11 @@ class ParsedSection(BaseModel):
     title: str = "General"
     content: str
     page: Optional[int] = None
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
     char_start: int = 0
     char_end: int = 0
+    blocks: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class CleanedDocument(BaseModel):
@@ -80,12 +83,50 @@ class HTMLCleaner:
         raw_paragraphs = extracted_text.split("\n\n")
         current_section_title = title or "Introduction"
         current_section_lines: List[str] = []
-        curr_offset = 0
 
         # Regex heuristic for headings: short lines (<80 chars), capital start, no terminal period
         heading_pattern = re.compile(r"^(#{1,4}\s+|[A-Z0-9][\w\s\-\:\.]{2,70}(?<!\.))$")
 
-        running_text_offset = 0
+        search_cursor = 0
+
+        def build_section(sec_title: str, lines: List[str], cursor: int):
+            if not lines:
+                return None, cursor
+            sec_content = "\n\n".join(lines)
+            sec_start = extracted_text.find(sec_content, cursor)
+            if sec_start != -1:
+                sec_end = sec_start + len(sec_content)
+                new_cursor = sec_end
+            else:
+                sec_start = cursor
+                sec_end = sec_start + len(sec_content)
+                new_cursor = sec_end + 2
+
+            b_list = []
+            b_curr = sec_start
+            for l in lines:
+                b_s = extracted_text.find(l, b_curr)
+                if b_s != -1:
+                    b_e = b_s + len(l)
+                    b_curr = b_e
+                else:
+                    b_s = b_curr
+                    b_e = b_curr + len(l)
+                    b_curr = b_e + 2
+                b_list.append({"text": l, "page": 1, "char_start": b_s, "char_end": b_e})
+
+            sec = ParsedSection(
+                title=sec_title,
+                content=sec_content,
+                page=1,
+                page_start=1,
+                page_end=1,
+                char_start=sec_start,
+                char_end=sec_end,
+                blocks=b_list
+            )
+            return sec, new_cursor
+
         for para in raw_paragraphs:
             para_clean = para.strip()
             if not para_clean:
@@ -96,17 +137,9 @@ class HTMLCleaner:
             is_heading = bool(heading_pattern.match(header_candidate)) and len(header_candidate.split()) <= 10
 
             if is_heading and current_section_lines:
-                # Flush previous section
-                sec_content = "\n\n".join(current_section_lines)
-                sec_end = running_text_offset + len(sec_content)
-                sections.append(ParsedSection(
-                    title=current_section_title,
-                    content=sec_content,
-                    page=1,
-                    char_start=running_text_offset,
-                    char_end=sec_end
-                ))
-                running_text_offset = sec_end + 2
+                sec, search_cursor = build_section(current_section_title, current_section_lines, search_cursor)
+                if sec:
+                    sections.append(sec)
                 current_section_title = header_candidate
                 current_section_lines = []
             elif is_heading and not current_section_lines:
@@ -115,15 +148,9 @@ class HTMLCleaner:
                 current_section_lines.append(para_clean)
 
         if current_section_lines:
-            sec_content = "\n\n".join(current_section_lines)
-            sec_end = running_text_offset + len(sec_content)
-            sections.append(ParsedSection(
-                title=current_section_title,
-                content=sec_content,
-                page=1,
-                char_start=running_text_offset,
-                char_end=sec_end
-            ))
+            sec, search_cursor = build_section(current_section_title, current_section_lines, search_cursor)
+            if sec:
+                sections.append(sec)
 
         # If no sections could be broken down, wrap entire text
         if not sections and extracted_text:
@@ -131,8 +158,11 @@ class HTMLCleaner:
                 title=title or "Body",
                 content=extracted_text,
                 page=1,
+                page_start=1,
+                page_end=1,
                 char_start=0,
-                char_end=len(extracted_text)
+                char_end=len(extracted_text),
+                blocks=[{"text": extracted_text, "page": 1, "char_start": 0, "char_end": len(extracted_text)}]
             ))
 
         return CleanedDocument(

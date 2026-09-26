@@ -12,6 +12,8 @@ trafilatura>=1.10.0
 pymupdf>=1.24.0
 rank-bm25>=0.2.2
 faiss-cpu>=1.9.0
+fastembed>=0.3.0
+onnxruntime>=1.18.0
 
 # Testing & Quality
 pytest>=8.2.0

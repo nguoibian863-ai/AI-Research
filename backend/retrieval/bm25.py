@@ -58,9 +58,15 @@ class BM25Index:
             reverse=True
         )
 
+        query_token_set = set(tokens)
         results: List[Tuple[Dict[str, Any], float]] = []
-        for idx, score in scored_indices[:top_k]:
-            if score > 0.0:  # Only return chunks with at least minimal keyword overlap
-                results.append((self.chunks[idx], score))
+        for idx, score in scored_indices:
+            chunk_tokens = tokenize_for_bm25(self.chunks[idx].get("text", ""))
+            has_overlap = any(t in query_token_set for t in chunk_tokens)
+            if score > 0.0 or has_overlap:
+                effective_score = score if score > 0.0 else float(sum(1 for t in chunk_tokens if t in query_token_set))
+                results.append((self.chunks[idx], effective_score))
 
-        return results
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+

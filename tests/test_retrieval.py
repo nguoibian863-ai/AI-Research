@@ -1,9 +1,10 @@
 import pytest
 from pathlib import Path
 from backend.retrieval.bm25 import BM25Index, tokenize_for_bm25
-from backend.retrieval.embeddings import LocalHashEmbeddingBackend, MockEmbeddingBackend
+from backend.retrieval.embeddings import LocalHashEmbeddingBackend, MockEmbeddingBackend, FastEmbedEmbeddingBackend
 from backend.retrieval.faiss_index import FaissVectorIndex
 from backend.retrieval.hybrid import HybridRetriever
+from backend.retrieval.reranker import ScoreReranker
 from backend.core.state import ResearchPhase, ResearchStatus
 
 
@@ -180,3 +181,102 @@ def test_api_clean_and_retrieve_endpoints(client, isolated_engine):
     assert data["phase"] == "RETRIEVE"
     assert data["results_count"] >= 1
     assert "71.2 NDS" in data["results"][0]["text"]
+
+
+def test_fastembed_true_semantic_paraphrasing(tmp_path):
+    """
+    P0 Test: True semantic search with paraphrased query without shared vocabulary.
+    Verifies FastEmbedEmbeddingBackend (BAAI/bge-small-en-v1.5) accurately matches
+    'how fast does the model run' with 'Inference latency is 20 ms' over irrelevant text.
+    """
+    emb = FastEmbedEmbeddingBackend()
+    faiss_idx = FaissVectorIndex(embedding_backend=emb, index_dir=tmp_path)
+
+    chunks = [
+        {"chunk_id": "speed_chunk", "text": "Inference latency is 20 ms per frame on RTX hardware."},
+        {"chunk_id": "recipe_chunk", "text": "Authentic Italian carbonara pasta requires eggs, guanciale, and pecorino."},
+        {"chunk_id": "weather_chunk", "text": "Sunny skies and mild temperatures expected across the Mediterranean."}
+    ]
+    faiss_idx.add_chunks(chunks)
+
+    # Paraphrased query with ZERO shared words with speed_chunk
+    results = faiss_idx.search("how fast does the model run", top_k=2)
+    assert len(results) > 0
+    top_chunk, score = results[0]
+    assert top_chunk["chunk_id"] == "speed_chunk"
+    # Ensure significant margin over recipe chunk
+    assert score > 0.5
+
+
+def test_bm25_small_corpus_no_drop():
+    """
+    P1 Test: Small corpus (N <= 2) term matching.
+    Ensures that when N=1 or N=2, chunks containing query terms are NOT discarded
+    due to negative or zero IDF scores.
+    """
+    chunks = [
+        {"chunk_id": "doc1", "text": "CenterPoint LiDAR point clouds 3D bounding boxes."},
+    ]
+    bm25 = BM25Index(chunks)
+
+    # Query matching doc1 in a 1-document corpus
+    results = bm25.search("CenterPoint", top_k=5)
+    assert len(results) == 1
+    assert results[0][0]["chunk_id"] == "doc1"
+    assert results[0][1] > 0.0
+
+
+def test_score_reranker_boosts():
+    """
+    P2 Test: ScoreReranker exact keyword and section boosts.
+    Verifies that chunks in 'Results' sections and containing exact query phrases
+    receive score boosts and rank at the top.
+    """
+    from backend.retrieval.hybrid import RetrievedChunk
+
+    c1 = RetrievedChunk(
+        chunk_id="c1", doc_id="d1",
+        text="Background discussion on autonomous vehicles and cameras.",
+        section="Introduction", score=0.015
+    )
+    c2 = RetrievedChunk(
+        chunk_id="c2", doc_id="d1",
+        text="CenterPoint achieved 71.2 NDS on nuScenes benchmark.",
+        section="Results", score=0.014
+    )
+
+    reranked = ScoreReranker.rerank(query="CenterPoint nuScenes benchmark", chunks=[c1, c2], top_k=2)
+    assert len(reranked) == 2
+    # c2 should receive both exact query match boost and benchmark section boost!
+    assert reranked[0].chunk_id == "c2"
+    assert reranked[0].score > reranked[1].score
+
+
+def test_session_retriever_isolation(isolated_engine):
+    """
+    P1 Test: HybridRetriever is isolated per session.
+    Verifies that indexing chunks for session A does not pollute or wipe session B.
+    """
+    sid_a = "sess_iso_a"
+    sid_b = "sess_iso_b"
+
+    retriever_a = isolated_engine.get_session_retriever(sid_a)
+    retriever_b = isolated_engine.get_session_retriever(sid_b)
+
+    assert retriever_a is not retriever_b
+
+    chunks_a = [{"chunk_id": "ca1", "text": "Session A unique secret alpha."}]
+    chunks_b = [{"chunk_id": "cb1", "text": "Session B unique secret beta."}]
+
+    retriever_a.index_chunks(chunks_a)
+    retriever_b.index_chunks(chunks_b)
+
+    res_a = retriever_a.retrieve("secret", top_k=5)
+    res_b = retriever_b.retrieve("secret", top_k=5)
+
+    assert len(res_a) == 1
+    assert res_a[0].chunk_id == "ca1"
+
+    assert len(res_b) == 1
+    assert res_b[0].chunk_id == "cb1"
+

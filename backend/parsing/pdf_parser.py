@@ -45,9 +45,29 @@ class PDFParser:
         running_char_offset = 0
 
         current_section_title = "Abstract" if len(doc) > 0 else "Introduction"
-        current_section_text: List[str] = []
-        current_section_page = 1
-        current_section_start = 0
+        current_section_blocks: List[Dict[str, Any]] = []
+
+        def flush_section(sec_title: str, blocks: List[Dict[str, Any]], offset: int):
+            if not blocks:
+                return None, offset
+            curr = offset
+            for blk in blocks:
+                blk["char_start"] = curr
+                blk["char_end"] = curr + len(blk["text"])
+                curr = blk["char_end"] + 2  # account for \n\n separator
+
+            sec_content = "\n\n".join(b["text"] for b in blocks)
+            sec = ParsedSection(
+                title=sec_title,
+                content=sec_content,
+                page=blocks[0]["page"],
+                page_start=blocks[0]["page"],
+                page_end=blocks[-1]["page"],
+                char_start=offset,
+                char_end=offset + len(sec_content),
+                blocks=blocks
+            )
+            return sec, offset + len(sec_content) + 2
 
         for page_idx in range(len(doc)):
             page = doc[page_idx]
@@ -78,40 +98,26 @@ class PDFParser:
 
                 if is_section_header:
                     # Flush previous section if it has content
-                    if current_section_text:
-                        sec_str = "\n\n".join(current_section_text)
-                        sec_len = len(sec_str)
-                        sections.append(ParsedSection(
-                            title=current_section_title,
-                            content=sec_str,
-                            page=current_section_page,
-                            char_start=current_section_start,
-                            char_end=current_section_start + sec_len
-                        ))
-                        full_text_parts.append(sec_str)
-                        running_char_offset += sec_len + 2  # account for \n\n separator
+                    if current_section_blocks:
+                        sec, next_offset = flush_section(current_section_title, current_section_blocks, running_char_offset)
+                        if sec:
+                            sections.append(sec)
+                            full_text_parts.append(sec.content)
+                            running_char_offset = next_offset
 
                     current_section_title = first_line
-                    current_section_page = page_num
-                    current_section_start = running_char_offset
                     # If block had more than 1 line, rest is content
                     remainder = "\n".join(lines[1:]).strip()
-                    current_section_text = [remainder] if remainder else []
+                    current_section_blocks = [{"text": remainder, "page": page_num}] if remainder else []
                 else:
-                    current_section_text.append(raw_text)
+                    current_section_blocks.append({"text": raw_text, "page": page_num})
 
         # Flush final section
-        if current_section_text:
-            sec_str = "\n\n".join(current_section_text)
-            sec_len = len(sec_str)
-            sections.append(ParsedSection(
-                title=current_section_title,
-                content=sec_str,
-                page=current_section_page,
-                char_start=current_section_start,
-                char_end=current_section_start + sec_len
-            ))
-            full_text_parts.append(sec_str)
+        if current_section_blocks:
+            sec, next_offset = flush_section(current_section_title, current_section_blocks, running_char_offset)
+            if sec:
+                sections.append(sec)
+                full_text_parts.append(sec.content)
 
         full_document_text = "\n\n".join(full_text_parts)
 
@@ -121,8 +127,11 @@ class PDFParser:
                 title=title,
                 content=full_document_text,
                 page=1,
+                page_start=1,
+                page_end=len(doc),
                 char_start=0,
-                char_end=len(full_document_text)
+                char_end=len(full_document_text),
+                blocks=[{"text": full_document_text, "page": 1, "char_start": 0, "char_end": len(full_document_text)}]
             ))
 
         return CleanedDocument(
@@ -137,3 +146,4 @@ class PDFParser:
                 "format": "pdf"
             }
         )
+

@@ -92,10 +92,10 @@ class HybridRetriever:
         # 3. Sort by combined RRF score descending
         sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
 
-        results: List[RetrievedChunk] = []
-        for cid in sorted_cids[:top_k]:
+        candidates: List[RetrievedChunk] = []
+        for cid in sorted_cids:
             c = chunk_map[cid]
-            results.append(RetrievedChunk(
+            candidates.append(RetrievedChunk(
                 chunk_id=cid,
                 doc_id=c.get("doc_id", ""),
                 text=c.get("text", ""),
@@ -115,5 +115,14 @@ class HybridRetriever:
                 }
             ))
 
+        # 4. Score-based reranking for exact match & section boost
+        try:
+            from backend.retrieval.reranker import ScoreReranker
+            results = ScoreReranker.rerank(query, candidates, top_k=top_k)
+        except Exception as e:
+            logger.warning(f"[HybridRetriever] Reranking skipped ({e}), using RRF order.")
+            results = candidates[:top_k]
+
         logger.info(f"[HybridRetriever] Retrieved top {len(results)} chunks for query: '{query}'")
         return results
+

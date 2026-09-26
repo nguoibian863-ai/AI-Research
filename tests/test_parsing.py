@@ -104,11 +104,58 @@ def test_section_aware_chunker():
         assert c.token_count <= 80  # within bounded chunk limit
         assert c.section is not None
         assert c.char_end > c.char_start
+        # Exact character offset invariant:
+        assert cleaned.text[c.char_start:c.char_end] == c.text
 
     # Check that nuScenes metric exists in results chunk
     result_chunk = next((c for c in chunks if "71.2 NDS" in c.text), None)
     assert result_chunk is not None
     assert "Results" in (result_chunk.section or "")
+
+
+def test_pdf_multipage_section_chunk_page_attribution(tmp_path):
+    """
+    Verifies that when a section spans multiple pages, chunks from page 2 get chunk.page == 2,
+    not page 1, and exact character offsets match document.text.
+    """
+    pdf_path = tmp_path / "multipage_section.pdf"
+    doc = pymupdf.open()
+
+    # Page 1: Section starts here with paragraph 1
+    page1 = doc.new_page()
+    page1.insert_text((50, 50), "1. Experiments and Results\nThis is the first benchmark experiment on page 1.")
+
+    # Page 2: Section continues here with paragraph 2
+    page2 = doc.new_page()
+    page2.insert_text((50, 50), "This is the second benchmark experiment on page 2 with 85.4 accuracy.")
+
+    doc.save(str(pdf_path))
+    doc.close()
+
+    cleaned = PDFParser.parse_file(pdf_path)
+    assert len(cleaned.sections) == 1
+    sec = cleaned.sections[0]
+    assert sec.page_start == 1
+    assert sec.page_end == 2
+
+    chunker = SectionAwareChunker(max_chunk_tokens=30, chunk_overlap_tokens=0)
+    chunks = chunker.chunk_document(doc_id="doc_multi_page", document=cleaned)
+
+    assert len(chunks) >= 2
+    # Verify exact character slices for all chunks
+    for c in chunks:
+        assert cleaned.text[c.char_start:c.char_end] == c.text
+
+    # The first chunk should have page 1
+    p1_chunk = next((c for c in chunks if "page 1" in c.text), None)
+    assert p1_chunk is not None
+    assert p1_chunk.page == 1
+
+    # The second chunk from page 2 MUST have page 2, NOT page 1!
+    p2_chunk = next((c for c in chunks if "page 2" in c.text), None)
+    assert p2_chunk is not None
+    assert p2_chunk.page == 2
+
 
 
 def test_pdf_fetch_tool_local(tmp_path):

@@ -46,6 +46,11 @@ from backend.retrieval.hybrid import HybridRetriever, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
+BLOCKED_DOMAINS = {
+    "facebook.com", "instagram.com", "twitter.com", "x.com", "pinterest.com",
+    "tiktok.com", "quora.com", "youtube.com"
+}
+
 
 class ResearchEngine:
     def __init__(
@@ -69,10 +74,11 @@ class ResearchEngine:
         self.pdf_tool = pdf_tool or PDFFetchTool()
         self.chunker = chunker or SectionAwareChunker(max_chunk_tokens=self.limits.max_chunk_tokens)
         self.embedding_backend = embedding_backend or LocalHashEmbeddingBackend()
-        self.hybrid_retriever = hybrid_retriever or HybridRetriever(
-            bm25_index=BM25Index(),
-            vector_index=FaissVectorIndex(embedding_backend=self.embedding_backend)
-        )
+        
+        # Per-session hybrid retrievers (BM25 + FAISS isolation)
+        self._session_retrievers: Dict[str, HybridRetriever] = {}
+        if hybrid_retriever:
+            self._session_retrievers["default"] = hybrid_retriever
 
         # Repositories
         self.session_repo = SessionRepository(self.db)
@@ -88,6 +94,34 @@ class ResearchEngine:
 
         # Session Budget Trackers (cached in-memory, backed by SQLite)
         self._budget_trackers: Dict[str, ExecutionBudgetTracker] = {}
+
+    def get_session_retriever(self, session_id: str) -> HybridRetriever:
+        """Returns or creates an isolated HybridRetriever per session."""
+        if session_id not in self._session_retrievers:
+            self._session_retrievers[session_id] = HybridRetriever(
+                bm25_index=BM25Index(),
+                vector_index=FaissVectorIndex(embedding_backend=self.embedding_backend)
+            )
+        return self._session_retrievers[session_id]
+
+    @property
+    def hybrid_retriever(self) -> HybridRetriever:
+        return self.get_session_retriever("default")
+
+    @hybrid_retriever.setter
+    def hybrid_retriever(self, val: HybridRetriever) -> None:
+        self._session_retrievers["default"] = val
+
+    def retrieve_chunks(self, session_id: str, query: str, top_k: Optional[int] = None) -> List[RetrievedChunk]:
+        """Read-only chunk retrieval without mutating session state or phase."""
+        chunks = self.chunk_repo.get_by_session(session_id)
+        if not chunks:
+            return []
+        retriever = self.get_session_retriever(session_id)
+        retriever.index_chunks(chunks)
+        k = top_k or self.limits.retrieval_top_k
+        return retriever.retrieve(query=query, top_k=k)
+
 
     def get_budget_tracker(self, session_id: str) -> ExecutionBudgetTracker:
         if session_id not in self._budget_trackers:
@@ -229,15 +263,22 @@ class ResearchEngine:
             self.save_state(state)
 
     def run_plan_phase(self, state: ResearchState) -> None:
-        """Executes the PLAN phase with strict budget checks."""
+        """Executes the PLAN phase with strict budget checks and technical few-shot prompt."""
         try:
             budget = self.get_budget_tracker(state.session_id)
             budget.assert_can_call_llm()
 
             self.state_machine.transition(state, ResearchPhase.PLAN, reason="Starting research plan")
             prompt = (
-                f"You are a Senior Research Planner. Given the following research question, "
-                f"break it down into 3-5 concrete, factual investigation sub-tasks and identify core hypotheses to test.\n\n"
+                f"You are a Senior Technical Research Planner. Given the following research question, "
+                f"break it down into 3-5 concrete, factual investigation sub-tasks focusing on measurable benchmarks, "
+                f"hardware specifications, datasets, and baseline comparisons.\n\n"
+                f"Example Benchmark Plan:\n"
+                f"Goal: Compare PointPillars vs CenterPoint 3D detection on nuScenes\n"
+                f"Tasks:\n"
+                f"1. Investigate CenterPoint architecture, voxel/pillar resolution, and test set mAP/NDS on nuScenes.\n"
+                f"2. Investigate PointPillars detection performance, latency, and FPS on LiDAR benchmarks.\n"
+                f"3. Compare computational cost, RTX GPU inference latency, and memory footprint between models.\n\n"
                 f"Question: {state.goal}"
             )
             res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema)
@@ -275,7 +316,7 @@ class ResearchEngine:
             raise
 
     def run_search_phase(self, state: ResearchState, custom_queries: Optional[List[str]] = None) -> List[str]:
-        """Generates targeted search queries and executes web search with URL deduplication & source limits."""
+        """Generates targeted search queries and executes web search with URL deduplication & domain filtering."""
         try:
             budget = self.get_budget_tracker(state.session_id)
             self.state_machine.transition(state, ResearchPhase.SEARCH, reason="Executing web search")
@@ -284,8 +325,12 @@ class ResearchEngine:
             if not queries_to_run:
                 budget.assert_can_call_llm()
                 prompt = (
-                    f"Based on the research goal and plan, generate 2-4 search queries across categories "
-                    f"(discovery, evidence, verification, contradiction) to gather required facts.\n\n"
+                    f"Based on the research goal and plan, generate 2-4 concise, highly-targeted keyword search queries "
+                    f"(3 to 8 words per query). Do NOT use conversational question sentences.\n\n"
+                    f"Good Examples:\n"
+                    f"- 'CenterPoint nuScenes 3D detection benchmark NDS mAP'\n"
+                    f"- 'PointPillars inference latency FPS RTX'\n"
+                    f"- 'CenterPoint vs PointPillars autonomous driving LiDAR benchmark'\n\n"
                     f"Goal: {state.goal}\n"
                     f"Plan: {state.plan.model_dump_json() if state.plan else ''}\n"
                     f"Previously visited: {state.visited_queries}"
@@ -320,12 +365,19 @@ class ResearchEngine:
                             break
 
                         url = item.url.strip() if item.url else ""
-                        if url and url not in existing_urls and url not in found_urls:
+                        if not url:
+                            continue
+
+                        domain = url.split("/")[2].lower() if "://" in url else ""
+                        if any(b in domain for b in BLOCKED_DOMAINS):
+                            logger.info(f"[{state.session_id}][SEARCH] Skipping blocked domain: {domain}")
+                            continue
+
+                        if url not in existing_urls and url not in found_urls:
                             found_urls.append(url)
                             existing_urls.add(url)
                             source_id = f"src_{uuid.uuid4().hex[:8]}"
                             state.source_ids.append(source_id)
-                            domain = url.split("/")[2] if "://" in url else ""
                             self.source_repo.add(
                                 source_id=source_id,
                                 session_id=state.session_id,
@@ -342,37 +394,50 @@ class ResearchEngine:
             self._handle_phase_error(state, e, "SEARCH")
             raise
 
-    def run_fetch_phase(self, state: ResearchState, urls: Optional[List[str]] = None) -> List[FetchedWebContent]:
+    def run_fetch_phase(self, state: ResearchState, urls: Optional[List[str]] = None) -> List[Union[FetchedWebContent, FetchedPDFContent]]:
         """
-        Fetches web pages, cleans HTML via Trafilatura, stores document in SQLite.
-        NOTE: Does NOT write arbitrary dummy raw evidence (resolves P0 evidence corruption).
+        Fetches web pages or PDFs, parses them into CleanedDocuments, and stores chunks in SQLite.
+        Routes PDF URLs to PDFFetchTool, captures author/date metadata, and respects max_total_chunks.
         """
         try:
             budget = self.get_budget_tracker(state.session_id)
             self.state_machine.transition(state, ResearchPhase.FETCH, reason="Fetching source documents")
 
-            # Accurate fallback: If urls is provided (even if []), use it directly
             if urls is not None:
                 target_urls = urls
             else:
                 sources = self.source_repo.get_by_session(state.session_id)
                 target_urls = [s["url"] for s in sources if s.get("url")]
 
-            fetched_documents: List[FetchedWebContent] = []
+            fetched_documents: List[Union[FetchedWebContent, FetchedPDFContent]] = []
             sources = self.source_repo.get_by_session(state.session_id)
+            current_session_chunks = len(self.chunk_repo.get_by_session(state.session_id))
 
             for url in target_urls:
                 if not budget.can_fetch():
                     logger.warning(f"[{state.session_id}][FETCH] Fetch budget exhausted ({budget.fetch_calls} calls). Skipping: {url}")
                     break
 
+                if current_session_chunks >= self.limits.max_total_chunks:
+                    logger.info(f"[{state.session_id}][FETCH] Reached max_total_chunks limit ({self.limits.max_total_chunks}).")
+                    break
+
                 budget.record_fetch()
-                fetched = self.fetch_tool.fetch(url)
+                is_pdf_url = url.lower().endswith(".pdf") or "/pdf/" in url.lower()
+                if is_pdf_url:
+                    fetched = self.pdf_tool.fetch(url)
+                else:
+                    fetched = self.fetch_tool.fetch(url)
+                    if fetched and getattr(fetched, "is_pdf", False):
+                        fetched = self.pdf_tool.fetch(url)
+                        is_pdf_url = True
+
                 if fetched and fetched.text:
                     fetched_documents.append(fetched)
 
-                    # Accurately match source or create source for this URL (resolves P0 source misattribution)
                     matching_source = next((s for s in sources if s["url"] == url), None)
+                    authors_list = [fetched.author] if getattr(fetched, "author", None) else None
+                    pub_date = getattr(fetched, "date", None)
                     if not matching_source:
                         domain = url.split("/")[2] if "://" in url else ""
                         source_id = f"src_{uuid.uuid4().hex[:8]}"
@@ -382,7 +447,10 @@ class ResearchEngine:
                             url=url,
                             title=fetched.title or url,
                             domain=domain,
-                            canonical_key=url.lower().rstrip("/")
+                            canonical_key=url.lower().rstrip("/"),
+                            authors=authors_list,
+                            published_at=pub_date,
+                            source_type="pdf" if is_pdf_url else "web"
                         )
                         if source_id not in state.source_ids:
                             state.source_ids.append(source_id)
@@ -410,6 +478,8 @@ class ResearchEngine:
                     )
                     chunks = self.chunker.chunk_document(doc_id=doc_id, document=cleaned_doc)
                     if chunks:
+                        available_slots = max(0, self.limits.max_total_chunks - current_session_chunks)
+                        chunks_to_add = chunks[:available_slots]
                         chunk_dicts = [
                             {
                                 "chunk_id": c.chunk_id,
@@ -421,9 +491,10 @@ class ResearchEngine:
                                 "char_end": c.char_end,
                                 "token_count": c.token_count
                             }
-                            for c in chunks
+                            for c in chunks_to_add
                         ]
                         self.chunk_repo.add_batch(chunk_dicts)
+                        current_session_chunks += len(chunks_to_add)
 
             self.save_state(state)
             logger.info(f"[{state.session_id}][FETCH] Fetched {len(fetched_documents)} documents successfully.")
@@ -435,12 +506,12 @@ class ResearchEngine:
     def run_clean_phase(self, state: ResearchState) -> int:
         """
         Executes the CLEAN phase: ensures all documents for the session are cleaned,
-        section-aware chunked, and stored in SQLite chunks table.
+        section-aware chunked, and stored in SQLite chunks table up to max_total_chunks.
         """
         try:
             self.state_machine.transition(state, ResearchPhase.CLEAN, reason="Cleaning and chunking documents")
             sources = self.source_repo.get_by_session(state.session_id)
-            total_chunks = 0
+            total_chunks = len(self.chunk_repo.get_by_session(state.session_id))
             for s in sources:
                 doc = self.doc_repo.get_by_source(s["source_id"])
                 if doc:
@@ -452,6 +523,8 @@ class ResearchEngine:
                         )
                         chunks = self.chunker.chunk_document(doc_id=doc["doc_id"], document=cleaned)
                         if chunks:
+                            available_slots = max(0, self.limits.max_total_chunks - total_chunks)
+                            chunks_to_add = chunks[:available_slots]
                             chunk_dicts = [
                                 {
                                     "chunk_id": c.chunk_id,
@@ -463,12 +536,10 @@ class ResearchEngine:
                                     "char_end": c.char_end,
                                     "token_count": c.token_count
                                 }
-                                for c in chunks
+                                for c in chunks_to_add
                             ]
                             self.chunk_repo.add_batch(chunk_dicts)
-                            total_chunks += len(chunks)
-                    else:
-                        total_chunks += len(existing_chunks)
+                            total_chunks += len(chunks_to_add)
 
             self.save_state(state)
             logger.info(f"[{state.session_id}][CLEAN] Documents chunked. Total chunks in SQLite: {total_chunks}")
@@ -484,15 +555,9 @@ class ResearchEngine:
         """
         try:
             self.state_machine.transition(state, ResearchPhase.RETRIEVE, reason="Retrieving relevant evidence chunks")
-            chunks = self.chunk_repo.get_by_session(state.session_id)
-            if not chunks:
-                logger.warning(f"[{state.session_id}][RETRIEVE] No chunks found in SQLite for retrieval.")
-                return []
-
             target_query = query or state.goal
-            self.hybrid_retriever.index_chunks(chunks)
             k = top_k or self.limits.retrieval_top_k
-            results = self.hybrid_retriever.retrieve(query=target_query, top_k=k)
+            results = self.retrieve_chunks(session_id=state.session_id, query=target_query, top_k=k)
             self.save_state(state)
             logger.info(f"[{state.session_id}][RETRIEVE] Retrieved {len(results)} chunks for query: '{target_query}'.")
             return results
@@ -509,6 +574,7 @@ class ResearchEngine:
         """
         Synthesizes a grounded initial answer from retrieved chunks or fetched sources.
         Records unverified trajectory strictly in 'raw' partition (resolves P0 fake confidence).
+        Transitions to PARTIAL if no substantive evidence context was found.
         """
         try:
             budget = self.get_budget_tracker(state.session_id)
@@ -547,11 +613,12 @@ class ResearchEngine:
             budget.record_llm_call(tokens=res.total_tokens)
             answer = res.content.strip()
 
-            # Transition state to DONE (or PARTIAL if no docs)
-            has_data = bool(context_snippets) or bool(state.source_ids)
+            # Transition state to DONE (or PARTIAL if no evidence found)
+            has_data = bool(context_snippets) and bool(state.source_ids) and "no external documents retrieved" not in full_context.lower()
             target_phase = ResearchPhase.DONE if has_data else ResearchPhase.PARTIAL
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
             self.save_state(state)
+
 
             # Save report
             report_id = f"rep_{uuid.uuid4().hex[:8]}"

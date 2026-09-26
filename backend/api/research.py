@@ -150,7 +150,12 @@ def run_retrieve(session_id: str, req: Optional[RetrieveRequest] = None, engine:
 
     query = req.query if req and req.query else state.goal
     top_k = req.top_k if req and req.top_k else 5
-    retrieved = engine.run_retrieve_phase(state, query=query, top_k=top_k)
+    # If session is in CLEAN, advance state machine to RETRIEVE. Otherwise perform read-only retrieval.
+    if state.phase == ResearchPhase.CLEAN:
+        retrieved = engine.run_retrieve_phase(state, query=query, top_k=top_k)
+    else:
+        retrieved = engine.retrieve_chunks(session_id=session_id, query=query, top_k=top_k)
+
     return {
         "session_id": session_id,
         "phase": state.phase.value,
@@ -158,6 +163,7 @@ def run_retrieve(session_id: str, req: Optional[RetrieveRequest] = None, engine:
         "results_count": len(retrieved),
         "results": [r.model_dump() for r in retrieved]
     }
+
 
 
 @router.post("/session/{session_id}/answer")

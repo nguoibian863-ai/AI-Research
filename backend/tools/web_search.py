@@ -20,8 +20,9 @@ class SearchResultItem(BaseModel):
     title: str
     url: str
     snippet: str
-    query: str
-    rank: int
+    query: str = ""
+    rank: int = 1
+
 
 
 class WebSearchTool:
