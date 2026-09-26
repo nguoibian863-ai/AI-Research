@@ -12,7 +12,9 @@
 | 4 — Verification + UI | chưa bắt đầu | |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 82 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 84 passed + 1 skipped (test FastEmbed cần mạng).
+
+Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 
 ## Đã giải quyết ở `4f3872c`
 

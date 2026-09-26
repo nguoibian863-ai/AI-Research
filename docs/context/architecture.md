@@ -47,6 +47,6 @@ Offset bất biến: `document.text[chunk.char_start:chunk.char_end] == chunk.te
 
 - OpenAlex/arXiv provider (12.5)
 - Cross-encoder reranker (18.1), NLI entailment verifier (23)
-- Writer theo section (27.1), UI (29)
+- Writer theo section (27.1), UI đầy đủ (29.1) — đã có Session Viewer chỉ đọc tại `/ui` (29.0)
 - Trajectory cho `query_generation` / `evidence_extraction` (43.1), `training/` (45.4)
 - Research memory liên session (19.1)

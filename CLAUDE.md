@@ -43,6 +43,7 @@ python -m pytest -q -m "not slow"        # bỏ test cần mạng/model
 uvicorn backend.main:app --host 127.0.0.1 --port 8000   # hoặc scripts/start_backend.ps1 (Windows)
 python scripts/benchmark_ollama.py       # đo tokens/s, VRAM, JSON constrained decoding
 python scripts/show_session.py           # liệt kê session; thêm <session_id> hoặc --latest để xem chi tiết + xuất data/reports/<id>.md
+# Session Viewer (chỉ đọc): chạy server rồi mở http://127.0.0.1:8000/ui  (backend/ui/index.html, render chỉ bằng textContent)
 ```
 
 E2E thật (cần Ollama chạy local):
@@ -71,5 +72,6 @@ backend/retrieval/  bm25.py, embeddings.py, faiss_index.py, hybrid.py (RRF), rer
 backend/evidence/   extractor.py (quote invariance + verify_atomic_fact), verifier.py (citation table)
 backend/sources/    dedup.py (canonical key: arXiv/DOI/title/URL)
 backend/db/         database.py (schema + migration), repositories.py
-backend/api/        research.py (FastAPI routes)
+backend/api/        research.py (FastAPI routes, gồm GET /sessions)
+backend/ui/         index.html (Session Viewer tĩnh, phục vụ tại /ui)
 ```
