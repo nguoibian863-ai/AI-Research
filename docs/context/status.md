@@ -57,11 +57,16 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 4. Chuẩn hoá trích dẫn `**E1**`, `(E1)`, `E1`, `[E1, E2]` → `[E1]`: writer sinh trích dẫn chuẩn, 3/3 claim đạt `CITED` và truy vết thành công.
 5. Không còn bịa số liệu: writer thừa nhận thiếu metric định lượng so sánh trực tiếp, không tự bịa TPS.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống)
+## Vấn đề còn mở (ưu tiên từ trên xuống) — review `aa5a034`
 
-1. **Thời gian EXTRACT trên CPU/Small GPU**: Trích xuất 5 chunk mất ~8.5 phút trên SmolLM3-3B, dễ chạm trần `max_runtime_seconds: 600s`. Cần tối ưu số lượng chunk chọn lọc (hoặc lọc trước bằng heuristic).
-2. **Statement đọc sai quote nhưng trùng từ nhiều** (vd "MySQL is the best open-source tool") vẫn qua → cần NLI (plan 23, Tuần 4).
-3. **Tỉ lệ quote bị loại "not in source chunk" cao** (model diễn đạt lại thay vì trích nguyên văn) → dữ liệu cho Dataset C (plan 43).
+1. **Composite search chỉ dùng provider đầu tiên**: arXiv trả đủ `max_results` là vòng lặp dừng, OpenAlex và DuckDuckGo không bao giờ được gọi (thử với 3 provider giả: `calls 1 0 0`). Mất docs chính thức, benchmark CSDL, trang ngoài arXiv → cần chia quota theo provider hoặc xen kẽ kết quả.
+2. **URL arXiv trỏ tới trang `abs`** → FETCH chỉ lấy được abstract, không có bảng kết quả; nên fetch bản `html`/`pdf` để có số liệu.
+3. **OpenAlex ưu tiên `landing_page_url`** (thường là trang nhà xuất bản, paywall/JS) trước `oa_url`/`pdf_url` → tốn fetch budget, ít text.
+4. **Trajectory `query_generation` ghi cả khi query đến từ `open_questions`** (không do LLM sinh) → nhiễm dữ liệu train; cần đánh dấu nguồn query hoặc bỏ qua. `verified=True` chỉ vì tìm được nguồn là nhãn gây hiểu nhầm.
+5. Trajectory `evidence_extraction` không lưu prompt/phiên bản prompt → khó tái tạo input chính xác cho SFT/DPO khi prompt thay đổi.
+6. **Thời gian EXTRACT** (~8.5 phút/5 chunk, vượt 600s ở run YOLOv8) chưa xử lý; thêm 3 provider tuần tự mỗi query còn tăng thời gian SEARCH (timeout tới 10+10+15s/query).
+7. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
+8. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
 
 ## Lịch sử kết quả chạy thật
 
