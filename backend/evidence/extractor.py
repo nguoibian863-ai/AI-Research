@@ -6,7 +6,7 @@ from backend.db.database import DatabaseManager
 from backend.db.repositories import RawEvidenceRepository, EvidenceRepository
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema
-from backend.core.coverage import extract_core_entities, check_entity_in_text
+from backend.core.coverage import extract_core_entities, check_entity_in_text, DATASET_BENCHMARK_TERMS
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,11 @@ def expand_quote_to_sentence(start_idx: int, end_idx: int, text: str) -> Tuple[i
     """
     Expands a candidate quote match to the full sentence or line boundaries
     to provide complete context, subject attribution, and metric grounding.
+    Correctly ignores decimal dots in floating point numbers (e.g. 60.3 or 67.3).
     """
-    if not text or (end_idx - start_idx) > 200 or text[start_idx:end_idx].count(".") > 1:
+    # Count real sentence terminators (not decimal points like 60.3 or 67.3)
+    sentence_terminators = len(re.findall(r"(?:[.!?](?:\s+|$))|\n", text[start_idx:end_idx]))
+    if not text or (end_idx - start_idx) > 250 or sentence_terminators > 1:
         return start_idx, end_idx, text[start_idx:end_idx]
 
     # Expand backwards to sentence start (previous period + space, newline, or start of text)
@@ -63,8 +66,15 @@ def expand_quote_to_sentence(start_idx: int, end_idx: int, text: str) -> Tuple[i
         prev_char = text[sent_start - 1]
         if prev_char == "\n":
             break
-        if prev_char == "." and (sent_start == len(text) or text[sent_start].isspace()):
-            break
+        if prev_char in {".", "!", "?"}:
+            next_char = text[sent_start] if sent_start < len(text) else ""
+            prev_prev = text[sent_start - 2] if sent_start > 1 else ""
+            # Do NOT break on decimal numbers like '60.3'
+            if prev_char == "." and prev_prev.isdigit() and next_char.isdigit():
+                sent_start -= 1
+                continue
+            if sent_start == len(text) or next_char.isspace():
+                break
         sent_start -= 1
 
     while sent_start < start_idx and text[sent_start].isspace():
@@ -76,9 +86,16 @@ def expand_quote_to_sentence(start_idx: int, end_idx: int, text: str) -> Tuple[i
         char = text[sent_end]
         if char == "\n":
             break
-        if char == "." and (sent_end + 1 == len(text) or text[sent_end + 1].isspace()):
-            sent_end += 1
-            break
+        if char in {".", "!", "?"}:
+            prev_char = text[sent_end - 1] if sent_end > 0 else ""
+            next_char = text[sent_end + 1] if sent_end + 1 < len(text) else ""
+            # Do NOT break on decimal numbers like '60.3'
+            if char == "." and prev_char.isdigit() and next_char.isdigit():
+                sent_end += 1
+                continue
+            if sent_end + 1 == len(text) or next_char.isspace():
+                sent_end += 1
+                break
         sent_end += 1
 
     expanded = text[sent_start:sent_end].strip()
@@ -151,25 +168,29 @@ def verify_atomic_fact(
         stmt_lower = fact.statement.lower()
         subj_lower = (fact.subject or "").strip().lower()
 
-        # Check secondary goal entities: if statement mentions another entity from research goal,
-        # that entity MUST appear in the verbatim quote.
-        if goal_entities:
-            for ent in goal_entities:
-                if ent in subj_lower or subj_lower in ent:
-                    continue
-                if check_entity_in_text(ent, stmt_lower):
-                    if not check_entity_in_text(ent, quote_lower):
-                        return False, f"UNSUPPORTED_COMPARISON: foreign entity '{ent}' in statement not found in verbatim quote"
-
         # Check comparative syntax: "X is better than Y", "outperforms Y", "beating Y"
-        is_comparative = bool(re.search(r"\b(than|outperforms?|beats?|beating|superior to|inferior to|ahead of)\b", stmt_lower))
+        is_comparative = bool(re.search(r"\b(than|outperforms?|beats?|beating|superior to|inferior to|ahead of|higher than|faster than|better than|more accurate than)\b", stmt_lower))
         if is_comparative:
             stmt_entities = extract_core_entities(fact.statement)
             for ent in stmt_entities:
                 if ent in subj_lower or subj_lower in ent:
                     continue
+                # If statement makes a comparison with another entity, that entity MUST be in the verbatim quote
                 if not check_entity_in_text(ent, quote_lower):
                     return False, f"UNSUPPORTED_COMPARISON: comparative statement mentions entity '{ent}' not found in verbatim quote"
+
+        # Check secondary competitor entities from research goal
+        if goal_entities:
+            for ent in goal_entities:
+                if ent in subj_lower or subj_lower in ent:
+                    continue
+                # Skip datasets/benchmarks - they provide experimental context, not competitor assertions
+                if ent in DATASET_BENCHMARK_TERMS:
+                    continue
+                if check_entity_in_text(ent, stmt_lower):
+                    # For non-dataset competitor entities, must be grounded in quote or chunk
+                    if not check_entity_in_text(ent, quote_lower) and not check_entity_in_text(ent, chunk_text_lower):
+                        return False, f"UNSUPPORTED_COMPARISON: foreign entity '{ent}' in statement not found in verbatim quote or chunk"
 
     return True, "VERIFIED"
 

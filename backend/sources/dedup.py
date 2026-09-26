@@ -1,19 +1,20 @@
 import re
+import urllib.parse
 from typing import Optional
 
 
 def compute_canonical_key(url: str, title: Optional[str] = None) -> str:
     """
     Computes a canonical deduplication key for a source:
-    1. arXiv ID (e.g. 'arxiv:2006.11275') ignoring version suffix (v1, v2) and format (.pdf, /abs/, /pdf/)
+    1. arXiv ID (e.g. 'arxiv:2006.11275') supporting /abs/, /pdf/, /html/, versions and .pdf/.html
     2. DOI (e.g. 'doi:10.1109/cvpr.2021.00123')
-    3. Normalized title slug if title is present and meaningful (>= 4 words)
+    3. Normalized title slug for cross-domain mirrors of substantive papers (>= 4 words, not repo/doc subpaths)
     4. Fallback: normalized URL (lowercase, stripped query/hash/trailing slash)
     """
     clean_url = (url or "").strip().lower()
 
-    # 1. Check for arXiv ID
-    arxiv_match = re.search(r"arxiv(?:\.org)?/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5})(?:v[0-9]+)?(?:\.pdf)?", clean_url)
+    # 1. Check for arXiv ID (supporting abs, pdf, html)
+    arxiv_match = re.search(r"arxiv(?:\.org)?/(?:abs|pdf|html)/([0-9]{4}\.[0-9]{4,5})(?:v[0-9]+)?(?:\.pdf|\.html)?", clean_url)
     if not arxiv_match:
         arxiv_match = re.search(r"\barxiv:([0-9]{4}\.[0-9]{4,5})\b", clean_url)
     if arxiv_match:
@@ -25,9 +26,17 @@ def compute_canonical_key(url: str, title: Optional[str] = None) -> str:
         matched_doi = doi_match.group(1).rstrip("/")
         return f"doi:{matched_doi}"
 
-    # 3. Check for normalized title if sufficiently descriptive (>= 3 words)
-    if title:
-        clean_title = re.sub(r"[^\w\s-]", "", title.lower())
+    parsed = urllib.parse.urlparse(clean_url)
+    domain = parsed.netloc.lower()
+
+    # 3. Check for normalized title for cross-domain articles
+    # Avoid collapsing distinct subpaths on repo/doc platforms (like GitHub, GitLab, ReadTheDocs)
+    is_repo_or_docs = any(platform in domain for platform in ["github.com", "gitlab.com", "readthedocs", "gitbook"]) or domain.startswith("docs.")
+    if title and not is_repo_or_docs:
+        # Strip generic website branding prefixes & suffixes
+        clean_title = re.sub(r"^(?:github\s*[-–:]\s*|arxiv\s*[-–:]\s*|docs?\s*[-–:]\s*)", "", title.lower())
+        clean_title = re.sub(r"\s*[-–:|]\s*(?:github|arxiv|docs?|documentation).*$", "", clean_title)
+        clean_title = re.sub(r"[^\w\s-]", "", clean_title).strip()
         words = clean_title.split()
         if len(words) >= 3:
             slug = "-".join(words[:8])

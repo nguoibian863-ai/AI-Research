@@ -640,7 +640,8 @@ def test_claims_table_populated_and_retrieved_via_api(tmp_path: Path):
                     "confidence": 0.99
                 }
             ]
-        }
+        },
+        "generate": "CenterPoint achieves 60.3 mAP on nuScenes benchmark [E1]."
     }
 
     db = DatabaseManager(db_path=tmp_path / "claims_api_test.db")
@@ -711,4 +712,183 @@ def test_session_with_zero_evidence_terminates_partial(tmp_path: Path):
     assert result["status"] == "PARTIAL"
     assert result["evidence_count"] == 0
     assert "No verified atomic evidence extracted" in result["error_message"]
+
+
+def test_expand_quote_to_sentence_ignores_decimal_numbers():
+    from backend.evidence.extractor import expand_quote_to_sentence
+    text = (
+        "Previous methods suffer from high latency. "
+        "Our CenterPoint achieves 60.3 mAP and 67.3 NDS on the nuScenes 3D benchmark. "
+        "This sets a new state of the art."
+    )
+    quote = "CenterPoint achieves 60.3 mAP and 67.3 NDS"
+    start_idx = text.find(quote)
+    end_idx = start_idx + len(quote)
+    _, _, expanded = expand_quote_to_sentence(start_idx, end_idx, text)
+    assert expanded == "Our CenterPoint achieves 60.3 mAP and 67.3 NDS on the nuScenes 3D benchmark."
+
+
+def test_verify_atomic_fact_allows_dataset_benchmark_context():
+    from backend.evidence.extractor import verify_atomic_fact
+    from backend.llm.schemas import AtomicFactItemSchema
+    fact = AtomicFactItemSchema(
+        statement="CenterPoint achieves 60.3 mAP on nuScenes.",
+        subject="CenterPoint",
+        predicate="achieves",
+        metric="mAP",
+        value="60.3",
+        raw_quote="CenterPoint achieves 60.3 mAP",
+        confidence=0.95
+    )
+    chunk_dict = {"text": "CenterPoint achieves 60.3 mAP and 67.3 NDS on the nuScenes benchmark."}
+    is_valid, reason = verify_atomic_fact(
+        fact=fact,
+        target_chunk=chunk_dict,
+        verified_quote="CenterPoint achieves 60.3 mAP on the nuScenes benchmark.",
+        goal_entities=["centerpoint", "nuscenes"]
+    )
+    assert is_valid is True
+    assert reason == "VERIFIED"
+
+
+def test_canonical_key_preserves_github_subpaths_and_supports_arxiv_html():
+    from backend.sources.dedup import compute_canonical_key
+
+    # arXiv HTML support
+    k_html = compute_canonical_key("https://arxiv.org/html/2304.08069v1", "RT-DETR Paper")
+    k_abs = compute_canonical_key("https://arxiv.org/abs/2304.08069", "RT-DETR Paper")
+    assert k_html == "arxiv:2304.08069"
+    assert k_html == k_abs
+
+    # GitHub subpaths must NOT collide based on common repo title
+    gh_root = compute_canonical_key(
+        "https://github.com/open-mmlab/OpenPCDet",
+        "GitHub - open-mmlab/OpenPCDet: An open-source 3D detection codebase"
+    )
+    gh_docs = compute_canonical_key(
+        "https://github.com/open-mmlab/OpenPCDet/blob/master/docs/getting_started.md",
+        "GitHub - open-mmlab/OpenPCDet: An open-source 3D detection codebase"
+    )
+    assert gh_root != gh_docs
+    assert gh_root == "url:github.com/open-mmlab/openpcdet"
+    assert gh_docs == "url:github.com/open-mmlab/openpcdet/blob/master/docs/getting_started.md"
+
+
+def test_uncited_numeric_report_creates_unsupported_claim_and_forces_partial(tmp_path: Path):
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Evaluate CenterPoint detection",
+            "tasks": [{"task_id": "t1", "description": "nuScenes test", "expected_evidence": "60.3"}],
+            "key_hypotheses": ["CenterPoint"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "CenterPoint", "query_type": "evidence", "rationale": "r"}]
+        },
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        },
+        # The LLM answers with an uncited fabricated numeric claim!
+        "generate": (
+            "CenterPoint achieves 60.3 mAP on nuScenes [E1]. "
+            "However, PointPillars is best with 80.5 NDS without citations."
+        )
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "uncited_num_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Evaluate CenterPoint detection")
+
+    # Because of the uncited numeric claim 'PointPillars is best with 80.5 NDS without citations',
+    # the session MUST transition to PARTIAL!
+    assert result["phase"] == "PARTIAL"
+    assert result["status"] == "PARTIAL"
+    assert "Report contains unsupported numeric claims without citations" in result["error_message"]
+
+    # Verify claim lineage in DB
+    claims = engine.claim_repo.get_by_session(result["session_id"])
+    supported = [c for c in claims if c["status"] == "SUPPORTED"]
+    unsupported = [c for c in claims if c["status"] == "UNSUPPORTED"]
+
+    assert len(supported) >= 1
+    assert supported[0]["verification"]["verified"] is True
+    assert supported[0]["evidence_ids"][0].startswith("evi_")
+
+    assert len(unsupported) >= 1
+    assert unsupported[0]["verification"]["verified"] is False
+    assert "PointPillars is best with 80.5 NDS" in unsupported[0]["text"]
+
+
+def test_evidence_based_entity_coverage_triggers_partial_when_one_entity_lacks_evidence(tmp_path: Path):
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Compare CenterPoint and PointPillars",
+            "tasks": [{"task_id": "t1", "description": "compare", "expected_evidence": "ev"}],
+            "key_hypotheses": ["h1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "CenterPoint vs PointPillars", "query_type": "evidence", "rationale": "r"}]
+        },
+        # Evidence only exists for CenterPoint, NONE for PointPillars!
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP on nuScenes.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        },
+        "generate": "CenterPoint achieves 60.3 mAP on nuScenes benchmark [E1]."
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "entity_ev_cov_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Compare CenterPoint and PointPillars")
+    # Must transition to PARTIAL because PointPillars lacks verified atomic evidence!
+    assert result["phase"] == "PARTIAL"
+    assert result["status"] == "PARTIAL"
+    assert "Missing evidence for: pointpillars" in result["error_message"]
+
 

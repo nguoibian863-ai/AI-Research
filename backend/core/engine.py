@@ -48,7 +48,9 @@ from backend.core.coverage import (
     extract_core_entities,
     check_entity_in_text,
     evaluate_coverage,
-    GENERIC_RESEARCH_TERMS
+    evaluate_evidence_coverage,
+    GENERIC_RESEARCH_TERMS,
+    DATASET_BENCHMARK_TERMS
 )
 from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
@@ -842,32 +844,91 @@ class ResearchEngine:
             self.state_machine.transition(state, ResearchPhase.WRITE, reason="Synthesizing report")
             res = self.llm.generate(prompt)
             budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
-            answer = res.content.strip()
+            raw_report = res.content.strip()
 
             # Append Evidence & Provenance Table and populate claims lineage if evidence items exist
             claims_json = "[]"
+            supported_claims_count = 0
+            unsupported_numeric_claims_count = 0
+
             if evidence_items:
-                augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(answer, evidence_items)
+                augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(raw_report, evidence_items)
                 answer = augmented_answer
                 valid_indices = citation_stats.get("valid_indices", [])
                 claims_json = json.dumps(valid_indices)
 
-                # Persist claims to claims table for complete claim lineage
-                indices_to_persist = valid_indices if valid_indices else list(range(1, len(evidence_items) + 1))
-                for idx in indices_to_persist:
-                    if 1 <= idx <= len(evidence_items):
-                        ev = evidence_items[idx - 1]
+                # Claim Lineage: Extract substantive sentences from the report body
+                # Each claim in the claims table MUST originate from a sentence in the report!
+                clean_body = raw_report.split("### Evidence & Provenance Table")[0].strip()
+                report_sentences = [
+                    s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", clean_body)
+                    if s.strip() and len(s.strip()) >= 10
+                ]
+
+                for sent in report_sentences:
+                    # Ignore markdown headers, footers, tables, or formatting lines
+                    trimmed = sent.strip()
+                    if trimmed.startswith("#") or trimmed.startswith("---") or trimmed.startswith("|"):
+                        continue
+                    lower_sent = trimmed.lower()
+                    if (
+                        lower_sent.startswith(("source:", "sources:", "url:", "urls:", "ref:", "reference:", "references:"))
+                        or lower_sent.startswith(("http://", "https://"))
+                        or lower_sent.startswith(("**citation", "**source", "**reference"))
+                    ):
+                        continue
+
+                    cited_tokens = re.findall(r"\[E(\d+)\]", sent)
+                    valid_cites_in_sent = [int(t) for t in cited_tokens if 1 <= int(t) <= len(evidence_items)]
+
+                    # Check for numeric metrics in the sentence (excluding [E#] citation brackets and URLs)
+                    sent_no_cites = re.sub(r"\[E\d+\]", "", sent)
+                    sent_no_cites = re.sub(r"https?://\S+", "", sent_no_cites)
+                    has_numbers = bool(re.search(r"\b\d+(?:\.\d+)?\b", sent_no_cites))
+
+                    if valid_cites_in_sent:
+                        for c_idx in valid_cites_in_sent:
+                            ev = evidence_items[c_idx - 1]
+                            claim_id = f"clm_{uuid.uuid4().hex[:8]}"
+                            self.claim_repo.add(
+                                claim_id=claim_id,
+                                session_id=state.session_id,
+                                text=sent,  # The actual sentence from the report!
+                                evidence_ids=[ev.get("evidence_id")],
+                                verification={
+                                    "verified": True,
+                                    "citation_index": c_idx,
+                                    "quote": ev.get("exact_quote"),
+                                    "source_id": ev.get("source_id")
+                                },
+                                status="SUPPORTED"
+                            )
+                            supported_claims_count += 1
+                    elif has_numbers:
+                        # Sentence contains numbers/metrics but has NO valid citation!
                         claim_id = f"clm_{uuid.uuid4().hex[:8]}"
                         self.claim_repo.add(
                             claim_id=claim_id,
                             session_id=state.session_id,
-                            text=ev.get("statement") or ev.get("exact_quote") or f"Finding [E{idx}]",
-                            evidence_ids=[ev.get("evidence_id")],
-                            verification={"verified": True, "citation_index": idx, "quote": ev.get("exact_quote")},
-                            status="SUPPORTED"
+                            text=sent,  # The actual uncited sentence from the report!
+                            evidence_ids=[],
+                            verification={"verified": False, "reason": "Uncited numeric claim"},
+                            status="UNSUPPORTED"
                         )
+                        unsupported_numeric_claims_count += 1
+            else:
+                answer = raw_report
 
-            # Transition state to DONE (or PARTIAL if missing coverage, 0 evidence, or insufficient info)
+            # Evidence-based entity coverage check:
+            # Each core entity in research goal must have at least 1 verified atomic evidence item!
+            goal_core_entities = [e for e in extract_core_entities(state.goal) if e not in DATASET_BENCHMARK_TERMS]
+            if not goal_core_entities:
+                goal_core_entities = extract_core_entities(state.goal)
+
+            ev_coverage = evaluate_evidence_coverage(goal_core_entities, evidence_items)
+            missing_evidence_entities = ev_coverage["missing"] if len(goal_core_entities) > 1 else []
+
+            # Transition state to DONE (or PARTIAL if missing coverage, 0 evidence, uncited numbers, or insufficient info)
             insufficient_phrases = [
                 "no information available",
                 "insufficient information",
@@ -886,13 +947,32 @@ class ResearchEngine:
                 and "no external documents retrieved" not in full_context.lower()
                 and not is_insufficient
                 and not bool(missing_entities)
+                and not bool(missing_evidence_entities)
                 and len(evidence_items) > 0
+                and supported_claims_count > 0
+                and unsupported_numeric_claims_count == 0
             )
-            if len(evidence_items) == 0:
-                if not state.error_message:
-                    state.error_message = "No verified atomic evidence extracted"
-                elif "No verified atomic evidence extracted" not in state.error_message:
-                    state.error_message = f"{state.error_message}; No verified atomic evidence extracted"
+
+            # Record transparent reasons if transitioning to PARTIAL
+            if not has_valid_evidence:
+                partial_reasons = []
+                if len(evidence_items) == 0:
+                    partial_reasons.append("No verified atomic evidence extracted")
+                if missing_evidence_entities:
+                    partial_reasons.append(f"Missing evidence for: {', '.join(missing_evidence_entities)}")
+                if supported_claims_count == 0 and evidence_items:
+                    partial_reasons.append("Report contains no valid citations")
+                if unsupported_numeric_claims_count > 0:
+                    partial_reasons.append("Report contains unsupported numeric claims without citations")
+                if is_insufficient:
+                    partial_reasons.append("Insufficient information in gathered context")
+
+                if partial_reasons:
+                    reason_msg = "; ".join(partial_reasons)
+                    if not state.error_message:
+                        state.error_message = reason_msg
+                    elif reason_msg not in state.error_message:
+                        state.error_message = f"{state.error_message}; {reason_msg}"
 
             target_phase = ResearchPhase.DONE if has_valid_evidence else ResearchPhase.PARTIAL
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")

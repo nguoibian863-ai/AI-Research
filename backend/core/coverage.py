@@ -38,6 +38,15 @@ GENERIC_RESEARCH_TERMS = {
     "approach", "approaches", "method", "methods", "technique", "techniques",
     "work", "works", "working", "consumer", "enterprise", "choice", "choose",
     "choosing", "various", "multiple", "several", "general", "common",
+    "verify", "verifies", "verified", "verifying", "verification",
+    "claim", "claims", "claimed", "claiming",
+    "fact", "facts", "factual",
+    "check", "checks", "checked", "checking",
+    "investigate", "investigates", "investigated", "investigating", "investigation",
+    "assess", "assesses", "assessed", "assessing", "assessment",
+    "validate", "validates", "validated", "validating", "validation",
+    "find", "finds", "found", "finding", "findings",
+    "detail", "details", "detailed",
     "like", "such", "than", "more", "most", "less", "least",
     "of", "to", "in", "on", "at", "by", "as", "is", "it", "an", "or", "we",
     "do", "so", "no", "if", "my", "up", "out", "off", "all", "any", "some",
@@ -118,5 +127,51 @@ def evaluate_coverage(entities: List[str], chunks: List[Dict[str, Any]]) -> Dict
         "covered": covered,
         "missing": missing,
         "coverage_ratio": coverage_ratio,
+        "is_complete": len(missing) == 0
+    }
+
+
+DATASET_BENCHMARK_TERMS = {
+    "nuscenes", "coco", "kitti", "imagenet", "waymo", "cityscapes", "voc",
+    "pascal", "glue", "squad", "cifar", "cifar10", "cifar100", "mnist",
+    "lvis", "wider", "mot17", "mot20", "bdd100k", "argoverse", "shapenet",
+    "scanrefer", "scannet", "sunrgbd", "tum", "kitti360"
+}
+
+
+def evaluate_evidence_coverage(
+    entities: List[str],
+    evidence_items: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Evaluates whether each required entity is supported by at least one verified atomic evidence item.
+    Returns:
+    {
+        "covered": [str, ...],
+        "missing": [str, ...],
+        "coverage_ratio": float,
+        "is_complete": bool
+    }
+    """
+    if not entities:
+        return {"covered": [], "missing": [], "coverage_ratio": 1.0, "is_complete": True}
+
+    covered = []
+    for ent in entities:
+        ent_found = False
+        for ev in evidence_items:
+            ev_text = f"{ev.get('subject', '')} {ev.get('predicate', '')} {ev.get('statement', '')} {ev.get('exact_quote', '')} {ev.get('raw_quote', '')}"
+            if check_entity_in_text(ent, ev_text):
+                ent_found = True
+                break
+        if ent_found:
+            covered.append(ent)
+
+    missing = [e for e in entities if e not in covered]
+    ratio = len(covered) / len(entities) if entities else 1.0
+    return {
+        "covered": covered,
+        "missing": missing,
+        "coverage_ratio": ratio,
         "is_complete": len(missing) == 0
     }
