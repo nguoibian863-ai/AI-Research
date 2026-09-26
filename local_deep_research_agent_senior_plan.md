@@ -672,6 +672,38 @@ independence
 reproducibility
 ```
 
+## 14.1 Source Credibility Score
+
+Tính hoàn toàn bằng Python (không gọi LLM), deterministic, test được.
+
+```text
+source_score (0–100) =
+    authority       30%   domain/venue: arxiv, doi, .edu, docs chính thức, repo gốc
+  + primary_source  30%   paper/repo gốc > blog tổng hợp > diễn đàn/Q&A
+  + directness      20%   core entities của goal xuất hiện trong title/snippet
+  + recency         10%   published_at so với thời điểm research
+  + independence    10%   không trùng canonical_key với source khác
+```
+
+Không chấm chỉ bằng whitelist domain cố định: một blog tóm tắt trên domain uy tín vẫn phải thấp hơn paper gốc.
+
+## 14.2 Quy tắc sử dụng
+
+```text
+score < 40
+→ không fetch (tiết kiệm fetch budget)
+
+evidence kế thừa source_score
+→ writer ưu tiên evidence từ source điểm cao
+
+2 evidence mâu thuẫn
+→ trình bày cả hai kèm source_score (xem mục 25), không tự chọn
+```
+
+Lưu `source_score` và từng thành phần vào bảng `sources` để giải thích được vì sao một source bị loại.
+
+> Tham khảo: module credibility scoring của `tarun7r/deep-research-agent` (MIT). Chỉ lấy ý tưởng chấm điểm; không dùng kiến trúc LangGraph/ReAct của repo đó (xem P3).
+
 ---
 
 # 15. Source Deduplication
@@ -1012,6 +1044,24 @@ Không nhận raw Internet result.
 
 Không được tự tạo metric mới.
 
+## 27.1 Section-by-Section Writing
+
+Với context 4096, không viết cả report trong một lần gọi.
+
+```text
+report outline (từ plan)
+→ với mỗi section:
+     chọn evidence liên quan section đó (retrieval trên evidence store)
+     writer viết section với [E#] citations
+     verifier kiểm tra section trước khi ghép
+→ ghép sections
+→ Evidence & Provenance Table
+```
+
+Mỗi lần gọi writer chỉ nhận evidence của section đó, giữ prompt trong `TOKEN_BUDGET["writer"]`.
+
+Section không có evidence → ghi rõ "không đủ evidence", không để LLM tự lấp.
+
 ---
 
 # 28. Answerability
@@ -1057,11 +1107,14 @@ Chỉ cần:
 ```text
 Research Input
 Progress
-Sources
+Sources (kèm source_score)
 Evidence
+Rejected Evidence (lý do bị loại: NUMERIC_MISMATCH, SUBJECT_MISMATCH, ...)
 Report
 Click-to-Verify
 ```
+
+Progress cập nhật theo phase thật của state machine (không giả lập).
 
 Không làm animation phức tạp.
 
@@ -1118,6 +1171,8 @@ SQLite
 ```
 
 Không tải lại cùng source nếu hash/version không đổi.
+
+Chỉ cache ở mức source (web/PDF), không cache toàn bộ report theo topic: cùng câu hỏi phải được research lại để không trả về kết luận cũ.
 
 ---
 
@@ -1392,6 +1447,7 @@ Question
 - atomic evidence;
 - provenance;
 - source dedupe;
+- source credibility scoring (mục 14.1);
 - Evidence Store;
 - Gap Evaluator;
 - open questions;
@@ -1403,7 +1459,8 @@ Question
 - raw quote immutable;
 - evidence có page/section/source;
 - agent biết khi nào còn thiếu evidence;
-- source duplicate được phát hiện.
+- source duplicate được phát hiện;
+- source có `source_score`, source < 40 không bị fetch.
 
 ---
 
@@ -1417,10 +1474,10 @@ Question
 - semantic verifier;
 - contradiction handling;
 - claim store;
-- grounded writer;
+- grounded writer theo từng section (mục 27.1);
 - Next.js UI;
 - progress view;
-- evidence view;
+- evidence view (kèm rejected evidence);
 - click-to-source.
 
 ### Acceptance Criteria
@@ -1429,7 +1486,8 @@ Question
 - unsupported claim bị reject;
 - click claim truy về raw source;
 - conflict được đánh dấu;
-- PARTIAL state hiển thị đúng.
+- PARTIAL state hiển thị đúng;
+- mỗi lần gọi writer nằm trong `TOKEN_BUDGET["writer"]`.
 
 ---
 
@@ -1444,7 +1502,8 @@ Question
 - trajectory filtering;
 - failure analysis;
 - bug fixing;
-- architecture stabilization.
+- architecture stabilization;
+- (tuỳ chọn) export report Markdown/HTML + citation style (APA/IEEE).
 
 ### Acceptance Criteria
 
@@ -1476,15 +1535,17 @@ Question
 - PDF
 - Hybrid Retrieval
 - Source Dedup
+- Source Credibility Scoring
 - Gap Evaluation
 - Contradiction Detection
+- Section-by-Section Writer
 
 ## P2
 
 - UI
 - GitHub search
 - local cache optimization
-- report formatting
+- report formatting (Markdown/HTML export, citation styles)
 
 ## P3
 
