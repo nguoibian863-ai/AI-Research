@@ -57,16 +57,19 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 4. Chuẩn hoá trích dẫn `**E1**`, `(E1)`, `E1`, `[E1, E2]` → `[E1]`: writer sinh trích dẫn chuẩn, 3/3 claim đạt `CITED` và truy vết thành công.
 5. Không còn bịa số liệu: writer thừa nhận thiếu metric định lượng so sánh trực tiếp, không tự bịa TPS.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống) — review `aa5a034`
+## Đã giải quyết (review 83150eb)
 
-1. **Composite search chỉ dùng provider đầu tiên**: arXiv trả đủ `max_results` là vòng lặp dừng, OpenAlex và DuckDuckGo không bao giờ được gọi (thử với 3 provider giả: `calls 1 0 0`). Mất docs chính thức, benchmark CSDL, trang ngoài arXiv → cần chia quota theo provider hoặc xen kẽ kết quả.
-2. **URL arXiv trỏ tới trang `abs`** → FETCH chỉ lấy được abstract, không có bảng kết quả; nên fetch bản `html`/`pdf` để có số liệu.
-3. **OpenAlex ưu tiên `landing_page_url`** (thường là trang nhà xuất bản, paywall/JS) trước `oa_url`/`pdf_url` → tốn fetch budget, ít text.
-4. **Trajectory `query_generation` ghi cả khi query đến từ `open_questions`** (không do LLM sinh) → nhiễm dữ liệu train; cần đánh dấu nguồn query hoặc bỏ qua. `verified=True` chỉ vì tìm được nguồn là nhãn gây hiểu nhầm.
-5. Trajectory `evidence_extraction` không lưu prompt/phiên bản prompt → khó tái tạo input chính xác cho SFT/DPO khi prompt thay đổi.
-6. **Thời gian EXTRACT** (~8.5 phút/5 chunk, vượt 600s ở run YOLOv8) chưa xử lý; thêm 3 provider tuần tự mỗi query còn tăng thời gian SEARCH (timeout tới 10+10+15s/query).
-7. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
-8. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+- **Composite Search xen kẽ quota & gọi song song**: Gọi song song `ThreadPoolExecutor` cho tất cả provider (arXiv, OpenAlex, DuckDuckGo) với quota chia đều, xếp xen kẽ round-robin và deduplicate canonical key, không còn hiện tượng một provider nuốt trọn kết quả.
+- **arXiv URL trỏ tới `/html/`**: Sinh URL dạng `https://arxiv.org/html/{id}` thay cho `/abs/`, cho phép crawler lấy toàn bộ bài báo, bảng thực nghiệm và số liệu.
+- **OpenAlex ưu tiên `oa_url`/`pdf_url`**: Chọn open-access URL trước landing page paywall/JS của nhà xuất bản, tiết kiệm fetch và lấy text chuẩn.
+- **Làm sạch Trajectory `query_generation`**: Gắn nhãn `query_origin: "llm" | "open_questions"`, đặt `verified=False` cho query thô, và thêm cờ `llm_only_queries=True` khi xuất JSONL để loại bỏ query lập trình không do LLM sinh.
+- **Version hóa prompt trích xuất evidence**: Lưu `prompt_version="v1.2"` cùng toàn văn prompt trong payload của `evidence_extraction` trajectory phục vụ huấn luyện SFT/DPO.
+- **Dự trữ thời gian WRITE & dừng sớm EXTRACT**: Dự trữ tối thiểu 90s cho pha WRITE; dừng vòng lặp chunk nếu thời gian còn lại < 120s hoặc khi đã có ≥ 3 evidence bao quát tất cả thực thể so sánh.
+
+## Vấn đề còn mở (ưu tiên từ trên xuống)
+
+1. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
+2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
 
 ## Lịch sử kết quả chạy thật
 

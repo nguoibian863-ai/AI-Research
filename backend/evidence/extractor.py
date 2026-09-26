@@ -248,6 +248,9 @@ def verify_atomic_fact(
     return True, "VERIFIED"
 
 
+EXTRACTOR_PROMPT_VERSION = "v1.2"
+
+
 class EvidenceExtractor:
     """
     Extracts atomic evidence items from evidence chunks with strict quote invariance guardrails.
@@ -267,9 +270,11 @@ class EvidenceExtractor:
         fact: AtomicFactItemSchema,
         verdict: str,
         verified_quote: Optional[str] = None,
-        goal: str = ""
+        goal: str = "",
+        prompt: Optional[str] = None,
+        prompt_version: str = EXTRACTOR_PROMPT_VERSION
     ) -> None:
-        """Logs evidence extraction trajectory sample with verifier label (Plan 43.1)."""
+        """Logs evidence extraction trajectory sample with verifier label & prompt version (Plan 43.1)."""
         try:
             chunk_id = chunk.get("chunk_id", "")
             source_id = chunk.get("source_id")
@@ -284,6 +289,8 @@ class EvidenceExtractor:
                     "chunk_id": chunk_id,
                     "source_id": source_id,
                     "chunk_text": c_text,
+                    "prompt_version": prompt_version,
+                    "prompt": prompt,
                     "fact": fact.model_dump(),
                     "verdict": verdict,
                     "verified_quote": verified_quote,
@@ -291,6 +298,7 @@ class EvidenceExtractor:
                     "metadata": {
                         "task_type": "evidence_extraction",
                         "model_source": getattr(self.llm, "model", "mock"),
+                        "prompt_version": prompt_version,
                         "verified": is_verified,
                         "quality_score": 1.0 if is_verified else 0.0,
                         "source_ids": [source_id] if source_id else [],
@@ -327,12 +335,35 @@ class EvidenceExtractor:
         goal_entities = extract_core_entities(goal) if goal else []
 
         # Iterate over candidate chunks (up to 5 chunks)
+        WRITE_RESERVED_SECONDS = 90.0
         for i, target_chunk in enumerate(chunks[:5], start=1):
             if len(verified_evidence) >= max_evidence:
                 break
-            if budget_tracker and not budget_tracker.can_call_llm():
-                logger.warning(f"[{session_id}][EXTRACT] LLM budget exhausted. Stopping extraction.")
-                break
+            if budget_tracker:
+                if not budget_tracker.can_call_llm():
+                    logger.warning(f"[{session_id}][EXTRACT] LLM budget exhausted. Stopping extraction.")
+                    break
+                # Reserve time for WRITE phase (report synthesis + claim entailment verification)
+                remaining_sec = budget_tracker.limits.max_runtime_seconds - budget_tracker.elapsed_seconds
+                if remaining_sec < (WRITE_RESERVED_SECONDS + 30.0):
+                    logger.warning(
+                        f"[{session_id}][EXTRACT] Remaining runtime ({remaining_sec:.1f}s) insufficient for further "
+                        f"chunk extraction while reserving {WRITE_RESERVED_SECONDS}s for WRITE. Stopping EXTRACT early."
+                    )
+                    break
+
+            # Early stop if we already have sufficient comparative evidence for all entities
+            if len(verified_evidence) >= 3 and goal_entities:
+                covered_subjects = {
+                    e["subject"].lower() for e in verified_evidence
+                    if any(check_entity_in_text(ent, e["subject"].lower()) for ent in goal_entities)
+                }
+                if all(any(ent in s for s in covered_subjects) for ent in goal_entities):
+                    logger.info(
+                        f"[{session_id}][EXTRACT] All goal entities {goal_entities} covered with {len(verified_evidence)} "
+                        f"verified evidence items. Stopping extraction early to conserve budget."
+                    )
+                    break
 
             c_id = target_chunk.get("chunk_id", f"chunk_{i}")
             c_sec = target_chunk.get("section") or ""
@@ -388,12 +419,12 @@ class EvidenceExtractor:
             for fact in extracted_facts:
                 candidate_quote = fact.raw_quote.strip() if fact.raw_quote else ""
                 if not candidate_quote:
-                    self._log_fact_trajectory(session_id, target_chunk, fact, "EMPTY_QUOTE", None, goal)
+                    self._log_fact_trajectory(session_id, target_chunk, fact, "EMPTY_QUOTE", None, goal, prompt=prompt)
                     continue
 
                 match_res = find_quote_in_text(candidate_quote, c_text)
                 if not match_res:
-                    self._log_fact_trajectory(session_id, target_chunk, fact, "QUOTE_NOT_FOUND", None, goal)
+                    self._log_fact_trajectory(session_id, target_chunk, fact, "QUOTE_NOT_FOUND", None, goal, prompt=prompt)
                     logger.warning(
                         f"[{session_id}][EXTRACT] Rejected ungrounded quote (not in source chunk): '{candidate_quote[:60]}...'"
                     )
@@ -419,7 +450,7 @@ class EvidenceExtractor:
                         final_start, final_end = exp_start, exp_end
                         is_valid = True
                     else:
-                        self._log_fact_trajectory(session_id, target_chunk, fact, reject_reason, None, goal)
+                        self._log_fact_trajectory(session_id, target_chunk, fact, reject_reason, None, goal, prompt=prompt)
                         logger.warning(
                             f"[{session_id}][EXTRACT] Rejected candidate fact ({reject_reason}): statement='{fact.statement}', quote='{matched_quote}'"
                         )
@@ -458,7 +489,7 @@ class EvidenceExtractor:
 
                 # If source_id cannot be verified, reject the evidence to prevent false attribution!
                 if not source_id or source_id == "src_unknown":
-                    self._log_fact_trajectory(session_id, target_chunk, fact, "SOURCE_UNRESOLVED", None, goal)
+                    self._log_fact_trajectory(session_id, target_chunk, fact, "SOURCE_UNRESOLVED", None, goal, prompt=prompt)
                     logger.warning(
                         f"[{session_id}][EXTRACT] Rejected evidence: source_id could not be resolved for chunk {chunk_id}."
                     )
@@ -534,7 +565,7 @@ class EvidenceExtractor:
                     "char_end": abs_end,
                     "confidence": fact.confidence or 1.0
                 })
-                self._log_fact_trajectory(session_id, target_chunk, fact, "VERIFIED", verified_verbatim_quote, goal)
+                self._log_fact_trajectory(session_id, target_chunk, fact, "VERIFIED", verified_verbatim_quote, goal, prompt=prompt)
 
                 if len(verified_evidence) >= max_evidence:
                     break

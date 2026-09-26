@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 import re
 import urllib.parse
@@ -149,8 +150,8 @@ class ArxivSearchProvider(BaseSearchProvider):
                 arxiv_m = re.search(r"(\d{4}\.\d{4,5}(?:v\d+)?)", raw_id_url)
                 arxiv_id = arxiv_m.group(1) if arxiv_m else None
 
-                # Canonical paper landing URL
-                url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else raw_id_url
+                # Full-text HTML URL preferred over /abs/ for rich benchmark and experiment extraction
+                url = f"https://arxiv.org/html/{arxiv_id}" if arxiv_id else raw_id_url
 
                 # Published timestamp
                 published_elem = entry.find("atom:published", ns)
@@ -261,8 +262,8 @@ class OpenAlexSearchProvider(BaseSearchProvider):
                 oa_url = open_access.get("oa_url")
                 work_id = work.get("id")
 
-                # Choose best URL: landing > oa > doi > work_id
-                url = landing_url or oa_url or doi or pdf_url or work_id or ""
+                # Choose best URL: prioritize open-access / PDF over paywalled publisher landing page
+                url = oa_url or pdf_url or landing_url or doi or work_id or ""
                 if not url:
                     continue
 
@@ -303,37 +304,58 @@ class OpenAlexSearchProvider(BaseSearchProvider):
 class CompositeSearchProvider(BaseSearchProvider):
     """
     Composite search provider querying academic sources (arXiv, OpenAlex)
-    alongside general web search (DuckDuckGo), with deduplication by canonical key.
+    alongside general web search (DuckDuckGo) concurrently with quota sharing
+    and round-robin interleaving to guarantee diverse high-credibility results.
     """
     name: str = "composite"
 
     def __init__(self, providers: Optional[List[BaseSearchProvider]] = None, max_results: int = 8):
         self.providers = providers or [
-            ArxivSearchProvider(timeout=10),
-            OpenAlexSearchProvider(timeout=10),
-            DuckDuckGoSearchProvider(timeout=15),
+            ArxivSearchProvider(timeout=8),
+            OpenAlexSearchProvider(timeout=8),
+            DuckDuckGoSearchProvider(timeout=12),
         ]
         self.max_results = max_results
 
     def search(self, query: str, max_results: Optional[int] = None) -> List[SearchResultItem]:
         limit = max_results or self.max_results
+        if not self.providers:
+            return []
+
+        # Determine quota per provider (ensure each provider can contribute)
+        per_provider = max(2, limit // len(self.providers) + 1)
+
+        # Call providers concurrently to minimize search latency
+        provider_results: Dict[str, List[SearchResultItem]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self.providers))) as executor:
+            future_to_provider = {
+                executor.submit(p.search, query, per_provider): p.name
+                for p in self.providers
+            }
+            for future in concurrent.futures.as_completed(future_to_provider):
+                p_name = future_to_provider[future]
+                try:
+                    provider_results[p_name] = future.result()
+                except Exception as e:
+                    logger.error(f"[CompositeSearchProvider] Provider {p_name} failed: {e}")
+                    provider_results[p_name] = []
+
+        # Round-robin interleaving across providers preserving configured priority order
+        lists = [provider_results.get(p.name, []) for p in self.providers]
+        max_len = max((len(l) for l in lists), default=0)
+
         combined: List[SearchResultItem] = []
         seen_keys: set = set()
         seen_urls: set = set()
 
-        for provider in self.providers:
-            if len(combined) >= limit:
-                break
-            try:
-                # Ask each provider for up to limit items
-                items = provider.search(query, max_results=limit)
-                for item in items:
-                    if len(combined) >= limit:
-                        break
+        for idx in range(max_len):
+            for p_list in lists:
+                if len(combined) >= limit:
+                    break
+                if idx < len(p_list):
+                    item = p_list[idx]
                     url_clean = (item.url or "").strip().lower()
-                    if not url_clean:
-                        continue
-                    if url_clean in seen_urls:
+                    if not url_clean or url_clean in seen_urls:
                         continue
 
                     canonical_k = compute_canonical_key(item.url, item.title)
@@ -344,8 +366,9 @@ class CompositeSearchProvider(BaseSearchProvider):
                     seen_urls.add(url_clean)
                     item.rank = len(combined) + 1
                     combined.append(item)
-            except Exception as e:
-                logger.error(f"[CompositeSearchProvider] Provider {provider.name} failed: {e}")
+            if len(combined) >= limit:
+                break
 
-        logger.info(f"[CompositeSearchProvider] Returning {len(combined)} deduplicated results for '{query}'.")
+        logger.info(f"[CompositeSearchProvider] Returning {len(combined)} interleaved results for '{query}'.")
         return combined
+

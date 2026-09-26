@@ -387,6 +387,7 @@ class ResearchEngine:
             self.state_machine.transition(state, ResearchPhase.SEARCH, reason="Executing web search")
 
             queries_to_run = custom_queries or []
+            query_origin = "open_questions" if custom_queries else "llm"
             if not queries_to_run:
                 budget.assert_can_call_llm()
                 prompt = (
@@ -503,19 +504,21 @@ class ResearchEngine:
                     "goal": state.goal,
                     "plan": state.plan.model_dump() if state.plan else None,
                     "queries": queries_to_run,
+                    "query_origin": query_origin,
                     "found_urls": found_urls,
                     "relevant_sources_count": len(found_urls),
                     "total_sources": len(state.source_ids),
                     "metadata": {
                         "task_type": "query_generation",
                         "model_source": getattr(self.llm, "model", "mock"),
-                        "verified": has_sources,
+                        "query_origin": query_origin,
+                        "verified": False,
                         "quality_score": min(1.0, len(found_urls) / max(1, len(queries_to_run))),
                         "source_ids": list(state.source_ids),
                         "language": "en"
                     }
                 },
-                verified=has_sources,
+                verified=False,
                 quality_score=min(1.0, len(found_urls) / max(1, len(queries_to_run))),
                 partition="raw"
             )

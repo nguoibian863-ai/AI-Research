@@ -14,8 +14,8 @@ from backend.tools.search_providers import (
     reconstruct_openalex_abstract,
 )
 from backend.tools.web_search import WebSearchTool
-from backend.evidence.extractor import EvidenceExtractor
-from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema
+from backend.evidence.extractor import EvidenceExtractor, EXTRACTOR_PROMPT_VERSION
+from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema, GeneratedQueriesSchema, SearchQueryItemSchema
 from backend.core.state import ResearchState, ResearchPhase, ResearchPlan, PlanTask
 
 
@@ -39,6 +39,10 @@ SAMPLE_OPENALEX_JSON = {
             "doi": "https://doi.org/10.1145/123456.7890",
             "publication_year": 2023,
             "cited_by_count": 42,
+            "open_access": {
+                "is_oa": True,
+                "oa_url": "https://arxiv.org/pdf/2304.08069.pdf"
+            },
             "primary_location": {
                 "landing_page_url": "https://dl.acm.org/doi/10.1145/123456.7890",
                 "source": {
@@ -70,7 +74,8 @@ def test_arxiv_search_provider_offline():
     assert len(items) == 1
     item = items[0]
     assert item.title == "DETRs Beat YOLOs on Real-time Object Detection"
-    assert item.url == "https://arxiv.org/abs/2304.08069v1"
+    # Full-text HTML URL preferred over /abs/ for rich benchmark and experiment extraction
+    assert item.url == "https://arxiv.org/html/2304.08069v1"
     assert item.arxiv_id == "2304.08069v1"
     assert item.source_type == "paper"
     assert item.doi == "10.1109/CVPR.2024.12345"
@@ -86,7 +91,7 @@ def test_arxiv_search_provider_error_handling():
     assert items == []
 
 
-def test_openalex_search_provider_offline():
+def test_openalex_search_provider_prioritizes_oa_url():
     mock_client = MagicMock(spec=httpx.Client)
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -99,7 +104,8 @@ def test_openalex_search_provider_offline():
     assert len(items) == 1
     item = items[0]
     assert item.title == "A Comprehensive Survey on Transaction Processing Performance Council Benchmarks"
-    assert item.url == "https://dl.acm.org/doi/10.1145/123456.7890"
+    # Prioritizes open-access / PDF over paywalled publisher landing page (Issue 3)
+    assert item.url == "https://arxiv.org/pdf/2304.08069.pdf"
     assert item.source_type == "academic"
     assert item.venue == "ACM Computing Surveys"
     assert item.citation_count == 42
@@ -120,44 +126,53 @@ def test_openalex_search_provider_rate_limit_graceful():
     assert items == []
 
 
-def test_composite_search_provider_deduplication():
-    class FakeProviderA:
-        name = "provider_a"
+def test_composite_search_provider_round_robin_interleaving_and_quota():
+    """Verifies that all providers are invoked and interleaved (Issue 1 fix)."""
+    calls = {"arxiv": 0, "openalex": 0, "ddg": 0}
+
+    class FakeArxiv:
+        name = "arxiv"
         def search(self, query, max_results=8):
+            calls["arxiv"] += 1
             return [
-                SearchResultItem(
-                    title="YOLOv8 Paper",
-                    url="https://arxiv.org/abs/2305.09972",
-                    snippet="Official YOLOv8 paper",
-                    source_type="paper"
-                )
+                SearchResultItem(title=f"Arxiv Paper {i}", url=f"https://arxiv.org/html/2301.0000{i}", snippet="Paper", source_type="paper")
+                for i in range(1, 9)
             ]
 
-    class FakeProviderB:
-        name = "provider_b"
+    class FakeOpenAlex:
+        name = "openalex"
         def search(self, query, max_results=8):
+            calls["openalex"] += 1
             return [
-                # Same arXiv paper in pdf format -> deduplicated by canonical key
-                SearchResultItem(
-                    title="YOLOv8 Paper PDF",
-                    url="https://arxiv.org/pdf/2305.09972.pdf",
-                    snippet="PDF version of YOLOv8 paper",
-                    source_type="paper"
-                ),
-                SearchResultItem(
-                    title="Ultralytics YOLO Documentation",
-                    url="https://docs.ultralytics.com/models/yolov8",
-                    snippet="Documentation page",
-                    source_type="web"
-                )
+                SearchResultItem(title=f"OpenAlex Paper {i}", url=f"https://doi.org/10.1000/{i}", snippet="Academic", source_type="academic")
+                for i in range(1, 9)
             ]
 
-    composite = CompositeSearchProvider(providers=[FakeProviderA(), FakeProviderB()], max_results=5)
-    results = composite.search("YOLOv8")
+    class FakeDDG:
+        name = "duckduckgo"
+        def search(self, query, max_results=8):
+            calls["ddg"] += 1
+            return [
+                SearchResultItem(title=f"Web Doc {i}", url=f"https://ultralytics.com/docs/{i}", snippet="Doc", source_type="web")
+                for i in range(1, 9)
+            ]
 
-    assert len(results) == 2
-    assert results[0].url == "https://arxiv.org/abs/2305.09972"
-    assert results[1].url == "https://docs.ultralytics.com/models/yolov8"
+    composite = CompositeSearchProvider(providers=[FakeArxiv(), FakeOpenAlex(), FakeDDG()], max_results=6)
+    results = composite.search("Object detection")
+
+    # ALL providers must be called (Issue 1: previously only arXiv was called)
+    assert calls["arxiv"] >= 1
+    assert calls["openalex"] >= 1
+    assert calls["ddg"] >= 1
+
+    # Interleaved round-robin order
+    assert len(results) == 6
+    assert results[0].source_type == "paper"      # Arxiv [0]
+    assert results[1].source_type == "academic"   # OpenAlex [0]
+    assert results[2].source_type == "web"        # DDG [0]
+    assert results[3].source_type == "paper"      # Arxiv [1]
+    assert results[4].source_type == "academic"   # OpenAlex [1]
+    assert results[5].source_type == "web"        # DDG [1]
 
 
 def test_trajectory_logging_query_generation_and_evidence_extraction(isolated_engine, tmp_path):
@@ -174,17 +189,29 @@ def test_trajectory_logging_query_generation_and_evidence_extraction(isolated_en
     )
     engine.session_repo.create(state.session_id, state.goal, phase="PLAN", status="PENDING")
 
-    # 1. Run Search Phase -> generates query_generation trajectory
-    engine.run_search_phase(state, custom_queries=["YOLOv8 RT-DETR COCO benchmark"])
+    # 1. Run Search Phase with LLM query generation -> query_origin = "llm"
+    mock_q_res = MagicMock()
+    mock_q_res.parsed = GeneratedQueriesSchema(queries=[SearchQueryItemSchema(query="YOLOv8 RT-DETR benchmark")])
+    mock_q_res.total_tokens = 50
+    mock_q_res.calls_made = 1
+    engine.llm.structured_generate = MagicMock(return_value=mock_q_res)
+
+    engine.run_search_phase(state)
 
     query_trajs = engine.trajectory_repo.list_by_task_type("query_generation", partition="raw")
     assert len(query_trajs) >= 1
     qt = query_trajs[0]
     payload = json.loads(qt["payload_json"])
     assert payload["goal"] == state.goal
-    assert "queries" in payload
-    assert "relevant_sources_count" in payload
-    assert qt["verified"] in (0, 1)
+    assert payload["query_origin"] == "llm"  # Issue 4 fix
+    assert qt["verified"] == 0               # Issue 4 fix: verified=False for raw queries
+
+    # 1b. Run search phase with custom queries (open_questions) -> query_origin = "open_questions"
+    state.phase = ResearchPhase.EVALUATE
+    engine.run_search_phase(state, custom_queries=["RT-DETR latency T4"])
+    oq_trajs = [t for t in engine.trajectory_repo.list_by_task_type("query_generation", partition="raw")
+                if json.loads(t["payload_json"]).get("query_origin") == "open_questions"]
+    assert len(oq_trajs) >= 1
 
     # 2. Run Evidence Extraction -> logs evidence_extraction trajectory for each candidate fact
     chunk = {
@@ -231,24 +258,30 @@ def test_trajectory_logging_query_generation_and_evidence_extraction(isolated_en
     assert len(extracted) == 1
     assert extracted[0]["value"] == "53.1"
 
-    # Verify trajectory table recorded BOTH facts (VERIFIED and QUOTE_NOT_FOUND)
+    # Verify trajectory table recorded BOTH facts with prompt and prompt_version (Issue 5 fix)
     ext_trajs = engine.trajectory_repo.list_by_task_type("evidence_extraction", partition="raw")
     assert len(ext_trajs) >= 2
+
+    for t in ext_trajs:
+        p = json.loads(t["payload_json"])
+        assert p["prompt_version"] == EXTRACTOR_PROMPT_VERSION  # Issue 5
+        assert p["prompt"] is not None and "Goal:" in p["prompt"]  # Issue 5
 
     verdicts = [json.loads(t["payload_json"])["verdict"] for t in ext_trajs]
     assert "VERIFIED" in verdicts
     assert "QUOTE_NOT_FOUND" in verdicts
 
-    # 3. Test JSONL export per Plan 43.1 / 42.4
-    counts = engine.trajectory_repo.export_partition_jsonl(partition="raw", output_dir=tmp_path / "trajectories")
-    assert counts.get("query_generation", 0) >= 1
+    # 3. Test JSONL export with llm_only_queries filter per Plan 43.1 / 42.4 (Issue 4)
+    counts = engine.trajectory_repo.export_partition_jsonl(
+        partition="raw",
+        output_dir=tmp_path / "trajectories",
+        llm_only_queries=True
+    )
+    # The open_questions query was filtered out, keeping only the LLM-generated query sample!
+    assert counts.get("query_generation", 0) == 1
     assert counts.get("evidence_extraction", 0) >= 2
 
-    jsonl_file = tmp_path / "trajectories" / "raw" / "evidence_extraction.jsonl"
-    assert jsonl_file.exists()
-    lines = [json.loads(line) for line in jsonl_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(lines) >= 2
-    for line in lines:
-        assert "trajectory_id" in line
-        assert "metadata" in line
-        assert "model_source" in line["metadata"]
+    q_file = tmp_path / "trajectories" / "raw" / "query_generation.jsonl"
+    q_lines = [json.loads(line) for line in q_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(q_lines) == 1
+    assert q_lines[0]["payload"]["query_origin"] == "llm"

@@ -416,10 +416,16 @@ class TrajectoryRepository:
             )
             return [dict(row) for row in cur.fetchall()]
 
-    def export_partition_jsonl(self, partition: str = "raw", output_dir: Any = "data/trajectories") -> Dict[str, int]:
+    def export_partition_jsonl(
+        self,
+        partition: str = "raw",
+        output_dir: Any = "data/trajectories",
+        llm_only_queries: bool = True
+    ) -> Dict[str, int]:
         """
         Exports trajectories in SQLite for a given partition into JSONL files under output_dir/partition/{task_type}.jsonl,
         formatted with Plan 42.4 metadata schema. Returns dict of {task_type: count_exported}.
+        Filters out programmatic open_questions queries if llm_only_queries is True.
         """
         from pathlib import Path
         out_base = Path(output_dir) / partition
@@ -436,12 +442,16 @@ class TrajectoryRepository:
         try:
             for row in rows:
                 tt = row["task_type"]
+                payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+
+                # Plan 43.1: Exclude programmatic queries (from open_questions) to avoid train data contamination
+                if tt == "query_generation" and llm_only_queries and payload.get("query_origin") == "open_questions":
+                    continue
+
                 if tt not in files:
                     fp = open(out_base / f"{tt}.jsonl", "w", encoding="utf-8")
                     files[tt] = fp
                     counts[tt] = 0
-
-                payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
                 record = {
                     "trajectory_id": row["trajectory_id"],
                     "session_id": row["session_id"],
