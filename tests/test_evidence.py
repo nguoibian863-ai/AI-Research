@@ -334,6 +334,33 @@ def test_evidence_extractor_rejects_numeric_mismatch_and_subject_mismatch(tmp_pa
     assert results[0]["exact_quote"] == "CenterPoint achieves 60.3 mAP"
 
 
+from backend.tools.web_search import SearchResultItem
+from backend.tools.web_fetch import FetchedWebContent
+
+
+class MockSearch:
+    def search(self, query: str, max_results: int = 5):
+        return [
+            SearchResultItem(
+                title="CenterPoint Paper",
+                url="https://arxiv.org/abs/2006.11275",
+                snippet="CenterPoint achieves 60.3 mAP on nuScenes.",
+                query=query,
+                rank=1
+            )
+        ]
+
+
+class MockFetch:
+    def fetch(self, url: str):
+        return FetchedWebContent(
+            url=url,
+            title="CenterPoint 3D Detection",
+            text="In our evaluations, CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark.",
+            content_hash="hash_cp"
+        )
+
+
 def test_run_week1_end_to_end_extracts_evidence_without_foreign_key_error(tmp_path: Path):
     """
     P0-1 Test: Ensures that run_week1 pipeline with RetrievedChunk objects
@@ -343,29 +370,6 @@ def test_run_week1_end_to_end_extracts_evidence_without_foreign_key_error(tmp_pa
     from backend.core.engine import ResearchEngine
     from backend.core.limits import ResearchLimits
     from backend.retrieval.embeddings import LocalHashEmbeddingBackend
-    from backend.tools.web_search import SearchResultItem
-    from backend.tools.web_fetch import FetchedWebContent
-
-    class MockSearch:
-        def search(self, query: str, max_results: int = 5):
-            return [
-                SearchResultItem(
-                    title="CenterPoint Paper",
-                    url="https://arxiv.org/abs/2006.11275",
-                    snippet="CenterPoint achieves 60.3 mAP on nuScenes.",
-                    query=query,
-                    rank=1
-                )
-            ]
-
-    class MockFetch:
-        def fetch(self, url: str):
-            return FetchedWebContent(
-                url=url,
-                title="CenterPoint 3D Detection",
-                text="In our evaluations, CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark.",
-                content_hash="hash_cp"
-            )
 
     canned = {
         "ResearchPlanSchema": {
@@ -441,4 +445,270 @@ def test_extract_core_entities_expanded_terms():
     q2 = "What are the tradeoffs of using Rust instead of Go for backend services"
     ents2 = extract_core_entities(q2)
     assert ents2 == ["rust", "go"]
+
+
+def test_extractor_rejects_evidence_when_source_id_unresolvable(tmp_path: Path):
+    """
+    Verifies that when an evidence chunk has unknown/missing source_id and cannot be resolved from DB,
+    the extractor rejects it rather than falling back to sess_sources[0] (which causes false attribution).
+    """
+    from backend.db.repositories import SessionRepository, SourceRepository
+    db = DatabaseManager(db_path=tmp_path / "source_attrib_test.db")
+    SessionRepository(db).create(session_id="sess_attrib", goal="Test attribution")
+    # First source belongs to a completely different paper
+    SourceRepository(db).add(
+        source_id="src_first_unrelated",
+        session_id="sess_attrib",
+        url="https://arxiv.org/abs/1900.00001",
+        title="Unrelated First Paper",
+        domain="arxiv.org",
+        canonical_key="unrelated"
+    )
+
+    chunks = [
+        {
+            "chunk_id": "chunk_no_source",
+            "source_id": "src_unknown",
+            "url": "local",
+            "text": "CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark.",
+            "section": "Results",
+            "page": 1,
+            "char_start": 0,
+            "char_end": 70
+        }
+    ]
+
+    canned = {
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP on nuScenes benchmark.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "chunk_no_source",
+                    "confidence": 0.99
+                }
+            ]
+        }
+    }
+
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    extractor = EvidenceExtractor(llm=mock_llm, db=db)
+
+    results = extractor.extract_from_chunks(
+        session_id="sess_attrib",
+        goal="Test attribution",
+        chunks=chunks
+    )
+
+    # Must be rejected because source_id cannot be resolved. NEVER attributed to src_first_unrelated!
+    assert len(results) == 0
+
+
+def test_extractor_rejects_unsupported_comparison_statements(tmp_path: Path):
+    """
+    Verifies that ungrounded comparative claims (e.g. 'PointPillars is more accurate than CenterPoint')
+    are rejected when the verbatim quote only mentions one entity ('PointPillars achieves 59.2 NDS').
+    """
+    from backend.db.repositories import SessionRepository, SourceRepository
+    db = DatabaseManager(db_path=tmp_path / "comparative_test.db")
+    SessionRepository(db).create(session_id="sess_comp", goal="Compare PointPillars and CenterPoint")
+    SourceRepository(db).add(
+        source_id="src_pointpillars",
+        session_id="sess_comp",
+        url="https://arxiv.org/abs/1812.05784",
+        title="PointPillars Paper",
+        domain="arxiv.org",
+        canonical_key="pointpillars"
+    )
+
+    chunks = [
+        {
+            "chunk_id": "chunk_pp_1",
+            "source_id": "src_pointpillars",
+            "url": "https://arxiv.org/abs/1812.05784",
+            "text": "PointPillars achieves 59.2 NDS on nuScenes val set with fast inference.",
+            "section": "Experiments",
+            "page": 4,
+            "char_start": 0,
+            "char_end": 75
+        }
+    ]
+
+    canned = {
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    # Comparative statement mentioning CenterPoint without grounding in quote
+                    "statement": "PointPillars is more accurate than CenterPoint.",
+                    "subject": "PointPillars",
+                    "predicate": "more accurate",
+                    "metric": "NDS",
+                    "value": "59.2",
+                    "raw_quote": "PointPillars achieves 59.2 NDS",
+                    "chunk_id": "chunk_pp_1",
+                    "confidence": 0.95
+                },
+                {
+                    # Grounded authentic statement
+                    "statement": "PointPillars achieves 59.2 NDS on nuScenes.",
+                    "subject": "PointPillars",
+                    "predicate": "achieves",
+                    "metric": "NDS",
+                    "value": "59.2",
+                    "raw_quote": "PointPillars achieves 59.2 NDS",
+                    "chunk_id": "chunk_pp_1",
+                    "confidence": 0.95
+                }
+            ]
+        }
+    }
+
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    extractor = EvidenceExtractor(llm=mock_llm, db=db)
+
+    results = extractor.extract_from_chunks(
+        session_id="sess_comp",
+        goal="Compare PointPillars and CenterPoint",
+        chunks=chunks
+    )
+
+    # Only the grounded non-comparative statement is accepted
+    assert len(results) == 1
+    assert results[0]["statement"] == "PointPillars achieves 59.2 NDS on nuScenes."
+
+
+def test_compute_canonical_key_deduplication():
+    """
+    Verifies canonical key deduplication across arXiv variants, DOIs, and titles.
+    """
+    from backend.sources.dedup import compute_canonical_key
+
+    # arXiv normalization
+    k1 = compute_canonical_key("https://arxiv.org/abs/2006.11275", "CenterPoint Paper")
+    k2 = compute_canonical_key("https://arxiv.org/pdf/2006.11275.pdf", "CenterPoint: Center-based 3D Detection")
+    k3 = compute_canonical_key("http://arxiv.org/abs/2006.11275v2", "CenterPoint")
+    assert k1 == "arxiv:2006.11275"
+    assert k1 == k2 == k3
+
+    # DOI normalization
+    d1 = compute_canonical_key("https://doi.org/10.1145/3318464.3389700", "RocksDB paper")
+    d2 = compute_canonical_key("http://dx.doi.org/10.1145/3318464.3389700", "RocksDB")
+    assert d1 == "doi:10.1145/3318464.3389700"
+    assert d1 == d2
+
+    # Title fallback normalization
+    t1 = compute_canonical_key("https://example.com/blog/centerpoint-review", "CenterPoint 3D Detection")
+    t2 = compute_canonical_key("https://other.com/article/123", "CenterPoint: 3D Detection")
+    assert t1 == "title:centerpoint-3d-detection"
+    assert t2 == "title:centerpoint-3d-detection"
+
+
+def test_claims_table_populated_and_retrieved_via_api(tmp_path: Path):
+    """
+    Verifies that claims table records citation lineage and can be fetched via API.
+    """
+    from fastapi.testclient import TestClient
+    from backend.main import app
+    from backend.api.research import get_engine
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Verify CenterPoint claims",
+            "tasks": [{"task_id": "t1", "description": "task", "expected_evidence": "ev"}],
+            "key_hypotheses": ["h1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "CenterPoint nuScenes", "query_type": "evidence", "rationale": "r"}]
+        },
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP on nuScenes benchmark.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        }
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "claims_api_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    app.dependency_overrides[get_engine] = lambda: engine
+    client = TestClient(app)
+
+    try:
+        run_res = client.post("/api/research/run", json={"goal": "Verify CenterPoint claims"})
+        assert run_res.status_code == 200
+        sid = run_res.json()["session_id"]
+
+        # Check claims endpoint
+        claims_res = client.get(f"/api/research/session/{sid}/claims")
+        assert claims_res.status_code == 200
+        claims_data = claims_res.json()["claims"]
+        assert len(claims_data) >= 1
+        assert claims_data[0]["evidence_ids"][0].startswith("evi_")
+        assert "CenterPoint" in claims_data[0]["text"]
+        assert claims_data[0]["verification"]["citation_index"] == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_session_with_zero_evidence_terminates_partial(tmp_path: Path):
+    """
+    Verifies that a session with 0 verified evidence extracted transitions to PARTIAL
+    with error_message indicating no verified atomic evidence.
+    """
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Test 0 evidence partial transition",
+            "tasks": [{"task_id": "t1", "description": "task", "expected_evidence": "ev"}],
+            "key_hypotheses": ["h1"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [{"query": "Test query", "query_type": "evidence", "rationale": "r"}]
+        },
+        # No ExtractedEvidencesSchema -> 0 evidence extracted!
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "zero_ev_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Test 0 evidence partial transition")
+    assert result["phase"] == "PARTIAL"
+    assert result["status"] == "PARTIAL"
+    assert result["evidence_count"] == 0
+    assert "No verified atomic evidence extracted" in result["error_message"]
 

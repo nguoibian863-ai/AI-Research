@@ -15,6 +15,18 @@ GENERIC_RESEARCH_TERMS = {
     "cost", "overhead", "efficiency", "scalability", "size", "parameter", "parameters",
     "detection", "detecting", "detector", "classification", "segmentation", "recognition", "tracking",
     "3d", "2d",
+    "achieve", "achieves", "achieved", "achieving",
+    "show", "shows", "shown", "showing",
+    "yield", "yields", "yielded", "yielding",
+    "reach", "reaches", "reached", "reaching",
+    "obtain", "obtains", "obtained", "obtaining",
+    "demonstrate", "demonstrates", "demonstrated", "demonstrating",
+    "present", "presents", "presented", "presenting",
+    "propose", "proposes", "proposed", "proposing",
+    "introduce", "introduces", "introduced", "introducing",
+    "report", "reports", "reported", "reporting",
+    "exceed", "exceeds", "exceeded", "exceeding",
+    "surpass", "surpasses", "surpassed", "surpassing",
     "affect", "affects", "affecting", "effect", "effects", "effective",
     "use", "using", "uses", "used", "instead", "tradeoff", "tradeoffs",
     "service", "services", "backend", "backends", "frontend", "frontends",
@@ -45,7 +57,7 @@ def extract_core_entities(text: str) -> List[str]:
 
     for orig_t in raw_tokens:
         t = orig_t.lower()
-        if t in GENERIC_RESEARCH_TERMS:
+        if t in GENERIC_RESEARCH_TERMS or t.isdigit():
             continue
 
         if len(t) == 2:

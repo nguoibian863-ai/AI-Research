@@ -13,7 +13,7 @@ class MockLLMBackend(LLMBackend):
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
         self.call_history.append({"prompt": prompt, "system_prompt": system_prompt, "kwargs": kwargs})
-        content = "Mock response from LLM"
+        content = self.canned_responses.get("generate", "Mock response citing [E1] from LLM")
         return LLMResponse(
             content=content,
             prompt_tokens=len(prompt.split()),

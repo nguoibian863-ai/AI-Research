@@ -52,6 +52,7 @@ from backend.core.coverage import (
 )
 from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
+from backend.sources.dedup import compute_canonical_key
 
 logger = logging.getLogger(__name__)
 
@@ -404,6 +405,12 @@ class ResearchEngine:
                             logger.info(f"[{state.session_id}][SEARCH] Skipping irrelevant search result (no core entity match): '{item.title}'")
                             continue
 
+                        canonical_k = compute_canonical_key(url, item.title)
+                        existing_source = self.source_repo.find_by_canonical_key(state.session_id, canonical_k)
+                        if existing_source:
+                            logger.info(f"[{state.session_id}][SEARCH] Deduplicated source by canonical key '{canonical_k}': {url}")
+                            continue
+
                         if url not in existing_urls and url not in found_urls:
                             found_urls.append(url)
                             existing_urls.add(url)
@@ -415,7 +422,7 @@ class ResearchEngine:
                                 url=url,
                                 title=item.title,
                                 domain=domain,
-                                canonical_key=url.lower().rstrip("/")
+                                canonical_key=canonical_k
                             )
 
             self.save_state(state)
@@ -478,7 +485,7 @@ class ResearchEngine:
                             url=url,
                             title=fetched.title or url,
                             domain=domain,
-                            canonical_key=url.lower().rstrip("/"),
+                            canonical_key=compute_canonical_key(url, fetched.title or url),
                             authors=authors_list,
                             published_at=pub_date,
                             source_type="pdf" if is_pdf_url else "web"
@@ -837,14 +844,30 @@ class ResearchEngine:
             budget.record_llm_call(tokens=res.total_tokens, count=getattr(res, "calls_made", 1))
             answer = res.content.strip()
 
-            # Append Evidence & Provenance Table if evidence items were extracted
+            # Append Evidence & Provenance Table and populate claims lineage if evidence items exist
             claims_json = "[]"
             if evidence_items:
                 augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(answer, evidence_items)
                 answer = augmented_answer
-                claims_json = json.dumps(citation_stats.get("valid_indices", []))
+                valid_indices = citation_stats.get("valid_indices", [])
+                claims_json = json.dumps(valid_indices)
 
-            # Transition state to DONE (or PARTIAL if missing coverage or insufficient info)
+                # Persist claims to claims table for complete claim lineage
+                indices_to_persist = valid_indices if valid_indices else list(range(1, len(evidence_items) + 1))
+                for idx in indices_to_persist:
+                    if 1 <= idx <= len(evidence_items):
+                        ev = evidence_items[idx - 1]
+                        claim_id = f"clm_{uuid.uuid4().hex[:8]}"
+                        self.claim_repo.add(
+                            claim_id=claim_id,
+                            session_id=state.session_id,
+                            text=ev.get("statement") or ev.get("exact_quote") or f"Finding [E{idx}]",
+                            evidence_ids=[ev.get("evidence_id")],
+                            verification={"verified": True, "citation_index": idx, "quote": ev.get("exact_quote")},
+                            status="SUPPORTED"
+                        )
+
+            # Transition state to DONE (or PARTIAL if missing coverage, 0 evidence, or insufficient info)
             insufficient_phrases = [
                 "no information available",
                 "insufficient information",
@@ -863,7 +886,14 @@ class ResearchEngine:
                 and "no external documents retrieved" not in full_context.lower()
                 and not is_insufficient
                 and not bool(missing_entities)
+                and len(evidence_items) > 0
             )
+            if len(evidence_items) == 0:
+                if not state.error_message:
+                    state.error_message = "No verified atomic evidence extracted"
+                elif "No verified atomic evidence extracted" not in state.error_message:
+                    state.error_message = f"{state.error_message}; No verified atomic evidence extracted"
+
             target_phase = ResearchPhase.DONE if has_valid_evidence else ResearchPhase.PARTIAL
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
             self.save_state(state)
@@ -1010,6 +1040,7 @@ class ResearchEngine:
                 "chunks_count": self.chunk_repo.count_by_session(state.session_id),
                 "evidence_count": len(self.evidence_repo.get_by_session(state.session_id)),
                 "answer": answer,
+                "error_message": state.error_message,
                 "budget": budget.summary()
             }
         except Exception as e:

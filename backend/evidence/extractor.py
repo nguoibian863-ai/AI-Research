@@ -3,9 +3,10 @@ import uuid
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from backend.db.database import DatabaseManager
-from backend.db.repositories import RawEvidenceRepository, EvidenceRepository, SourceRepository
+from backend.db.repositories import RawEvidenceRepository, EvidenceRepository
 from backend.llm.backend import LLMBackend
 from backend.llm.schemas import ExtractedEvidencesSchema, AtomicFactItemSchema
+from backend.core.coverage import extract_core_entities, check_entity_in_text
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,54 @@ def find_quote_in_text(quote: str, text: str) -> Optional[Tuple[int, int, str]]:
     return None
 
 
+def expand_quote_to_sentence(start_idx: int, end_idx: int, text: str) -> Tuple[int, int, str]:
+    """
+    Expands a candidate quote match to the full sentence or line boundaries
+    to provide complete context, subject attribution, and metric grounding.
+    """
+    if not text or (end_idx - start_idx) > 200 or text[start_idx:end_idx].count(".") > 1:
+        return start_idx, end_idx, text[start_idx:end_idx]
+
+    # Expand backwards to sentence start (previous period + space, newline, or start of text)
+    sent_start = start_idx
+    while sent_start > 0:
+        prev_char = text[sent_start - 1]
+        if prev_char == "\n":
+            break
+        if prev_char == "." and (sent_start == len(text) or text[sent_start].isspace()):
+            break
+        sent_start -= 1
+
+    while sent_start < start_idx and text[sent_start].isspace():
+        sent_start += 1
+
+    # Expand forwards to sentence end (period + space/newline, newline, or end of text)
+    sent_end = end_idx
+    while sent_end < len(text):
+        char = text[sent_end]
+        if char == "\n":
+            break
+        if char == "." and (sent_end + 1 == len(text) or text[sent_end + 1].isspace()):
+            sent_end += 1
+            break
+        sent_end += 1
+
+    expanded = text[sent_start:sent_end].strip()
+    if len(expanded) < (end_idx - start_idx):
+        return start_idx, end_idx, text[start_idx:end_idx]
+
+    actual_start = text.find(expanded, sent_start)
+    if actual_start != -1:
+        return actual_start, actual_start + len(expanded), expanded
+    return sent_start, sent_end, expanded
+
+
 def verify_atomic_fact(
     fact: AtomicFactItemSchema,
     target_chunk: Dict[str, Any],
     verified_quote: str,
-    min_quote_len: int = 15
+    min_quote_len: int = 15,
+    goal_entities: Optional[List[str]] = None
 ) -> Tuple[bool, str]:
     """
     Python-based rule verification for atomic facts (Anti-hallucination guardrail).
@@ -61,6 +105,7 @@ def verify_atomic_fact(
     2. Value numeric invariant: all numbers in fact.value must appear in the verbatim quote.
     3. Statement numeric invariant: all numbers in fact.statement must appear in the verbatim quote.
     4. Subject grounding: fact.subject must appear in the quote or in the chunk text.
+    5. Comparative grounding: any secondary entity mentioned in fact.statement must appear in the verbatim quote.
     """
     if not verified_quote or len(verified_quote.strip()) < min_quote_len:
         return False, f"QUOTE_TOO_SHORT: quote length {len(verified_quote.strip()) if verified_quote else 0} < {min_quote_len}"
@@ -99,6 +144,33 @@ def verify_atomic_fact(
             if not re.search(num_pattern, verified_quote) and num not in verified_quote:
                 return False, f"NUMERIC_MISMATCH: number '{num}' from statement not found in verbatim quote '{verified_quote}'"
 
+    # 4. Comparative & cross-entity grounding:
+    # A statement must not make ungrounded comparative claims or assert facts about
+    # competitor entities not supported by the quote.
+    if fact.statement:
+        stmt_lower = fact.statement.lower()
+        subj_lower = (fact.subject or "").strip().lower()
+
+        # Check secondary goal entities: if statement mentions another entity from research goal,
+        # that entity MUST appear in the verbatim quote.
+        if goal_entities:
+            for ent in goal_entities:
+                if ent in subj_lower or subj_lower in ent:
+                    continue
+                if check_entity_in_text(ent, stmt_lower):
+                    if not check_entity_in_text(ent, quote_lower):
+                        return False, f"UNSUPPORTED_COMPARISON: foreign entity '{ent}' in statement not found in verbatim quote"
+
+        # Check comparative syntax: "X is better than Y", "outperforms Y", "beating Y"
+        is_comparative = bool(re.search(r"\b(than|outperforms?|beats?|beating|superior to|inferior to|ahead of)\b", stmt_lower))
+        if is_comparative:
+            stmt_entities = extract_core_entities(fact.statement)
+            for ent in stmt_entities:
+                if ent in subj_lower or subj_lower in ent:
+                    continue
+                if not check_entity_in_text(ent, quote_lower):
+                    return False, f"UNSUPPORTED_COMPARISON: comparative statement mentions entity '{ent}' not found in verbatim quote"
+
     return True, "VERIFIED"
 
 
@@ -123,221 +195,224 @@ class EvidenceExtractor:
     ) -> List[Dict[str, Any]]:
         """
         Extracts up to max_evidence atomic facts from retrieved chunks.
-        Performs Python-level quote invariance and numeric/subject verification before saving to SQLite.
-        Limits extraction context to ~2500 tokens (<= 8000 chars) to prevent context overflow.
+        Processes chunks with focused, few-shot prompts to maximize small model accuracy.
+        Performs quote sentence expansion and Python-level rule verification before saving to SQLite.
         """
         if not chunks:
             logger.warning(f"[{session_id}][EXTRACT] No chunks provided for evidence extraction.")
             return []
 
-        # 1. Format chunks context for LLM extraction (constrained to ~2500 tokens)
-        snippets = []
-        total_chars = 0
-        MAX_CONTEXT_CHARS = 8000
-
-        for i, c in enumerate(chunks[:5], start=1):
-            c_id = c.get("chunk_id", f"chunk_{i}")
-            c_sec = c.get("section") or ""
-            c_page = c.get("page") or ""
-            c_url = c.get("url") or c.get("metadata", {}).get("url") or "local"
-            sec_info = f", Section: '{c_sec}'" if c_sec else ""
-            page_info = f", Page: {c_page}" if c_page else ""
-            c_text = c.get("text", "").strip()
-
-            snippet_header = f"--- [Chunk ID: {c_id}] (Source: {c_url}{sec_info}{page_info}) ---\n"
-            snippet_body = c_text
-            remaining_chars = MAX_CONTEXT_CHARS - total_chars - len(snippet_header)
-            if remaining_chars <= 200:
-                break
-            if len(snippet_body) > remaining_chars:
-                snippet_body = snippet_body[:remaining_chars] + "..."
-
-            snippet = f"{snippet_header}{snippet_body}\n"
-            snippets.append(snippet)
-            total_chars += len(snippet)
-
-        context_str = "\n".join(snippets)
-
-        prompt = (
-            f"You are an expert factual research extractor. Extract 3 to {max_evidence} substantive, key atomic facts "
-            f"from the evidence text below to answer the research goal.\n\n"
-            f"CRITICAL REQUIREMENTS:\n"
-            f"1. 'raw_quote' MUST be an EXACT VERBATIM excerpt from the chunk text. Do NOT alter, summarize, or edit the quote.\n"
-            f"2. 'chunk_id' MUST match the exact Chunk ID containing the quote.\n"
-            f"3. 'statement' must be a concise, objective 1-sentence statement of the fact or benchmark result.\n"
-            f"4. If metrics/numbers are present, extract them into 'metric' and 'value'. All numbers in statement and value must be directly in raw_quote.\n\n"
-            f"Goal: {goal}\n\n"
-            f"Evidence Context:\n{context_str}"
-        )
-
-        try:
-            if budget_tracker:
-                budget_tracker.assert_can_call_llm()
-            res = self.llm.structured_generate(prompt, schema=ExtractedEvidencesSchema)
-            if budget_tracker:
-                calls = getattr(res, "calls_made", 1)
-                tokens = getattr(res, "total_tokens", 0)
-                budget_tracker.record_llm_call(tokens=tokens, count=calls)
-            extracted_facts = res.parsed.facts
-            logger.info(f"[{session_id}][EXTRACT] LLM proposed {len(extracted_facts)} candidate facts.")
-        except Exception as e:
-            logger.error(f"[{session_id}][EXTRACT] LLM extraction failed ({e}), falling back to direct chunk facts.")
-            extracted_facts = []
-
         verified_evidence: List[Dict[str, Any]] = []
-        chunks_by_id = {c.get("chunk_id"): c for c in chunks if c.get("chunk_id")}
+        seen_quotes = set()
+        goal_entities = extract_core_entities(goal) if goal else []
 
-        # 2. Strict Quote Invariance & Numeric Verification
-        for fact in extracted_facts:
-            candidate_quote = fact.raw_quote.strip() if fact.raw_quote else ""
-            if not candidate_quote:
-                continue
-
-            target_chunk = None
-            match_res = None
-
-            # First, check specified chunk_id
-            if fact.chunk_id and fact.chunk_id in chunks_by_id:
-                cand_chunk = chunks_by_id[fact.chunk_id]
-                match_res = find_quote_in_text(candidate_quote, cand_chunk.get("text", ""))
-                if match_res:
-                    target_chunk = cand_chunk
-
-            # Fallback: search across all available chunks if chunk_id was missing or mismatched
-            if not match_res:
-                for c in chunks:
-                    match_res = find_quote_in_text(candidate_quote, c.get("text", ""))
-                    if match_res:
-                        target_chunk = c
-                        break
-
-            # Reject hallucinated or altered quotes
-            if not match_res or not target_chunk:
-                logger.warning(
-                    f"[{session_id}][EXTRACT] Rejected ungrounded quote (not found in source chunks): '{candidate_quote[:60]}...'"
-                )
-                continue
-
-            start_idx, end_idx, verified_verbatim_quote = match_res
-
-            # Enforce Python-level Rule-Based Grounding Verification
-            is_valid, reject_reason = verify_atomic_fact(fact, target_chunk, verified_verbatim_quote, min_quote_len=15)
-            if not is_valid:
-                logger.warning(
-                    f"[{session_id}][EXTRACT] Rejected candidate fact ({reject_reason}): statement='{fact.statement}', quote='{verified_verbatim_quote}'"
-                )
-                continue
-
-            chunk_char_start = target_chunk.get("char_start") or 0
-            abs_start = chunk_char_start + start_idx
-            abs_end = chunk_char_start + end_idx
-
-            # Resilient source_id resolution to prevent foreign key errors
-            source_id = target_chunk.get("source_id")
-            url = target_chunk.get("url") or target_chunk.get("metadata", {}).get("url") or "local"
-            source_title = target_chunk.get("source_title") or url
-            chunk_id = target_chunk.get("chunk_id") or ""
-            page = target_chunk.get("page")
-            section = target_chunk.get("section")
-
-            if not source_id or source_id == "src_unknown":
-                if chunk_id:
-                    with self.db.session() as conn:
-                        row = conn.execute(
-                            """
-                            SELECT d.source_id, s.url, s.title as source_title
-                            FROM chunks c
-                            JOIN documents d ON c.doc_id = d.doc_id
-                            JOIN sources s ON d.source_id = s.source_id
-                            WHERE c.chunk_id = ?
-                            LIMIT 1
-                            """,
-                            (chunk_id,)
-                        ).fetchone()
-                        if row:
-                            source_id = row["source_id"]
-                            url = row["url"] or url
-                            source_title = row["source_title"] or source_title
-
-                if not source_id or source_id == "src_unknown":
-                    sess_sources = SourceRepository(self.db).get_by_session(session_id)
-                    if sess_sources:
-                        source_id = sess_sources[0]["source_id"]
-                        url = sess_sources[0]["url"]
-                        source_title = sess_sources[0].get("title") or url
-
-            if not source_id or source_id == "src_unknown":
-                logger.error(f"[{session_id}][EXTRACT] Cannot persist evidence: no valid source_id found for chunk {chunk_id}")
-                continue
-
-            raw_ev_id = f"revi_{uuid.uuid4().hex[:8]}"
-            ev_id = f"evi_{uuid.uuid4().hex[:8]}"
-
-            # Construct clean fact statement
-            statement = fact.statement.strip() if fact.statement else ""
-            if not statement:
-                val_str = f": {fact.value}" if fact.value else ""
-                statement = f"{fact.subject} {fact.predicate}{val_str}."
-
-            # Save to raw_evidences (immutable raw layer)
-            self.raw_evidence_repo.add(
-                raw_evidence_id=raw_ev_id,
-                session_id=session_id,
-                source_id=source_id,
-                raw_quote=verified_verbatim_quote,
-                page=page,
-                section=section,
-                char_start=abs_start,
-                char_end=abs_end,
-                chunk_id=chunk_id
-            )
-
-            # Save to evidences (atomic structured layer)
-            object_payload = {
-                "statement": statement,
-                "metric": fact.metric,
-                "value": fact.value,
-                "raw_quote": verified_verbatim_quote,
-                "url": url,
-                "source_title": source_title,
-                "section": section,
-                "page": page,
-                "chunk_id": chunk_id
-            }
-
-            self.evidence_repo.add(
-                evidence_id=ev_id,
-                session_id=session_id,
-                raw_evidence_id=raw_ev_id,
-                subject=fact.subject,
-                predicate=fact.predicate,
-                object_data=object_payload,
-                confidence=fact.confidence or 1.0
-            )
-
-            verified_evidence.append({
-                "evidence_id": ev_id,
-                "raw_evidence_id": raw_ev_id,
-                "session_id": session_id,
-                "subject": fact.subject,
-                "predicate": fact.predicate,
-                "statement": statement,
-                "exact_quote": verified_verbatim_quote,
-                "metric": fact.metric,
-                "value": fact.value,
-                "source_id": source_id,
-                "source_title": source_title,
-                "url": url,
-                "section": section,
-                "page": page,
-                "chunk_id": chunk_id,
-                "char_start": abs_start,
-                "char_end": abs_end,
-                "confidence": fact.confidence or 1.0
-            })
-
+        # Iterate over candidate chunks (up to 5 chunks)
+        for i, target_chunk in enumerate(chunks[:5], start=1):
             if len(verified_evidence) >= max_evidence:
                 break
+            if budget_tracker and not budget_tracker.can_call_llm():
+                logger.warning(f"[{session_id}][EXTRACT] LLM budget exhausted. Stopping extraction.")
+                break
+
+            c_id = target_chunk.get("chunk_id", f"chunk_{i}")
+            c_sec = target_chunk.get("section") or ""
+            c_page = target_chunk.get("page") or ""
+            c_url = target_chunk.get("url") or target_chunk.get("metadata", {}).get("url") or "local"
+            sec_info = f", Section: '{c_sec}'" if c_sec else ""
+            page_info = f", Page: {c_page}" if c_page else ""
+            c_text = target_chunk.get("text", "").strip()
+
+            if len(c_text) < 20:
+                continue
+
+            # Focused prompt with neutral few-shot example for high JSON compliance with small models
+            prompt = (
+                f"You are an expert factual research extractor. Extract key atomic facts from the chunk below.\n\n"
+                f"NEUTRAL FEW-SHOT EXAMPLE:\n"
+                f'Input Chunk: "RocksDB introduces a log-structured merge-tree architecture that achieves 150,000 writes/sec on NVMe storage."\n'
+                f"Output:\n"
+                f'{{\n'
+                f'  "facts": [\n'
+                f'    {{\n'
+                f'      "statement": "RocksDB achieves 150,000 writes/sec on NVMe storage.",\n'
+                f'      "subject": "RocksDB",\n'
+                f'      "predicate": "achieves",\n'
+                f'      "metric": "writes/sec",\n'
+                f'      "value": "150,000",\n'
+                f'      "raw_quote": "RocksDB introduces a log-structured merge-tree architecture that achieves 150,000 writes/sec on NVMe storage.",\n'
+                f'      "chunk_id": "{c_id}",\n'
+                f'      "confidence": 0.98\n'
+                f'    }}\n'
+                f'  ]\n'
+                f'}}\n\n'
+                f"Goal: {goal}\n\n"
+                f"Evidence Chunk:\n"
+                f"--- [Chunk ID: {c_id}] (Source: {c_url}{sec_info}{page_info}) ---\n"
+                f"{c_text}\n"
+            )
+
+            try:
+                if budget_tracker:
+                    budget_tracker.assert_can_call_llm()
+                res = self.llm.structured_generate(prompt, schema=ExtractedEvidencesSchema)
+                if budget_tracker:
+                    calls = getattr(res, "calls_made", 1)
+                    tokens = getattr(res, "total_tokens", 0)
+                    budget_tracker.record_llm_call(tokens=tokens, count=calls)
+                extracted_facts = res.parsed.facts
+                logger.info(f"[{session_id}][EXTRACT] LLM proposed {len(extracted_facts)} candidate facts for chunk {c_id}.")
+            except Exception as e:
+                logger.warning(f"[{session_id}][EXTRACT] Extraction call failed for chunk {c_id} ({e}).")
+                continue
+
+            for fact in extracted_facts:
+                candidate_quote = fact.raw_quote.strip() if fact.raw_quote else ""
+                if not candidate_quote:
+                    continue
+
+                match_res = find_quote_in_text(candidate_quote, c_text)
+                if not match_res:
+                    logger.warning(
+                        f"[{session_id}][EXTRACT] Rejected ungrounded quote (not in source chunk): '{candidate_quote[:60]}...'"
+                    )
+                    continue
+
+                start_idx, end_idx, matched_quote = match_res
+
+                # Check if matched_quote itself satisfies rule verification
+                is_valid, reject_reason = verify_atomic_fact(
+                    fact, target_chunk, matched_quote, min_quote_len=15, goal_entities=goal_entities
+                )
+                verified_verbatim_quote = matched_quote
+                final_start, final_end = start_idx, end_idx
+
+                if not is_valid:
+                    # Sentence expansion: expand quote to full sentence boundaries for rich context & grounding
+                    exp_start, exp_end, expanded_quote = expand_quote_to_sentence(start_idx, end_idx, c_text)
+                    is_valid_exp, reject_reason_exp = verify_atomic_fact(
+                        fact, target_chunk, expanded_quote, min_quote_len=15, goal_entities=goal_entities
+                    )
+                    if is_valid_exp:
+                        verified_verbatim_quote = expanded_quote
+                        final_start, final_end = exp_start, exp_end
+                        is_valid = True
+                    else:
+                        logger.warning(
+                            f"[{session_id}][EXTRACT] Rejected candidate fact ({reject_reason}): statement='{fact.statement}', quote='{matched_quote}'"
+                        )
+                        continue
+
+                # Deduplicate identical quotes
+                if verified_verbatim_quote in seen_quotes:
+                    continue
+
+                # Strict source_id resolution: NEVER fallback to unrelated first source
+                source_id = target_chunk.get("source_id")
+                url = target_chunk.get("url") or target_chunk.get("metadata", {}).get("url") or "local"
+                source_title = target_chunk.get("source_title") or url
+                chunk_id = target_chunk.get("chunk_id") or c_id
+                page = target_chunk.get("page")
+                section = target_chunk.get("section")
+
+                if not source_id or source_id == "src_unknown":
+                    if chunk_id:
+                        with self.db.session() as conn:
+                            row = conn.execute(
+                                """
+                                SELECT d.source_id, s.url, s.title as source_title
+                                FROM chunks c
+                                JOIN documents d ON c.doc_id = d.doc_id
+                                JOIN sources s ON d.source_id = s.source_id
+                                WHERE c.chunk_id = ?
+                                LIMIT 1
+                                """,
+                                (chunk_id,)
+                            ).fetchone()
+                            if row:
+                                source_id = row["source_id"]
+                                url = row["url"] or url
+                                source_title = row["source_title"] or source_title
+
+                # If source_id cannot be verified, reject the evidence to prevent false attribution!
+                if not source_id or source_id == "src_unknown":
+                    logger.warning(
+                        f"[{session_id}][EXTRACT] Rejected evidence: source_id could not be resolved for chunk {chunk_id}."
+                    )
+                    continue
+
+                chunk_char_start = target_chunk.get("char_start") or 0
+                abs_start = chunk_char_start + final_start
+                abs_end = chunk_char_start + final_end
+
+                raw_ev_id = f"revi_{uuid.uuid4().hex[:8]}"
+                ev_id = f"evi_{uuid.uuid4().hex[:8]}"
+
+                # Construct clean fact statement
+                statement = fact.statement.strip() if fact.statement else ""
+                if not statement or len(statement) < 10:
+                    val_str = f": {fact.value}" if fact.value else ""
+                    statement = f"{fact.subject} {fact.predicate}{val_str}."
+
+                # Save to raw_evidences (immutable raw layer)
+                self.raw_evidence_repo.add(
+                    raw_evidence_id=raw_ev_id,
+                    session_id=session_id,
+                    source_id=source_id,
+                    raw_quote=verified_verbatim_quote,
+                    page=page,
+                    section=section,
+                    char_start=abs_start,
+                    char_end=abs_end,
+                    chunk_id=chunk_id
+                )
+
+                # Save to evidences (atomic structured layer)
+                object_payload = {
+                    "statement": statement,
+                    "metric": fact.metric,
+                    "value": fact.value,
+                    "raw_quote": verified_verbatim_quote,
+                    "url": url,
+                    "source_title": source_title,
+                    "section": section,
+                    "page": page,
+                    "chunk_id": chunk_id
+                }
+
+                self.evidence_repo.add(
+                    evidence_id=ev_id,
+                    session_id=session_id,
+                    raw_evidence_id=raw_ev_id,
+                    subject=fact.subject,
+                    predicate=fact.predicate,
+                    object_data=object_payload,
+                    confidence=fact.confidence or 1.0
+                )
+
+                seen_quotes.add(verified_verbatim_quote)
+                verified_evidence.append({
+                    "evidence_id": ev_id,
+                    "raw_evidence_id": raw_ev_id,
+                    "session_id": session_id,
+                    "subject": fact.subject,
+                    "predicate": fact.predicate,
+                    "statement": statement,
+                    "exact_quote": verified_verbatim_quote,
+                    "metric": fact.metric,
+                    "value": fact.value,
+                    "source_id": source_id,
+                    "source_title": source_title,
+                    "url": url,
+                    "section": section,
+                    "page": page,
+                    "chunk_id": chunk_id,
+                    "char_start": abs_start,
+                    "char_end": abs_end,
+                    "confidence": fact.confidence or 1.0
+                })
+
+                if len(verified_evidence) >= max_evidence:
+                    break
 
         logger.info(
             f"[{session_id}][EXTRACT] Successfully verified and stored {len(verified_evidence)} atomic evidence items."

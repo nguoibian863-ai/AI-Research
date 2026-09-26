@@ -296,7 +296,12 @@ class EvidenceRepository:
             rows = []
             for row in cur.fetchall():
                 item = dict(row)
-                item["object_data"] = json.loads(item["object_json"]) if item.get("object_json") else {}
+                obj = json.loads(item["object_json"]) if item.get("object_json") else {}
+                item["object_data"] = obj
+                item["statement"] = obj.get("statement") or f"{item.get('subject', '')} {item.get('predicate', '')}"
+                item["metric"] = obj.get("metric")
+                item["value"] = obj.get("value")
+                item["exact_quote"] = item.get("raw_quote", "")
                 rows.append(item)
             return rows
 
@@ -322,6 +327,17 @@ class ClaimRepository:
         with self.db.session() as conn:
             cur = conn.execute("SELECT claim_id FROM claims WHERE session_id = ?", (session_id,))
             return [row["claim_id"] for row in cur.fetchall()]
+
+    def get_by_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute("SELECT * FROM claims WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
+            rows = []
+            for row in cur.fetchall():
+                item = dict(row)
+                item["evidence_ids"] = json.loads(item["evidence_ids_json"]) if item.get("evidence_ids_json") else []
+                item["verification"] = json.loads(item["verification_json"]) if item.get("verification_json") else {}
+                rows.append(item)
+            return rows
 
 
 class ReportRepository:
