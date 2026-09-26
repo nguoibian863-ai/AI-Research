@@ -34,9 +34,11 @@ ollama_cfg = settings.get("llm", {}).get("ollama", {})
 if llm_provider == "ollama":
     llm_backend = OllamaBackend(
         base_url=ollama_cfg.get("base_url", "http://127.0.0.1:11434"),
-        model=ollama_cfg.get("model", "qwen3:8b"),
+        model=ollama_cfg.get("model", "smollm3:3b"),
         timeout=ollama_cfg.get("timeout_seconds", 120.0),
-        temperature=ollama_cfg.get("temperature", 0.1)
+        temperature=ollama_cfg.get("temperature", 0.1),
+        context_window=ollama_cfg.get("context_window", 4096),
+        max_output_tokens=ollama_cfg.get("max_output_tokens", 1024)
     )
 else:
     llm_backend = MockLLMBackend()

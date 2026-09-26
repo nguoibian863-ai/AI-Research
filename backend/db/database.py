@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
     plan_json TEXT,
+    open_questions_json TEXT,
     step INTEGER DEFAULT 0,
     phase TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -170,3 +171,8 @@ class DatabaseManager:
     def init_schema(self) -> None:
         with self.session() as conn:
             conn.executescript(SCHEMA_SQL)
+            # Safe migration for existing databases
+            cursor = conn.execute("PRAGMA table_info(sessions)")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "open_questions_json" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN open_questions_json TEXT")

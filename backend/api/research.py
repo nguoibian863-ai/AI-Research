@@ -11,6 +11,11 @@ class CreateSessionRequest(BaseModel):
     goal: str = Field(description="The research question to investigate")
 
 
+class RunResearchRequest(BaseModel):
+    goal: Optional[str] = Field(None, description="Research question for a new session")
+    session_id: Optional[str] = Field(None, description="Existing session ID to run to completion")
+
+
 class SessionResponse(BaseModel):
     session_id: str
     goal: str
@@ -19,7 +24,6 @@ class SessionResponse(BaseModel):
     step: int
 
 
-# Dependency placeholder - in main.py we will inject the singleton ResearchEngine
 def get_engine() -> ResearchEngine:
     from backend.main import get_research_engine
     return get_research_engine()
@@ -39,54 +43,120 @@ def create_session(req: CreateSessionRequest, engine: ResearchEngine = Depends(g
 
 @router.get("/session/{session_id}")
 def get_session(session_id: str, engine: ResearchEngine = Depends(get_engine)):
-    session_data = engine.session_repo.get(session_id)
-    if not session_data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
+    try:
+        state = engine.load_state(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
     sources = engine.source_repo.get_by_session(session_id)
     raw_evidences = engine.raw_evidence_repo.get_by_session(session_id)
+    report = engine.report_repo.get_by_session(session_id)
+    budget = engine.get_budget_tracker(session_id)
 
     return {
-        "session": session_data,
+        "session": {
+            "session_id": state.session_id,
+            "goal": state.goal,
+            "phase": state.phase.value,
+            "status": state.status.value,
+            "step": state.step,
+            "plan": state.plan.model_dump() if state.plan else None,
+            "visited_queries": state.visited_queries,
+            "open_questions": [q.model_dump() for q in state.open_questions]
+        },
         "sources": sources,
-        "raw_evidences": raw_evidences
+        "raw_evidences": raw_evidences,
+        "report": report,
+        "budget": budget.summary()
     }
 
 
 @router.post("/session/{session_id}/plan")
 def run_plan(session_id: str, engine: ResearchEngine = Depends(get_engine)):
-    session_data = engine.session_repo.get(session_id)
-    if not session_data:
+    try:
+        state = engine.load_state(session_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    from backend.core.state import ResearchState
-    state = ResearchState(
-        session_id=session_id,
-        goal=session_data["goal"],
-        step=session_data["step"],
-        phase=ResearchPhase(session_data["phase"]),
-        status=ResearchStatus(session_data["status"])
-    )
+
     engine.run_plan_phase(state)
-    return {"session_id": session_id, "plan": state.plan.model_dump() if state.plan else None}
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "plan": state.plan.model_dump() if state.plan else None
+    }
 
 
 @router.post("/session/{session_id}/search")
 def run_search(session_id: str, engine: ResearchEngine = Depends(get_engine)):
-    session_data = engine.session_repo.get(session_id)
-    if not session_data:
+    try:
+        state = engine.load_state(session_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    from backend.core.state import ResearchState
-    state = ResearchState(
-        session_id=session_id,
-        goal=session_data["goal"],
-        step=session_data["step"],
-        phase=ResearchPhase(session_data["phase"]),
-        status=ResearchStatus(session_data["status"])
-    )
+
     urls = engine.run_search_phase(state)
-    return {"session_id": session_id, "found_urls": urls}
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "visited_queries": state.visited_queries,
+        "found_urls": urls
+    }
+
+
+@router.post("/session/{session_id}/fetch")
+def run_fetch(session_id: str, engine: ResearchEngine = Depends(get_engine)):
+    try:
+        state = engine.load_state(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    docs = engine.run_fetch_phase(state)
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "documents_count": len(docs),
+        "documents": [{"url": d.url, "title": d.title, "length": len(d.text)} for d in docs]
+    }
+
+
+@router.post("/session/{session_id}/answer")
+def run_answer(session_id: str, engine: ResearchEngine = Depends(get_engine)):
+    try:
+        state = engine.load_state(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Get fetched sources
+    sources = engine.source_repo.get_by_session(session_id)
+    docs = []
+    for s in sources:
+        doc = engine.doc_repo.get_by_source(s["source_id"])
+        if doc:
+            from backend.tools.web_fetch import FetchedWebContent
+            docs.append(FetchedWebContent(
+                url=s["url"],
+                title=s.get("title"),
+                text=doc["raw_text"],
+                content_hash=doc["content_hash"]
+            ))
+
+    answer = engine.run_basic_answer(state, fetched_docs=docs)
+    return {
+        "session_id": session_id,
+        "phase": state.phase.value,
+        "status": state.status.value,
+        "answer": answer
+    }
+
+
+@router.post("/run")
+def run_end_to_end(req: RunResearchRequest, engine: ResearchEngine = Depends(get_engine)):
+    """P0-3 & P0-4: End-to-End One-Click Execution (Question -> Plan -> Search -> Fetch -> Answer)"""
+    target = req.session_id or req.goal
+    if not target:
+        raise HTTPException(status_code=400, detail="Either 'goal' or 'session_id' must be provided.")
+
+    result = engine.run_week1(target)
+    return result
 
 
 @router.get("/trajectories/{partition}")
