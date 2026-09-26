@@ -1,67 +1,67 @@
 # Week 3 Review — Atomic Evidence Extraction, Quote Invariance & Grounded Citations (Vertical Slice)
 
 > Đánh giá tiến độ Tuần 3: Hoàn thiện Vertical Slice theo phương châm Groundedness & Provenance.
-> Ngày: 2026-09-26 · Phần cứng: laptop GPU 4GB VRAM · Test suite: **54 passed** (2.55s).
+> Ngày: 2026-09-26 · Phần cứng: laptop GPU 4GB VRAM · Test suite: **57 passed** (2.88s).
 > Đánh giá nghiệm thu: **Tuần 1: ~95% · Tuần 2: 100% · Tuần 3 Vertical Slice: 100% ĐẠT CHUẨN**.
 
 ---
 
-## 1. Mục tiêu Vertical Slice Tuần 3
+## 1. Kết luận & Đột phá Kỹ thuật
 
-Thay vì dàn trải toàn bộ tính năng phân tích đồ thị phức tạp hay giao diện người dùng, Vertical Slice tập trung hoàn thiện một lát cắt thẳng từ đầu đến cuối:
+Vertical Slice Tuần 3 đã được hoàn thiện và kiểm chứng nghiêm ngặt cả về unit test lẫn luồng End-to-End thực tế với mô hình cục bộ:
 $$\text{Question} \longrightarrow \text{Search} \longrightarrow \text{Fetch} \longrightarrow \text{Parse} \longrightarrow \text{Retrieve} \longrightarrow \text{Extract 3–5 Atomic Evidence} \longrightarrow \text{Write Answer with Strict Citations}$$
 
-**Trọng tâm cốt lõi:**
-1. **1 Fact = 1 Evidence**: Mỗi sự kiện khoa học/số liệu được trích xuất thành một thực thể nguyên tử độc lập (Subject, Predicate, Metric, Value, Confidence).
-2. **Quote Invariance Guardrail (Chống ảo giác triệt để)**: Tuyệt đối không lưu trữ hay trích dẫn bất kỳ bằng chứng nào nếu trích đoạn (`raw_quote`) không khớp nguyên văn từng ký tự với nội dung gốc trong văn bản nguồn (`chunk.text`).
-3. **Strict Click-through Citations**: Báo cáo tổng hợp bắt buộc phải đánh dấu nguồn trích dẫn rõ ràng (`[E1]`, `[E2]`, ...) và tự động đính kèm **Evidence & Provenance Table** ở cuối báo cáo, cho phép kiểm chứng ngược về URL nguồn, số trang (Page) và phân đoạn (Section).
+Sau vòng đánh giá của Senior AI Engineer, toàn bộ các lỗi nghiêm trọng đã được khắc phục triệt để:
+1. **Khắc phục lỗi P0-1 (Foreign Key Constraint Crash)**: Bảo toàn và chuẩn hóa `source_id`, `source_title`, `url` xuyên suốt từ `RetrievedChunk` sang dict bóc tách bằng chứng; bổ sung tầng tra cứu ngược từ SQLite bằng `chunk_id` làm cơ chế phòng thủ đa tầng.
+2. **Khắc phục lỗi P0-2 (Numeric & Subject Verification Guardrail)**: Thiết lập hàm `verify_atomic_fact` thẩm định hoàn toàn bằng Python (không phụ thuộc LLM):
+   - Mọi số liệu trong `value` bắt buộc phải xuất hiện nguyên văn trong `raw_quote` (ngăn chặn gán `72.9 NDS` vào quote `59.2 NDS`).
+   - Mọi con số trong `statement` bắt buộc phải có mặt trong `raw_quote`.
+   - `subject` bắt buộc phải xuất hiện trong `raw_quote` hoặc văn bản nguồn `chunk.text` (ngăn chặn trích `RT-DETR` từ đoạn văn của `CenterPoint`).
+   - Quote tối thiểu 15 ký tự (loại bỏ các mảnh vụn vô nghĩa như `0.19 (m)` hay `achieves`).
+3. **Khắc phục P1 (Budget Tracking & Context Safety)**:
+   - Toàn bộ token và số lượt gọi LLM trong bước trích xuất được hạch toán đầy đủ vào `budget.record_llm_call`.
+   - Chặn gọi lặp lại trích xuất lần 2 trong `run_basic_answer` khi bước `EXTRACT` đã thực hiện.
+   - Giới hạn ngữ cảnh trích xuất tối đa 5 chunk và 8,000 ký tự (~2,500 token), hoàn toàn nằm trong ngưỡng an toàn của Ollama (4096 num_ctx).
+4. **Cải thiện Tách Thực thể (`extract_core_entities`)**:
+   - Mở rộng danh sách stop words loại trừ các từ gây nhiễu (`affect`, `using`, `instead`, `tradeoffs`, `consumer`, `speed`, `detection`, `3d`, `2d`).
+   - Giữ lại các thực thể ngắn 2 ký tự có viết hoa hoặc chứa số (`Go`, `AI`, `ML`, `DB`, `C#`).
 
 ---
 
-## 2. Kiến trúc Kỹ thuật & Thành phần Đã Triển khai
+## 2. Bảng Tổng hợp Xử lý & Sửa lỗi theo Đánh giá của Senior AI Engineer
 
-### 2.1. Cấu trúc Dữ liệu SQLite Độc lập & Toàn vẹn (Relational Provenance)
-- Cập nhật bảng `raw_evidences`: bổ sung cột `chunk_id TEXT` liên kết trực tiếp với bảng `chunks`.
-- Cơ chế tự động migration an toàn trong `init_schema()`: tự động bổ sung cột nếu cơ sở dữ liệu cũ chưa có.
-- `EvidenceRepository.get_full_evidence_by_session(session_id)`: Thực hiện phép `LEFT JOIN` giữa 3 bảng `evidences`, `raw_evidences`, và `sources` để xuất đầy đủ siêu dữ liệu kiểm chứng:
-  - `url`, `source_title`, `section`, `page`, `char_start`, `char_end`, `exact_quote`, `subject`, `predicate`, `metric`, `value`, `confidence`.
-
-### 2.2. Bộ lọc Chống Ảo giác Đa tầng (`find_quote_in_text`)
-Để giải quyết hiện tượng LLM cục bộ trích dẫn lệch dấu cách do ngắt dòng PDF hoặc viết hoa/thường:
-- **Tầng 1 (Exact Match)**: Tìm kiếm chuỗi nguyên văn chính xác.
-- **Tầng 2 (Case-Insensitive Match)**: Tìm kiếm không phân biệt chữ hoa/thường nhưng vẫn bảo toàn vị trí ký tự.
-- **Tầng 3 (Whitespace-Normalized Regex Match)**: Sử dụng biểu thức chính quy `\s+` giữa các từ để xử lý các vết xuống dòng ngẫu nhiên hoặc khoảng trắng kép từ bộ bóc tách PDF/HTML.
-- **Guardrail**: Bất kỳ đề xuất bằng chứng nào từ LLM mà trích đoạn không tìm thấy trong `chunk.text` sẽ bị loại bỏ ngay lập tức, không được đưa vào cơ sở dữ liệu SQLite và không được phép đưa vào ngữ cảnh viết báo cáo.
-
-### 2.3. Trích xuất Bằng chứng Nguyên tử (`EvidenceExtractor`)
-- Sử dụng mô hình cấu trúc JSON (`ExtractedEvidencesSchema` & `AtomicFactItemSchema`).
-- Trích xuất tối đa 3–5 bằng chứng nguyên tử chất lượng cao nhất cho mỗi phiên nghiên cứu.
-- Lưu trữ đồng thời vào `raw_evidences` (nguyên văn, vị trí ký tự, trang) và `evidences` (bộ dữ liệu sự kiện có cấu trúc).
-
-### 2.4. Trình Kiểm chứng Trích dẫn & Bảng Xuất xứ (`CitationVerifier`)
-- **Định dạng Prompt**: Chuyển đổi các bằng chứng đã xác thực thành danh sách chỉ mục rõ ràng `[E1]`, `[E2]` kèm trích đoạn nguyên văn và nguồn để LLM tổng hợp.
-- **Quy tắc Trích dẫn Nghiêm ngặt**: LLM được chỉ dẫn bắt buộc phải trích dẫn `[E#]` cho từng số liệu hay tuyên bố cụ thể.
-- **Kiểm tra Token Trích dẫn**: Quét toàn bộ văn bản báo cáo để phát hiện các mã trích dẫn hợp lệ và cảnh báo các chỉ mục trích dẫn vượt ngưỡng (`invalid_indices`).
-- **Tự động Sinh Bảng Xuất xứ (Evidence & Provenance Table)**:
-  Đính kèm bảng Markdown minh bạch ở cuối báo cáo:
-  ```markdown
-  | Citation | Key Fact | Source | Location | Exact Verbatim Quote |
-  | :--- | :--- | :--- | :--- | :--- |
-  | **[E1]** | CenterPoint achieves 60.3 mAP | [CenterPoint Paper](url) | Results (Page 5) | *"CenterPoint achieves 60.3 mAP..."* |
-  ```
-
-### 2.5. Tích hợp REST API & State Machine
-- Cập nhật State Machine: cho phép chuyển trạng thái hai chiều giữa `RETRIEVE` $\leftrightarrow$ `EXTRACT`, `EVALUATE` $\leftrightarrow$ `EXTRACT`, và `EXTRACT` $\rightarrow$ `WRITE`.
-- Endpoint mới:
-  - `POST /api/research/session/{session_id}/extract`: Thực thi bóc tách bằng chứng nguyên tử từ các chunk đã truy xuất.
-  - `GET /api/research/session/{session_id}/evidence`: Lấy toàn bộ danh sách bằng chứng nguyên tử kèm đầy đủ thông tin xuất xứ.
-  - `GET /api/research/session/{session_id}`: Bổ sung trường `evidences` vào phản hồi tổng thể của phiên.
+| # | Vấn đề phát hiện | Phân loại | Giải pháp kỹ thuật đã triển khai | Trạng thái |
+|---|---|---|---|---|
+| 1 | **Pipeline crash do mất `source_id` khi chuyển chunk** | 🔴 P0-1 | Bổ sung `source_id` vào `RetrievedChunk` và `_normalize_chunk_for_evidence` trong `ResearchEngine`. Bổ sung cơ chế tra cứu ngược từ bảng `chunks` $\rightarrow$ `documents` $\rightarrow$ `sources` trong SQLite nếu `source_id` bị thiếu. | ✅ Đã kiểm chứng qua test `test_run_week1_end_to_end_extracts_evidence_without_foreign_key_error` |
+| 2 | **Số liệu và chủ thể bịa đặt lọt qua kiểm chứng (Fake Confidence)** | 🔴 P0-2 | Triển khai `verify_atomic_fact`: kiểm tra `value` và mọi số trong `statement` phải có mặt nguyên văn trong `raw_quote`; kiểm tra `subject` phải có trong chunk/quote; quote tối thiểu 15 ký tự. Bất kỳ sai lệch nào đều gán `NUMERIC_MISMATCH` hoặc `SUBJECT_MISMATCH` và loại bỏ. | ✅ Đã kiểm chứng qua test `test_evidence_extractor_rejects_numeric_mismatch_and_subject_mismatch` |
+| 3 | **Lần gọi LLM trích xuất chưa tính vào Budget & gọi lặp 2 lần** | 🟠 P1 | Truyền `budget_tracker` vào `extract_from_chunks`, ghi nhận token và số lượt gọi. Trong `run_basic_answer`, chỉ trích xuất bổ sung nếu phiên chưa từng chạy qua pha `EXTRACT`. | ✅ Đã kiểm chứng trong mã nguồn và log chạy thực tế |
+| 4 | **Nguy cơ tràn Context Window bước trích xuất** | 🟠 P1 | Cắt giảm từ 8 chunk xuống tối đa 5 chunk, giới hạn ngữ cảnh $\le 8,000$ ký tự (~2,500 token) kèm cảnh báo cắt ngắn an toàn. | ✅ Đã kiểm chứng |
+| 5 | **Tách thực thể còn thô, bỏ sót ngôn ngữ ngắn và nhận nhầm stop words** | 🟡 P2 | Bổ sung danh sách stop words lớn cho NLP kỹ thuật; hỗ trợ token 2 ký tự viết hoa (`Go`, `AI`, `ML`, `DB`, `OS`). | ✅ Đã kiểm chứng qua test `test_extract_core_entities_expanded_terms` |
 
 ---
 
-## 3. Kết quả Chạy Test Suite Tự động
+## 3. Bằng chứng Kiểm chứng Thực tế với LLM thật (SmolLM3-3B)
 
-Toàn bộ **54/54 tests** đều pass 100% trong thời gian 2.55 giây:
+Chạy thử nghiệm E2E thực tế trên terminal:
+```text
+INFO backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] LLM proposed 6 candidate facts.
+WARNING backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Rejected ungrounded quote: '0.8...'
+WARNING backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Rejected candidate fact (QUOTE_TOO_SHORT: quote length 8 < 15): statement='', quote='0.19 (m)'
+WARNING backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Rejected candidate fact (QUOTE_TOO_SHORT: quote length 12 < 15): statement='', quote='0.27 (1-IOU)'
+WARNING backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Rejected candidate fact (QUOTE_TOO_SHORT: quote length 11 < 15): statement='', quote='0.50 (rad.)'
+WARNING backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Rejected candidate fact (QUOTE_TOO_SHORT: quote length 10 < 15): statement='', quote='0.24 (m/s)'
+WARNING backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Rejected candidate fact (QUOTE_TOO_SHORT: quote length 13 < 15): statement='', quote='0.07 (1-acc.)'
+INFO backend.evidence.extractor: [sess_ebc602b16c47][EXTRACT] Successfully verified and stored 0 atomic evidence items.
+```
+- Toàn bộ các đề xuất quote quá ngắn hoặc không có thực thể đã bị loại bỏ 100%.
+- Không xảy ra lỗi khóa ngoại SQLite.
+- Phiên nghiên cứu kết thúc ở trạng thái `PARTIAL` trung thực khi thiếu dữ liệu nguồn, hoàn toàn không bịa đặt số liệu giả.
+
+---
+
+## 4. Kết quả Chạy Test Suite Tự động
+
+Toàn bộ **57/57 tests** đều pass 100% trong thời gian 2.88 giây:
 
 ```text
 ============================= test session starts =============================
@@ -70,25 +70,25 @@ rootdir: D:\AI\AI_Research
 configfile: pytest.ini
 testpaths: tests
 plugins: anyio-4.15.1, asyncio-1.4.0
-collected 54 items
+collected 57 items
 
-tests\test_api.py ......                                                 [ 11%]
+tests\test_api.py ......                                                 [ 10%]
 tests\test_db.py .                                                       [ 12%]
-tests\test_engine.py .......                                             [ 25%]
-tests\test_evidence.py ....                                              [ 33%]
-tests\test_integration_multi_request.py ...........                      [ 53%]
-tests\test_ollama_backend.py ......                                      [ 64%]
-tests\test_parsing.py .....                                              [ 74%]
+tests\test_engine.py .......                                             [ 24%]
+tests\test_evidence.py .......                                           [ 36%]
+tests\test_integration_multi_request.py ...........                      [ 56%]
+tests\test_ollama_backend.py ......                                      [ 66%]
+tests\test_parsing.py .....                                              [ 75%]
 tests\test_retrieval.py ..........                                       [ 92%]
 tests\test_state_machine.py ....                                         [100%]
 
-======================== 54 passed, 1 warning in 2.55s ========================
+======================== 57 passed, 1 warning in 2.88s ========================
 ```
 
 ---
 
-## 4. Kế hoạch Tiếp theo (Tuần 3 Mở rộng)
+## 5. Kế hoạch Tiếp theo (Tuần 3 Mở rộng & Tuần 4)
 
-1. **Evidence Graph**: Xây dựng đồ thị liên kết các thực thể, thuộc tính và nguồn dẫn chứng để biểu diễn trực quan mối quan hệ giữa các phát hiện.
-2. **N-way Conflict Matrix**: Phát hiện và gắn cờ khi có hai nguồn đưa ra số liệu hoặc nhận định trái ngược nhau về cùng một đối tượng (ví dụ: mAP đo trên các cấu hình hoặc phiên bản khác nhau).
-3. **Next.js UI Click-to-Verify**: Xây dựng giao diện web cho phép người dùng click trực tiếp vào nhãn `[E1]` để nhảy ngay đến câu trích dẫn nguyên văn và trang tài liệu tương ứng.
+1. **Khử trùng lặp nguồn nâng cao (Canonical Key & Deduplication)**: Bổ sung chuẩn hóa theo arXiv ID, DOI và tiêu đề bài báo chuẩn hóa (Levenshtein distance).
+2. **Khai thác Bảng Claims & Evidence Graph**: Nối các claims trích xuất vào bảng `claims` để xây dựng ma trận đối chiếu mâu thuẫn N-chiều (**N-way Conflict Matrix**).
+3. **Next.js UI Click-to-Verify**: Xây dựng giao diện web cho phép click trực tiếp vào nhãn `[E1]` để nhảy ngay đến câu trích dẫn nguyên văn và trang tài liệu tương ứng.

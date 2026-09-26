@@ -12,6 +12,7 @@ class RetrievedChunk(BaseModel):
     chunk_id: str
     doc_id: str
     text: str
+    source_id: Optional[str] = None
     page: Optional[int] = None
     section: Optional[str] = None
     char_start: int = 0
@@ -95,10 +96,14 @@ class HybridRetriever:
         candidates: List[RetrievedChunk] = []
         for cid in sorted_cids:
             c = chunk_map[cid]
+            src_id = c.get("source_id") or (c.get("metadata", {}).get("source_id") if isinstance(c.get("metadata"), dict) else None)
+            url_val = c.get("url") or (c.get("metadata", {}).get("url") if isinstance(c.get("metadata"), dict) else None)
+            src_title = c.get("source_title") or c.get("title") or (c.get("metadata", {}).get("source_title") if isinstance(c.get("metadata"), dict) else None)
             candidates.append(RetrievedChunk(
                 chunk_id=cid,
                 doc_id=c.get("doc_id", ""),
                 text=c.get("text", ""),
+                source_id=src_id,
                 page=c.get("page"),
                 section=c.get("section"),
                 char_start=c.get("char_start", 0),
@@ -109,9 +114,9 @@ class HybridRetriever:
                 bm25_rank=bm25_ranks.get(cid),
                 vector_rank=vector_ranks.get(cid),
                 metadata={
-                    "source_id": c.get("source_id"),
-                    "url": c.get("url"),
-                    "source_title": c.get("source_title")
+                    "source_id": src_id,
+                    "url": url_val,
+                    "source_title": src_title
                 }
             ))
 

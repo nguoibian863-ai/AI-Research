@@ -630,6 +630,65 @@ class ResearchEngine:
             self._handle_phase_error(state, e, "RETRIEVE")
             raise
 
+    def _normalize_chunk_for_evidence(self, c: Any) -> Dict[str, Any]:
+        """Ensures chunk representation preserves source_id, url, and source_title for relational provenance."""
+        if isinstance(c, dict):
+            chunk_id = c.get("chunk_id", "")
+            text = c.get("text", "")
+            section = c.get("section", "")
+            page = c.get("page")
+            char_start = c.get("char_start", 0)
+            char_end = c.get("char_end", 0)
+            meta = c.get("metadata", {}) if isinstance(c.get("metadata"), dict) else {}
+            source_id = c.get("source_id") or meta.get("source_id")
+            url = c.get("url") or meta.get("url") or "local"
+            source_title = c.get("source_title") or c.get("title") or meta.get("source_title") or meta.get("title") or ""
+        else:
+            chunk_id = getattr(c, "chunk_id", "")
+            text = getattr(c, "text", "")
+            section = getattr(c, "section", "")
+            page = getattr(c, "page", None)
+            char_start = getattr(c, "char_start", 0)
+            char_end = getattr(c, "char_end", 0)
+            meta = getattr(c, "metadata", {}) if hasattr(c, "metadata") and isinstance(c.metadata, dict) else {}
+            source_id = getattr(c, "source_id", None) or meta.get("source_id")
+            url = meta.get("url") or getattr(c, "url", "local")
+            source_title = meta.get("source_title") or meta.get("title") or getattr(c, "source_title", "")
+
+        # Look up in SQLite if source_id is missing or placeholder
+        if (not source_id or source_id == "src_unknown") and chunk_id and self.db:
+            try:
+                with self.db.session() as conn:
+                    row = conn.execute(
+                        """
+                        SELECT d.source_id, s.url, s.title as source_title
+                        FROM chunks c
+                        JOIN documents d ON c.doc_id = d.doc_id
+                        JOIN sources s ON d.source_id = s.source_id
+                        WHERE c.chunk_id = ?
+                        LIMIT 1
+                        """,
+                        (chunk_id,)
+                    ).fetchone()
+                    if row:
+                        source_id = row["source_id"]
+                        url = url if url != "local" else (row["url"] or "local")
+                        source_title = source_title or (row["source_title"] or "")
+            except Exception:
+                pass
+
+        return {
+            "chunk_id": chunk_id,
+            "text": text,
+            "section": section,
+            "page": page,
+            "char_start": char_start,
+            "char_end": char_end,
+            "source_id": source_id,
+            "url": url,
+            "source_title": source_title
+        }
+
     def run_extract_phase(
         self,
         state: ResearchState,
@@ -649,27 +708,14 @@ class ResearchEngine:
                 self.save_state(state)
                 return []
 
-            normalized_chunks = []
-            for c in cand_chunks:
-                if isinstance(c, dict):
-                    normalized_chunks.append(c)
-                else:
-                    normalized_chunks.append({
-                        "chunk_id": getattr(c, "chunk_id", ""),
-                        "text": getattr(c, "text", ""),
-                        "section": getattr(c, "section", ""),
-                        "page": getattr(c, "page", None),
-                        "char_start": getattr(c, "char_start", 0),
-                        "char_end": getattr(c, "char_end", 0),
-                        "url": getattr(c, "metadata", {}).get("url") if hasattr(c, "metadata") else "local",
-                        "source_title": getattr(c, "metadata", {}).get("title") if hasattr(c, "metadata") else ""
-                    })
+            normalized_chunks = [self._normalize_chunk_for_evidence(c) for c in cand_chunks]
 
             evidence_items = self.evidence_extractor.extract_from_chunks(
                 session_id=state.session_id,
                 goal=state.goal,
                 chunks=normalized_chunks,
-                max_evidence=5
+                max_evidence=5,
+                budget_tracker=budget
             )
             self.save_state(state)
             logger.info(f"[{state.session_id}][EXTRACT] Extracted {len(evidence_items)} verified atomic evidence items.")
@@ -750,29 +796,16 @@ class ResearchEngine:
 
             full_context = "\n".join(context_snippets) if context_snippets else "No external documents retrieved."
 
-            # Retrieve or eagerly extract atomic evidence items
+            # Retrieve or eagerly extract atomic evidence items (only if not already executed in EXTRACT phase)
             evidence_items = self.evidence_repo.get_full_evidence_by_session(state.session_id)
-            if not evidence_items and selected_chunks:
-                normalized_selected = []
-                for c in selected_chunks:
-                    if isinstance(c, dict):
-                        normalized_selected.append(c)
-                    else:
-                        normalized_selected.append({
-                            "chunk_id": getattr(c, "chunk_id", ""),
-                            "text": getattr(c, "text", ""),
-                            "section": getattr(c, "section", ""),
-                            "page": getattr(c, "page", None),
-                            "char_start": getattr(c, "char_start", 0),
-                            "char_end": getattr(c, "char_end", 0),
-                            "url": getattr(c, "metadata", {}).get("url") if hasattr(c, "metadata") else "local",
-                            "source_title": getattr(c, "metadata", {}).get("title") if hasattr(c, "metadata") else ""
-                        })
+            if not evidence_items and selected_chunks and state.phase != ResearchPhase.EXTRACT:
+                normalized_selected = [self._normalize_chunk_for_evidence(c) for c in selected_chunks]
                 _ = self.evidence_extractor.extract_from_chunks(
                     session_id=state.session_id,
                     goal=state.goal,
                     chunks=normalized_selected,
-                    max_evidence=5
+                    max_evidence=5,
+                    budget_tracker=budget
                 )
                 evidence_items = self.evidence_repo.get_full_evidence_by_session(state.session_id)
 

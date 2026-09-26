@@ -83,7 +83,7 @@ def test_evidence_extractor_guards_against_hallucinated_quotes(tmp_path: Path):
                     "predicate": "achieves mAP",
                     "metric": "mAP",
                     "value": "37.3",
-                    "raw_quote": "YOLOv8n model achieves a mAP of 37.3 on the COCO dataset",
+                    "raw_quote": "YOLOv8n model achieves a mAP of 37.3 on the COCO dataset and a speed of 0.99 ms on A100 TensorRT.",
                     "chunk_id": "chunk_coco_1",
                     "confidence": 0.98
                 },
@@ -244,3 +244,201 @@ def test_api_evidence_endpoints(client, isolated_engine):
     assert data["evidence"][0]["url"] == "https://arxiv.org/abs/2006.11275"
     assert data["evidence"][0]["section"] == "Results"
     assert data["evidence"][0]["page"] == 5
+
+
+def test_evidence_extractor_rejects_numeric_mismatch_and_subject_mismatch(tmp_path: Path):
+    """
+    P0-2 Test: Ensures numeric verification and subject grounding guardrails reject fabricated facts:
+    1. 'PointPillars achieves 72.9 NDS' with quote 'PointPillars achieves 59.2 NDS' -> REJECTED (NUMERIC_MISMATCH).
+    2. 'RT-DETR achieves 53.1 AP on COCO' with quote 'achieves 60.3 mAP' -> REJECTED (SUBJECT_MISMATCH & NUMERIC_MISMATCH).
+    """
+    from backend.db.repositories import SessionRepository, SourceRepository
+    db = DatabaseManager(db_path=tmp_path / "numeric_guard_test.db")
+    SessionRepository(db).create(session_id="sess_guard", goal="Compare detection benchmarks")
+    SourceRepository(db).add(
+        source_id="src_nuscenes",
+        session_id="sess_guard",
+        url="https://arxiv.org/abs/2006.11275",
+        title="nuScenes Benchmark",
+        domain="arxiv.org",
+        canonical_key="nuscenes"
+    )
+
+    chunks = [
+        {
+            "chunk_id": "chunk_nu_1",
+            "source_id": "src_nuscenes",
+            "url": "https://arxiv.org/abs/2006.11275",
+            "source_title": "nuScenes Benchmark",
+            "text": "CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark. Meanwhile, PointPillars achieves 59.2 NDS.",
+            "section": "Experiments",
+            "page": 5,
+            "char_start": 0,
+            "char_end": 110
+        }
+    ]
+
+    canned = {
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    # Case 1: Fabricated metric number 72.9 (quote actually has 59.2 NDS)
+                    "statement": "PointPillars achieves 72.9 NDS, beating CenterPoint.",
+                    "subject": "PointPillars",
+                    "predicate": "achieves",
+                    "metric": "NDS",
+                    "value": "72.9",
+                    "raw_quote": "PointPillars achieves 59.2 NDS",
+                    "chunk_id": "chunk_nu_1",
+                    "confidence": 0.99
+                },
+                {
+                    # Case 2: Fabricated subject RT-DETR and fabricated metric 53.1 AP (quote actually has achieves 60.3 mAP)
+                    "statement": "RT-DETR achieves 53.1 AP on COCO.",
+                    "subject": "RT-DETR",
+                    "predicate": "achieves",
+                    "metric": "AP",
+                    "value": "53.1",
+                    "raw_quote": "achieves 60.3 mAP",
+                    "chunk_id": "chunk_nu_1",
+                    "confidence": 0.95
+                },
+                {
+                    # Case 3: Genuine authentic fact
+                    "statement": "CenterPoint achieves 60.3 mAP on nuScenes benchmark.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "chunk_nu_1",
+                    "confidence": 0.99
+                }
+            ]
+        }
+    }
+
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    extractor = EvidenceExtractor(llm=mock_llm, db=db)
+
+    results = extractor.extract_from_chunks(
+        session_id="sess_guard",
+        goal="Compare detection benchmarks",
+        chunks=chunks
+    )
+
+    # Both fabricated facts MUST be rejected. Only Case 3 should be accepted!
+    assert len(results) == 1
+    assert results[0]["subject"] == "CenterPoint"
+    assert results[0]["value"] == "60.3"
+    assert results[0]["exact_quote"] == "CenterPoint achieves 60.3 mAP"
+
+
+def test_run_week1_end_to_end_extracts_evidence_without_foreign_key_error(tmp_path: Path):
+    """
+    P0-1 Test: Ensures that run_week1 pipeline with RetrievedChunk objects
+    preserves source_id, extracts valid atomic evidence without SQLite foreign key crash,
+    and returns evidence_count > 0.
+    """
+    from backend.core.engine import ResearchEngine
+    from backend.core.limits import ResearchLimits
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+    from backend.tools.web_search import SearchResultItem
+    from backend.tools.web_fetch import FetchedWebContent
+
+    class MockSearch:
+        def search(self, query: str, max_results: int = 5):
+            return [
+                SearchResultItem(
+                    title="CenterPoint Paper",
+                    url="https://arxiv.org/abs/2006.11275",
+                    snippet="CenterPoint achieves 60.3 mAP on nuScenes.",
+                    query=query,
+                    rank=1
+                )
+            ]
+
+    class MockFetch:
+        def fetch(self, url: str):
+            return FetchedWebContent(
+                url=url,
+                title="CenterPoint 3D Detection",
+                text="In our evaluations, CenterPoint achieves 60.3 mAP and 67.3 NDS on nuScenes benchmark.",
+                content_hash="hash_cp"
+            )
+
+    canned = {
+        "ResearchPlanSchema": {
+            "goal": "Evaluate CenterPoint 3D detection accuracy",
+            "tasks": [
+                {"task_id": "t1", "description": "Check nuScenes mAP", "expected_evidence": "60.3 mAP"}
+            ],
+            "key_hypotheses": ["CenterPoint achieves strong mAP"]
+        },
+        "GeneratedQueriesSchema": {
+            "queries": [
+                {"query": "CenterPoint nuScenes mAP benchmark", "query_type": "evidence", "rationale": "benchmark data"}
+            ]
+        },
+        "ExtractedEvidencesSchema": {
+            "facts": [
+                {
+                    "statement": "CenterPoint achieves 60.3 mAP on nuScenes benchmark.",
+                    "subject": "CenterPoint",
+                    "predicate": "achieves",
+                    "metric": "mAP",
+                    "value": "60.3",
+                    "raw_quote": "CenterPoint achieves 60.3 mAP",
+                    "chunk_id": "",
+                    "confidence": 0.99
+                }
+            ]
+        }
+    }
+
+    db = DatabaseManager(db_path=tmp_path / "e2e_extract_test.db")
+    mock_llm = MockLLMBackend(canned_responses=canned)
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        search_tool=MockSearch(),
+        fetch_tool=MockFetch(),
+        embedding_backend=LocalHashEmbeddingBackend(dimension=64)
+    )
+
+    result = engine.run_week1("Evaluate CenterPoint 3D detection accuracy")
+
+    assert result["phase"] == "DONE"
+    assert result["status"] == "COMPLETED"
+    assert result["evidence_count"] >= 1
+    assert "Evidence & Provenance Table" in result["answer"]
+    assert "[E1]" in result["answer"]
+
+    # Verify SQLite raw_evidences and evidences were persisted without foreign key errors
+    raw_evs = engine.raw_evidence_repo.get_by_session(result["session_id"])
+    assert len(raw_evs) >= 1
+    assert raw_evs[0]["source_id"].startswith("src_")
+
+
+def test_extract_core_entities_expanded_terms():
+    """
+    Verifies improved entity extraction:
+    - Drops 'affect', 'using', 'instead', 'tradeoffs', 'consumer', 'speed'
+    - Retains 2-letter tech names like 'Go', 'AI'
+    """
+    from backend.core.coverage import extract_core_entities
+
+    q1 = "How does quantization affect LLM inference speed on consumer GPUs"
+    ents1 = extract_core_entities(q1)
+    assert "quantization" in ents1
+    assert "llm" in ents1
+    assert "gpus" in ents1
+    assert "affect" not in ents1
+    assert "speed" not in ents1
+    assert "consumer" not in ents1
+
+    q2 = "What are the tradeoffs of using Rust instead of Go for backend services"
+    ents2 = extract_core_entities(q2)
+    assert ents2 == ["rust", "go"]
+
