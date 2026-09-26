@@ -13,10 +13,12 @@ class ParsedChunk(BaseModel):
     doc_id: str
     text: str
     page: Optional[int] = None
+    page_end: Optional[int] = None
     section: Optional[str] = None
     char_start: int = 0
     char_end: int = 0
     token_count: int = 0
+
 
 
 class SectionAwareChunker:
@@ -111,11 +113,13 @@ class SectionAwareChunker:
                 doc_id=doc_id,
                 text=chunk_text,
                 page=b_list[0].get("page", section.page or 1),
+                page_end=b_list[-1].get("page", section.page or 1),
                 section=section.title,
                 char_start=c_start,
                 char_end=c_end,
                 token_count=t_count
             )
+
 
         for b in blocks:
             b_text = b["text"]
@@ -196,11 +200,13 @@ class SectionAwareChunker:
                 doc_id=doc_id,
                 text=chunk_text,
                 page=b_page,
+                page_end=b_page,
                 section=section.title,
                 char_start=abs_start,
                 char_end=abs_end,
                 token_count=self.estimate_tokens(chunk_text)
             )
+
 
         for span in sentence_spans:
             s_text = b_text[span[0]:span[1]]

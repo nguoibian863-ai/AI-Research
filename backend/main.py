@@ -55,12 +55,37 @@ def get_research_engine() -> ResearchEngine:
         else:
             llm_backend = MockLLMBackend()
 
+        # Configure Embedding Backend
+        retrieval_cfg = settings.get("retrieval", {})
+        emb_cfg = retrieval_cfg.get("embedding", {})
+        emb_type = emb_cfg.get("backend", "fastembed")
+        emb_model = emb_cfg.get("model", "BAAI/bge-small-en-v1.5")
+
+        embedding_backend = None
+        if emb_type == "fastembed":
+            try:
+                from backend.retrieval.embeddings import FastEmbedEmbeddingBackend
+                embedding_backend = FastEmbedEmbeddingBackend(model_name=emb_model)
+                logger.info(f"Loaded FastEmbedEmbeddingBackend with model: {emb_model}")
+            except Exception as e:
+                logger.warning(f"Could not load FastEmbed ({e}). Falling back to LocalHashEmbeddingBackend.")
+                from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+                embedding_backend = LocalHashEmbeddingBackend()
+        elif emb_type == "ollama":
+            from backend.retrieval.embeddings import OllamaEmbeddingBackend
+            embedding_backend = OllamaEmbeddingBackend(model=emb_model)
+        else:
+            from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+            embedding_backend = LocalHashEmbeddingBackend()
+
         _engine_instance = ResearchEngine(
             llm=llm_backend,
             db=db_manager,
-            limits=ResearchLimits(**settings.get("limits", {}))
+            limits=ResearchLimits(**settings.get("limits", {})),
+            embedding_backend=embedding_backend
         )
     return _engine_instance
+
 
 
 def setup_logging(logs_dir: Optional[Path] = None) -> List[logging.Handler]:

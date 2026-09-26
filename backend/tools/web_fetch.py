@@ -72,6 +72,10 @@ class WebFetchTool:
                     # Check Content-Type header for binary PDF
                     content_type = response.headers.get("content-type", "").lower()
                     if "application/pdf" in content_type:
+                        pdf_cache_dir = Path("data/pdf")
+                        pdf_cache_dir.mkdir(parents=True, exist_ok=True)
+                        pdf_cache_file = pdf_cache_dir / f"{url_hash}.pdf"
+                        pdf_cache_file.write_bytes(response.content)
                         return FetchedWebContent(
                             url=url,
                             title=Path(url).name,
@@ -79,6 +83,7 @@ class WebFetchTool:
                             content_hash="",
                             is_pdf=True
                         )
+
 
                     html_content = response.text
 

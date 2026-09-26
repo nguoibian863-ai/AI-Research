@@ -142,17 +142,20 @@ def test_engine_enforces_max_total_chunks(tmp_path):
 
 def test_engine_search_skips_blocked_domains(tmp_path):
     """
-    P1 Test: Search domain blocklist.
-    Verifies that social media / spam domains are filtered before fetch.
+    P1 Test: Search domain blocklist with substring-safe matching.
+    Verifies that social media / spam domains (x.com, m.facebook.com) are filtered,
+    while valid domains containing blocked substrings (e.g. dropbox.com containing 'x.com')
+    are NOT incorrectly blocked.
     """
     from backend.tools.web_search import SearchResultItem
 
     class BlocklistTestSearchTool:
         def search(self, query: str, max_results: int = 5):
             return [
-                SearchResultItem(title="Facebook Spam", url="https://facebook.com/group/ai", snippet="spam"),
-                SearchResultItem(title="Real Tech Blog", url="https://towardsdatascience.com/3d-lidar", snippet="real tech"),
-                SearchResultItem(title="Twitter post", url="https://twitter.com/user/status/123", snippet="tweet")
+                SearchResultItem(title="Facebook Spam", url="https://m.facebook.com/group/ai", snippet="spam on facebook"),
+                SearchResultItem(title="Real Tech Blog", url="https://towardsdatascience.com/3d-lidar", snippet="real tech blog benchmark"),
+                SearchResultItem(title="Twitter post", url="https://x.com/user/status/123", snippet="tweet on x.com"),
+                SearchResultItem(title="Dropbox Tech Paper", url="https://dropbox.com/s/benchmark.pdf", snippet="whitepaper on benchmark evaluation")
             ]
 
     db = DatabaseManager(db_path=tmp_path / "blocklist.db")
@@ -162,18 +165,21 @@ def test_engine_search_skips_blocked_domains(tmp_path):
         search_tool=BlocklistTestSearchTool()
     )
 
-    state = engine.create_session("Blocklist test")
+    state = engine.create_session("Evaluation benchmark test")
     state.phase = ResearchPhase.PLAN
     engine.save_state(state)
 
-    found_urls = engine.run_search_phase(state, custom_queries=["test query"])
-    # Only towardsdatascience should be retained
-    assert len(found_urls) == 1
-    assert "towardsdatascience.com" in found_urls[0]
+    found_urls = engine.run_search_phase(state, custom_queries=["benchmark evaluation"])
+    # towardsdatascience.com and dropbox.com must be retained; x.com and m.facebook.com must be dropped
+    assert len(found_urls) == 2
+    assert any("towardsdatascience.com" in u for u in found_urls)
+    assert any("dropbox.com" in u for u in found_urls)
+    assert not any(u.split("/")[2] in {"x.com", "m.facebook.com"} for u in found_urls)
 
     sources = engine.source_repo.get_by_session(state.session_id)
     domains = [s["domain"] for s in sources]
     assert "towardsdatascience.com" in domains
-    assert "facebook.com" not in domains
-    assert "twitter.com" not in domains
+    assert "dropbox.com" in domains
+    assert "m.facebook.com" not in domains
+    assert "x.com" not in domains
 

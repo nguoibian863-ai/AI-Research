@@ -26,14 +26,15 @@ Local Deep Research Agent is an autonomous research system designed to run on pe
 - **Trafilatura Web Cleaner & Metadata (`HTMLCleaner`):** Cleans HTML articles, extracts title, author, date, and preserves structured sections with exact character offsets.
 - **PyMuPDF Page-Aware & Section-Aware PDF Parser (`PDFParser`):** Extracts structured academic text preserving exact 1-indexed page numbers at the block level, preventing multi-page sections from misattributing subsequent pages to page 1.
 - **Section-Aware Hierarchical Chunker (`SectionAwareChunker`):** Prioritizes Section → Heading → Paragraph → Token limit with configurable max chunk tokens (600) and overlap (80). Strictly preserves character offset invariant `document.text[chunk.char_start:chunk.char_end] == chunk.text`.
-- **True Semantic Embedding (`FastEmbedEmbeddingBackend`):** Powered by `BAAI/bge-small-en-v1.5` on ONNX Runtime CPU (0 GPU VRAM). Proven semantic paraphrasing without shared vocabulary. Explicit failure on error without silent degrading.
+- **True Semantic Embedding (`FastEmbedEmbeddingBackend`):** Powered by `BAAI/bge-small-en-v1.5` on ONNX Runtime CPU (0 GPU VRAM). Proven semantic paraphrasing without shared vocabulary. Explicit failure on error without silent degrading. Configurable in `config/settings.yaml`.
 - **SQLite Chunk Persistence (`ChunkRepository`):** Chunks stored directly in SQLite `chunks` table linked to documents and sources, enforcing `max_total_chunks` hard limits (default 300).
 - **BM25 Exact Metric & Keyword Index (`BM25Index`):** Tokenizer preserves floats and metrics (`71.2 NDS`, `59.2 mAP`), model identifiers, and technical names using `rank_bm25`. Includes small-corpus fallback preventing term drops when $N \le 2$.
 - **CPU-Optimized FAISS Vector Index (`FaissVectorIndex`):** Normalized inner product / cosine similarity vector search with disk persistence and full rebuild from SQLite Source of Truth (`rebuild_from_db`).
-- **Score-Based Reranker (`ScoreReranker`):** Multi-signal reranking applying exact phrase boosts, benchmark section boosts (`Results`, `Experiments`, `Benchmark`), and numerical metric boosts.
+- **Calibrated Score Reranker (`ScoreReranker`):** Multi-signal reranker with calibrated scaling ($1 / (K + 1)$) preventing boost explosion over RRF fusion; filters stop words and applies precise phrase and numerical target boosts.
 - **Per-Session Isolated Hybrid Retrieval (`HybridRetriever`):** Combines BM25 and FAISS results using standard RRF fusion ($k=60$) with per-session instance isolation (`get_session_retriever(session_id)`).
 - **End-to-End & REST Integration:** Pipeline routes `.pdf` URLs and `application/pdf` headers to `PDFFetchTool`, records author and publication date metadata in SQLite `sources`, and provides read-only `/session/{id}/retrieve` queries.
-- **Automated Test Coverage:** 44/44 tests passing in ~2.3s with completely offline and isolated fixtures.
+- **Automated Test Coverage:** 45/45 tests passing with air-gapped test container safety.
+- **Review & Validation:** see [`docs/week2_review.md`](docs/week2_review.md).
 
 ### 📅 Weeks 3–5: Evidence, Verification, UI & Benchmark (Roadmap)
 - [ ] Atomic evidence extraction (1 Fact = 1 Evidence) and Provenance.

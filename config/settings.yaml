@@ -60,3 +60,19 @@ token_budget:
   gap_evaluator: 2000
   verifier: 2000
   writer: 6000
+
+retrieval:
+  embedding:
+    backend: "fastembed"  # "fastembed" | "local_hash" | "ollama"
+    model: "BAAI/bge-small-en-v1.5"
+    dimension: 384
+  bm25:
+    k1: 1.5
+    b: 0.75
+  rrf:
+    k: 60
+    bm25_weight: 0.5
+    vector_weight: 0.5
+  reranker:
+    enabled: true
+

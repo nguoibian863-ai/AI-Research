@@ -1,6 +1,7 @@
 import uuid
 import json
 import logging
+import re
 from typing import Optional, List, Dict, Any, Union
 from backend.core.state import (
     ResearchState,
@@ -73,9 +74,18 @@ class ResearchEngine:
         self.fetch_tool = fetch_tool or WebFetchTool()
         self.pdf_tool = pdf_tool or PDFFetchTool()
         self.chunker = chunker or SectionAwareChunker(max_chunk_tokens=self.limits.max_chunk_tokens)
-        self.embedding_backend = embedding_backend or LocalHashEmbeddingBackend()
+        if embedding_backend is not None:
+            self.embedding_backend = embedding_backend
+        else:
+            try:
+                from backend.retrieval.embeddings import FastEmbedEmbeddingBackend
+                self.embedding_backend = FastEmbedEmbeddingBackend()
+            except Exception as e:
+                logger.info(f"Using LocalHashEmbeddingBackend as default fallback ({e}).")
+                self.embedding_backend = LocalHashEmbeddingBackend()
         
         # Per-session hybrid retrievers (BM25 + FAISS isolation)
+
         self._session_retrievers: Dict[str, HybridRetriever] = {}
         if hybrid_retriever:
             self._session_retrievers["default"] = hybrid_retriever
@@ -274,11 +284,11 @@ class ResearchEngine:
                 f"break it down into 3-5 concrete, factual investigation sub-tasks focusing on measurable benchmarks, "
                 f"hardware specifications, datasets, and baseline comparisons.\n\n"
                 f"Example Benchmark Plan:\n"
-                f"Goal: Compare PointPillars vs CenterPoint 3D detection on nuScenes\n"
+                f"Goal: Compare RocksDB vs LevelDB write amplification and throughput on NVMe SSDs\n"
                 f"Tasks:\n"
-                f"1. Investigate CenterPoint architecture, voxel/pillar resolution, and test set mAP/NDS on nuScenes.\n"
-                f"2. Investigate PointPillars detection performance, latency, and FPS on LiDAR benchmarks.\n"
-                f"3. Compare computational cost, RTX GPU inference latency, and memory footprint between models.\n\n"
+                f"1. Investigate RocksDB LSM-tree compaction strategies, write stall mitigation, and random write throughput.\n"
+                f"2. Investigate LevelDB write amplification factor, memory table architecture, and sequential read/write benchmarks.\n"
+                f"3. Compare CPU overhead, space amplification, and P99 latency on high-iops NVMe storage.\n\n"
                 f"Question: {state.goal}"
             )
             res = self.llm.structured_generate(prompt, schema=ResearchPlanSchema)
@@ -328,9 +338,9 @@ class ResearchEngine:
                     f"Based on the research goal and plan, generate 2-4 concise, highly-targeted keyword search queries "
                     f"(3 to 8 words per query). Do NOT use conversational question sentences.\n\n"
                     f"Good Examples:\n"
-                    f"- 'CenterPoint nuScenes 3D detection benchmark NDS mAP'\n"
-                    f"- 'PointPillars inference latency FPS RTX'\n"
-                    f"- 'CenterPoint vs PointPillars autonomous driving LiDAR benchmark'\n\n"
+                    f"- 'RocksDB LevelDB write amplification benchmark NVMe'\n"
+                    f"- 'RocksDB compaction throughput latency SSD'\n"
+                    f"- 'LevelDB LSM tree space amplification evaluation'\n\n"
                     f"Goal: {state.goal}\n"
                     f"Plan: {state.plan.model_dump_json() if state.plan else ''}\n"
                     f"Previously visited: {state.visited_queries}"
@@ -368,9 +378,24 @@ class ResearchEngine:
                         if not url:
                             continue
 
-                        domain = url.split("/")[2].lower() if "://" in url else ""
-                        if any(b in domain for b in BLOCKED_DOMAINS):
+                        raw_domain = url.split("/")[2].lower() if "://" in url else ""
+                        domain = raw_domain.split(":")[0]
+                        if any(domain == b or domain.endswith("." + b) for b in BLOCKED_DOMAINS):
                             logger.info(f"[{state.session_id}][SEARCH] Skipping blocked domain: {domain}")
+                            continue
+
+                        # Relevance filter: skip items with zero substantive keyword match
+                        query_and_goal = f"{state.goal} {q}".lower()
+                        goal_tokens = {
+                            w for w in re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", query_and_goal)
+                            if w not in {
+                                "the", "and", "for", "with", "from", "that", "this", "which",
+                                "what", "how", "why", "where", "when", "does", "compare", "vs"
+                            }
+                        }
+                        item_text = f"{item.title} {item.snippet} {item.url}".lower()
+                        if goal_tokens and not any(t in item_text for t in goal_tokens):
+                            logger.info(f"[{state.session_id}][SEARCH] Skipping irrelevant search result: {item.title}")
                             continue
 
                         if url not in existing_urls and url not in found_urls:
@@ -517,10 +542,26 @@ class ResearchEngine:
                 if doc:
                     existing_chunks = self.chunk_repo.get_by_doc(doc["doc_id"])
                     if not existing_chunks:
-                        cleaned = CleanedDocument(
-                            title=s.get("title"),
-                            text=doc["raw_text"]
-                        )
+                        cleaned = None
+                        if s.get("source_type") == "pdf" or (doc.get("file_path") and str(doc["file_path"]).lower().endswith(".pdf")):
+                            try:
+                                from backend.parsing.pdf_parser import PDFParser
+                                cleaned = PDFParser().parse_file(doc["file_path"])
+                            except Exception as pdf_err:
+                                logger.warning(f"[{state.session_id}][CLEAN] PDF parsing failed ({pdf_err}), falling back to text.")
+                        if cleaned is None:
+                            try:
+                                cleaner = HTMLCleaner()
+                                cleaned = cleaner.clean(doc.get("raw_text") or "", url=s.get("url"))
+                                if s.get("title") and not cleaned.title:
+                                    cleaned.title = s.get("title")
+                            except Exception as html_err:
+                                logger.warning(f"[{state.session_id}][CLEAN] HTML cleaning failed ({html_err}), falling back to raw text.")
+                                cleaned = CleanedDocument(
+                                    title=s.get("title"),
+                                    text=doc.get("raw_text") or ""
+                                )
+
                         chunks = self.chunker.chunk_document(doc_id=doc["doc_id"], document=cleaned)
                         if chunks:
                             available_slots = max(0, self.limits.max_total_chunks - total_chunks)
@@ -613,9 +654,26 @@ class ResearchEngine:
             budget.record_llm_call(tokens=res.total_tokens)
             answer = res.content.strip()
 
-            # Transition state to DONE (or PARTIAL if no evidence found)
-            has_data = bool(context_snippets) and bool(state.source_ids) and "no external documents retrieved" not in full_context.lower()
-            target_phase = ResearchPhase.DONE if has_data else ResearchPhase.PARTIAL
+            # Transition state to DONE (or PARTIAL if no evidence found or answer states insufficient info)
+            insufficient_phrases = [
+                "no information available",
+                "insufficient information",
+                "not enough information",
+                "cannot be answered",
+                "unable to find information",
+                "no evidence found",
+                "there is no information"
+            ]
+            answer_lower = answer.lower()
+            is_insufficient = any(phrase in answer_lower for phrase in insufficient_phrases)
+
+            has_valid_evidence = (
+                bool(context_snippets)
+                and bool(state.source_ids)
+                and "no external documents retrieved" not in full_context.lower()
+                and not is_insufficient
+            )
+            target_phase = ResearchPhase.DONE if has_valid_evidence else ResearchPhase.PARTIAL
             self.state_machine.transition(state, target_phase, reason="Report synthesis completed")
             self.save_state(state)
 

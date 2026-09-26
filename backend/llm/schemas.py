@@ -15,12 +15,13 @@ class ResearchPlanSchema(BaseModel):
 
 
 class SearchQueryItemSchema(BaseModel):
-    query: str = Field(description="Precise search query string")
+    query: str = Field(..., min_length=3, max_length=80, description="Precise keyword search query (3 to 8 words)")
     query_type: str = Field(
         default="discovery",
         description="Query category: discovery | evidence | verification | contradiction"
     )
-    rationale: str = Field(description="Why this specific query is needed")
+    rationale: str = Field(default="", description="Why this specific query is needed")
+
 
 
 class GeneratedQueriesSchema(BaseModel):
