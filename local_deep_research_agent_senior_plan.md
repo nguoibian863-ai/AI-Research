@@ -877,6 +877,41 @@ rebuild from SQLite
 
 ---
 
+## 19.1 Cross-Session Research Memory (P2, sau MVP)
+
+Hiện mỗi session bắt đầu từ con số 0. SQLite đã có đủ dữ liệu để làm memory, nhưng chỉ được nhớ những gì **đã kiểm chứng và có provenance**.
+
+| Loại memory | Nội dung | Dùng khi |
+|---|---|---|
+| Evidence Memory | evidence VERIFIED + raw quote + source từ các session trước | Trước SEARCH: tra theo core entities của goal |
+| Source Memory | `source_score`, domain bị chặn, URL fetch lỗi, canonical key | Trước FETCH: bỏ qua source đã biết là kém/lỗi |
+| User Preferences | ngôn ngữ report, citation style, lĩnh vực ưu tiên | Khi WRITE |
+
+Luồng:
+
+```text
+PLAN
+→ Memory Lookup (evidence theo entity, còn hạn)
+→ coverage đủ? → dùng lại, chỉ SEARCH phần còn thiếu
+→ coverage thiếu → SEARCH như bình thường
+```
+
+Quy tắc bắt buộc:
+
+- chỉ nhớ **evidence đã VERIFIED kèm đầy đủ provenance**; không bao giờ nhớ answer/summary do LLM viết;
+- evidence dùng lại phải có `retrieved_at`; quá hạn (mặc định 90 ngày, số liệu benchmark có thể 30 ngày) → coi như thiếu, search lại;
+- report phải đánh dấu evidence nào lấy từ memory, evidence nào vừa thu thập;
+- memory là cache của SQLite, không phải source of truth mới; xoá memory không làm mất dữ liệu gốc;
+- mỗi lần dùng lại vẫn đi qua verifier như evidence mới (quote vẫn phải khớp raw text đã lưu).
+
+Acceptance:
+
+- câu hỏi lặp lại dùng ít search/fetch call hơn;
+- không có evidence quá hạn trong report;
+- report ghi rõ nguồn gốc memory/new.
+
+---
+
 # 20. Raw Evidence Layer
 
 Đây là P0.
@@ -1613,6 +1648,7 @@ Question
 - report formatting (Markdown/HTML export, citation styles)
 - PDF nâng cao (`pymupdf4llm`, GROBID)
 - AI development context (Phụ lục A.3)
+- Cross-Session Research Memory (mục 19.1)
 
 ## P3
 
