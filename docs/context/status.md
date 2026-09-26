@@ -12,7 +12,7 @@
 | 4 — Verification + UI | chưa bắt đầu | |
 | 5 — Evaluation + Trajectory | chưa bắt đầu | |
 
-Test: 75 passed + 1 skipped (test FastEmbed cần mạng).
+Test: 76 passed + 1 skipped (test FastEmbed cần mạng).
 
 ## Đã giải quyết ở `4f3872c`
 
@@ -27,6 +27,11 @@ Test: 75 passed + 1 skipped (test FastEmbed cần mạng).
 - Credibility score thang 0–100 theo plan 14.1 (authority 30, primary_source 30, directness 20, recency 10, independence 10); so khớp domain theo host/subdomain; mạng xã hội < 40; repo code chỉ là primary khi owner/repo trùng thực thể của goal.
 - Source < `min_source_score` (40) bị bỏ trước FETCH; evidence mang `source_score`; writer thấy evidence điểm cao trước và thấy điểm trong prompt.
 - Claim `CITED` không còn `verified: True` (entailment `PENDING`); lý do PARTIAL không còn ghi "no valid citations" khi câu có citation nhưng sai số.
+
+## Phát hiện từ lần chạy E2E thật đang diễn ra (`sess_a90c2f47fd8e`)
+
+- Mỗi lần retrieve đều embed lại toàn bộ chunk (177 chunk ≈ 20–37s/lần trên CPU, ~2 phút/vòng RETRIEVE) → **đã sửa**: index theo session chỉ embed chunk mới.
+- Retrieve/coverage theo thực thể chạy cả cho dataset (`coco`) → **đã sửa**: chỉ dùng thực thể được so sánh.
 
 ## Vấn đề còn mở (ưu tiên từ trên xuống)
 

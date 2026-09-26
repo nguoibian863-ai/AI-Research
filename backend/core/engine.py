@@ -94,6 +94,8 @@ class ResearchEngine:
         # Per-session hybrid retrievers (BM25 + FAISS isolation)
 
         self._session_retrievers: Dict[str, HybridRetriever] = {}
+        # chunk_ids currently embedded in each session's index (avoids re-embedding on every query)
+        self._indexed_chunk_ids: Dict[str, List[str]] = {}
         if hybrid_retriever:
             self._session_retrievers["default"] = hybrid_retriever
 
@@ -148,13 +150,36 @@ class ResearchEngine:
     def hybrid_retriever(self, val: HybridRetriever) -> None:
         self._session_retrievers["default"] = val
 
+    def _sync_retriever_index(self, session_id: str, retriever: HybridRetriever, chunks: List[Dict[str, Any]]) -> None:
+        """
+        Keeps the session index in sync with SQLite without re-embedding unchanged chunks.
+        Same chunk set -> no-op; new chunks appended -> embed only the new ones; otherwise full rebuild.
+        """
+        current_ids = [c["chunk_id"] for c in chunks]
+        indexed_ids = self._indexed_chunk_ids.get(session_id)
+
+        if indexed_ids == current_ids:
+            return
+
+        if indexed_ids is not None and set(indexed_ids).issubset(current_ids):
+            indexed = set(indexed_ids)
+            new_chunks = [c for c in chunks if c["chunk_id"] not in indexed]
+            retriever.bm25_index.index(chunks)  # cheap, keeps IDF consistent over the full corpus
+            retriever.vector_index.add_chunks(new_chunks)
+            self._indexed_chunk_ids[session_id] = list(indexed_ids) + [c["chunk_id"] for c in new_chunks]
+            logger.info(f"[{session_id}][RETRIEVE] Index updated incrementally: +{len(new_chunks)} chunks.")
+            return
+
+        retriever.index_chunks(chunks)
+        self._indexed_chunk_ids[session_id] = current_ids
+
     def retrieve_chunks(self, session_id: str, query: str, top_k: Optional[int] = None) -> List[RetrievedChunk]:
         """Read-only chunk retrieval without mutating session state or phase."""
         chunks = self.chunk_repo.get_by_session(session_id)
         if not chunks:
             return []
         retriever = self.get_session_retriever(session_id)
-        retriever.index_chunks(chunks)
+        self._sync_retriever_index(session_id, retriever, chunks)
         k = top_k or self.limits.retrieval_top_k
         return retriever.retrieve(query=query, top_k=k)
 
@@ -646,8 +671,8 @@ class ResearchEngine:
             seen_ids = {c.chunk_id for c in primary_results}
             combined_results = list(primary_results)
 
-            # 2. Entity-level queries for balanced coverage across distinct subjects
-            core_entities = extract_core_entities(state.goal)
+            # 2. Entity-level queries for balanced coverage across distinct subjects (datasets excluded)
+            core_entities = self._goal_subject_entities(state.goal)
             if len(core_entities) > 1:
                 per_entity_k = max(2, (k + len(core_entities) - 1) // len(core_entities))
                 for ent in core_entities:
@@ -774,7 +799,7 @@ class ResearchEngine:
             budget = self.get_budget_tracker(state.session_id)
             budget.assert_can_call_llm()
 
-            core_entities = extract_core_entities(state.goal)
+            core_entities = self._goal_subject_entities(state.goal)
             db_chunks = self.chunk_repo.get_by_session(state.session_id)
             cov = evaluate_coverage(core_entities, db_chunks)
 
@@ -1118,8 +1143,8 @@ class ResearchEngine:
                 # Evaluate: Transition to EVALUATE
                 self.state_machine.transition(state, ResearchPhase.EVALUATE, reason="Evaluating research iteration")
 
-                # Core Entity Coverage Check
-                core_entities = extract_core_entities(state.goal)
+                # Core Entity Coverage Check (compared subjects only; datasets/benchmarks are context)
+                core_entities = self._goal_subject_entities(state.goal)
                 db_chunks = self.chunk_repo.get_by_session(state.session_id)
                 cov = evaluate_coverage(core_entities, db_chunks)
                 logger.info(f"[{state.session_id}][EVALUATE] Entity coverage: {cov}")

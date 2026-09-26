@@ -327,3 +327,44 @@ def test_session_retriever_isolation(isolated_engine):
     assert len(res_b) == 1
     assert res_b[0].chunk_id == "cb1"
 
+
+
+def test_retrieval_does_not_reembed_unchanged_chunks(isolated_engine):
+    """Real E2E showed every retrieve re-embedding all chunks (~30s each on CPU). Index must be reused."""
+    from backend.retrieval.embeddings import LocalHashEmbeddingBackend
+
+    class CountingEmbedding(LocalHashEmbeddingBackend):
+        def __init__(self):
+            super().__init__(dimension=64)
+            self.embedded_texts = 0
+
+        def embed_batch(self, texts):
+            self.embedded_texts += len(texts)
+            return super().embed_batch(texts)
+
+    counting = CountingEmbedding()
+    isolated_engine.embedding_backend = counting
+
+    state = isolated_engine.create_session("Compare CenterPoint and PointPillars on nuScenes")
+    source_id = "src_idx"
+    isolated_engine.source_repo.add(source_id=source_id, session_id=state.session_id,
+                                    url="https://arxiv.org/abs/2006.11275", title="CenterPoint", domain="arxiv.org")
+    isolated_engine.doc_repo.add(doc_id="doc_idx", source_id=source_id, file_path=None, content_hash="h", raw_text="x")
+    isolated_engine.chunk_repo.add_batch([
+        {"chunk_id": f"chk_{i}", "doc_id": "doc_idx", "text": f"CenterPoint result number {i} on nuScenes.",
+         "page": 1, "section": "Results", "char_start": 0, "char_end": 10, "token_count": 8}
+        for i in range(3)
+    ])
+
+    for q in ["CenterPoint NDS", "PointPillars NDS", "nuScenes benchmark"]:
+        assert isolated_engine.retrieve_chunks(state.session_id, q, top_k=2)
+    assert counting.embedded_texts == 3  # embedded once, reused for 3 queries
+
+    # New chunk appended -> only the new chunk is embedded
+    isolated_engine.chunk_repo.add_batch([
+        {"chunk_id": "chk_new", "doc_id": "doc_idx", "text": "PointPillars reaches 59.2 NDS.",
+         "page": 2, "section": "Results", "char_start": 0, "char_end": 10, "token_count": 6}
+    ])
+    results = isolated_engine.retrieve_chunks(state.session_id, "PointPillars 59.2 NDS", top_k=4)
+    assert counting.embedded_texts == 4
+    assert any(r.chunk_id == "chk_new" for r in results)
