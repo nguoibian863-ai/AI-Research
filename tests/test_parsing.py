@@ -212,3 +212,48 @@ def test_section_aware_chunker_enforces_max_chunk_chars_limit():
         assert len(c.text) <= 1800, f"Chunk {c.chunk_id} length ({len(c.text)}) exceeds 1800 chars limit"
         assert doc.text[c.char_start:c.char_end] == c.text
 
+
+def test_section_aware_chunker_counts_delimiter_whitespace_between_blocks():
+    """
+    Verifies that whitespace/newlines between blocks are accounted for,
+    ensuring chunks never exceed max_chunk_chars even by 1 character.
+    """
+    from backend.parsing.html_cleaner import CleanedDocument, ParsedSection
+
+    # Create multiple blocks of 500 chars separated by multi-newline gaps
+    block_texts = ["A" * 500, "B" * 500, "C" * 500, "D" * 500]
+    delimiter = "\n\n   \n\n"
+    full_text = delimiter.join(block_texts)
+
+    blocks = []
+    offset = 0
+    for bt in block_texts:
+        start = full_text.find(bt, offset)
+        end = start + len(bt)
+        blocks.append({"text": bt, "page": 1, "char_start": start, "char_end": end})
+        offset = end
+
+    doc = CleanedDocument(
+        text=full_text,
+        title="Multi-block Whitespace Test",
+        sections=[
+            ParsedSection(
+                title="Blocks",
+                content=full_text,
+                page=1,
+                page_start=1,
+                page_end=1,
+                char_start=0,
+                char_end=len(full_text),
+                blocks=blocks
+            )
+        ]
+    )
+
+    chunker = SectionAwareChunker(max_chunk_tokens=1000, max_chunk_chars=1200)
+    chunks = chunker.chunk_document(doc_id="doc_blocks", document=doc)
+
+    for c in chunks:
+        assert len(c.text) <= 1200, f"Chunk {c.chunk_id} length {len(c.text)} exceeds 1200 chars limit"
+
+

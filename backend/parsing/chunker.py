@@ -141,7 +141,10 @@ class SectionAwareChunker:
                 section_chunks.extend(sub_chunks)
                 continue
 
-            if (curr_tokens + b_tokens > self.max_chunk_tokens or curr_chars + b_chars > self.max_chunk_chars) and curr_blocks:
+            # Potential character length including whitespace between blocks
+            potential_chars = (b["char_end"] - curr_blocks[0]["char_start"]) if curr_blocks else b_chars
+
+            if (curr_tokens + b_tokens > self.max_chunk_tokens or potential_chars > self.max_chunk_chars) and curr_blocks:
                 c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
                 if c:
                     section_chunks.append(c)
@@ -149,11 +152,11 @@ class SectionAwareChunker:
                 # Check if last block can be kept as overlap within character limit
                 last_b = curr_blocks[-1]
                 last_b_tokens = self.estimate_tokens(last_b["text"])
-                last_b_chars = len(last_b["text"])
-                if last_b_tokens <= self.chunk_overlap_tokens and last_b_chars + b_chars <= self.max_chunk_chars:
+                overlap_chars = b["char_end"] - last_b["char_start"]
+                if last_b_tokens <= self.chunk_overlap_tokens and overlap_chars <= self.max_chunk_chars:
                     curr_blocks = [last_b, b]
                     curr_tokens = last_b_tokens + b_tokens
-                    curr_chars = last_b_chars + b_chars
+                    curr_chars = overlap_chars
                 else:
                     curr_blocks = [b]
                     curr_tokens = b_tokens
@@ -161,7 +164,7 @@ class SectionAwareChunker:
             else:
                 curr_blocks.append(b)
                 curr_tokens += b_tokens
-                curr_chars += b_chars
+                curr_chars = potential_chars
 
         if curr_blocks:
             c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
@@ -242,7 +245,9 @@ class SectionAwareChunker:
                     sub_start = sub_end
                 continue
 
-            if (curr_tokens + s_tokens > self.max_chunk_tokens or curr_chars + s_chars > self.max_chunk_chars) and curr_spans:
+            potential_chars = (span[1] - curr_spans[0][0]) if curr_spans else s_chars
+
+            if (curr_tokens + s_tokens > self.max_chunk_tokens or potential_chars > self.max_chunk_chars) and curr_spans:
                 c = emit_sentence_chunk(curr_spans, start_num + len(chunks))
                 if c:
                     chunks.append(c)
@@ -250,10 +255,11 @@ class SectionAwareChunker:
                 last_span = curr_spans[-1]
                 last_text = b_text[last_span[0]:last_span[1]]
                 last_tokens = self.estimate_tokens(last_text)
-                if last_tokens <= self.chunk_overlap_tokens and len(last_text) + s_chars <= self.max_chunk_chars:
+                overlap_chars = span[1] - last_span[0]
+                if last_tokens <= self.chunk_overlap_tokens and overlap_chars <= self.max_chunk_chars:
                     curr_spans = [last_span, span]
                     curr_tokens = last_tokens + s_tokens
-                    curr_chars = len(last_text) + s_chars
+                    curr_chars = overlap_chars
                 else:
                     curr_spans = [span]
                     curr_tokens = s_tokens
@@ -261,7 +267,7 @@ class SectionAwareChunker:
             else:
                 curr_spans.append(span)
                 curr_tokens += s_tokens
-                curr_chars += s_chars
+                curr_chars = potential_chars
 
         if curr_spans:
             c = emit_sentence_chunk(curr_spans, start_num + len(chunks))

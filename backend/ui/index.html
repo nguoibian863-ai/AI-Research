@@ -8,11 +8,13 @@
   :root {
     --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --border: #e3e2dd;
     --accent: #2f5bd3; --done: #1f7a4d; --partial: #a36400; --failed: #b3261e; --code: #f0efea;
+    --offtopic: #7c3aed;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #151514; --panel: #1f1f1d; --text: #ecebe6; --muted: #a09f98; --border: #33322f;
       --accent: #7ea2ff; --done: #5cc48f; --partial: #f0b24a; --failed: #ff8a80; --code: #2a2a27;
+      --offtopic: #a78bfa;
     }
   }
   * { box-sizing: border-box; }
@@ -34,6 +36,7 @@
   .DONE, .COMPLETED, .CITED, .SUPPORTED { color: var(--done); }
   .PARTIAL, .PARTIALLY_SUPPORTED, .NUMERIC_MISMATCH, .UNSUPPORTED, .NOT_SUPPORTED { color: var(--partial); }
   .FAILED, .CANCELLED, .CONTRADICTED { color: var(--failed); }
+  .OFF_TOPIC { color: var(--offtopic); }
   h2 { font-size: 20px; margin: 0 0 6px; }
   h3 { font-size: 15px; margin: 24px 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
   .reason { color: var(--partial); margin: 6px 0; }

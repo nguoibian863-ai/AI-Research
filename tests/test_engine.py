@@ -457,5 +457,70 @@ def test_off_topic_claim_guardrail_marks_off_topic_and_session_partial(tmp_path)
     assert "Report claims do not address the research goal entities (off-topic)" in state.error_message
 
 
+def test_off_topic_guardrail_allows_pronoun_when_evidence_subject_matches(tmp_path):
+    """
+    Verifies that claims using pronouns (e.g. 'It achieves 53.9% AP [E1]')
+    are recognized as ON-TOPIC when the cited evidence's subject matches a goal entity.
+    """
+    canned = {
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence explicitly confirms YOLOv8 AP."
+        },
+        "generate": "It achieves 53.9% AP on COCO val [E1]."
+    }
+    mock_llm = MockLLMBackend(canned)
+    db = DatabaseManager(db_path=tmp_path / "pronoun_on_topic.db")
+    engine = ResearchEngine(llm=mock_llm, db=db)
+
+    state = engine.create_session("Evaluate YOLOv8 accuracy on COCO benchmark")
+    source_id = "src_1"
+    engine.source_repo.add(
+        source_id=source_id,
+        session_id=state.session_id,
+        url="https://example.com/yolov8",
+        title="YOLOv8 Paper",
+        domain="example.com"
+    )
+    state.source_ids.append(source_id)
+
+    raw_ev_id = "rev_1"
+    engine.raw_evidence_repo.add(
+        raw_evidence_id=raw_ev_id,
+        session_id=state.session_id,
+        source_id=source_id,
+        raw_quote="YOLOv8 achieves 53.9% AP on COCO val."
+    )
+    engine.evidence_repo.add(
+        evidence_id="evi_1",
+        session_id=state.session_id,
+        raw_evidence_id=raw_ev_id,
+        subject="YOLOv8",
+        predicate="achieves",
+        object_data={
+            "statement": "YOLOv8 achieves 53.9% AP on COCO val.",
+            "raw_quote": "YOLOv8 achieves 53.9% AP on COCO val.",
+            "url": "https://example.com/yolov8",
+            "value": "53.9%"
+        },
+        confidence=1.0
+    )
+
+    state.phase = ResearchPhase.EVALUATE
+    engine.save_state(state)
+
+    _ = engine.run_basic_answer(state)
+
+    claims = engine.claim_repo.get_by_session(state.session_id)
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["status"] == "CITED"
+    verif = claim.get("verification") or {}
+    assert verif.get("is_on_topic") is True
+    assert verif.get("verified") is True
+
+
+
 
 

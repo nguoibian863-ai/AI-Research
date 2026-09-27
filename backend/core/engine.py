@@ -93,7 +93,10 @@ class ResearchEngine:
         self.search_tool = search_tool or WebSearchTool(max_results=self.limits.max_search_results)
         self.fetch_tool = fetch_tool or WebFetchTool()
         self.pdf_tool = pdf_tool or PDFFetchTool()
-        self.chunker = chunker or SectionAwareChunker(max_chunk_tokens=self.limits.max_chunk_tokens)
+        self.chunker = chunker or SectionAwareChunker(
+            max_chunk_tokens=self.limits.max_chunk_tokens,
+            max_chunk_chars=self.limits.max_chunk_chars
+        )
         self.embedding_backend = embedding_backend or LocalHashEmbeddingBackend()
         
         # Per-session hybrid retrievers (BM25 + FAISS isolation)
@@ -1141,24 +1144,22 @@ class ResearchEngine:
                             )
                             numeric_mismatch_claims_count += 1
                         else:
-                            # Cited and numerically consistent -> Plan 23 NLI Entailment Verification
-                            quotes_for_nli = [
-                                ev.get("exact_quote") or ev.get("raw_quote") or "" for ev in cited_evs
-                                if (ev.get("exact_quote") or ev.get("raw_quote"))
-                            ]
-                            nli_res = self.claim_verification_pipeline.verify_claim_against_quotes(
-                                sent, quotes_for_nli, budget_tracker=budget, known_entities=goal_core_entities
-                            )
-                            if nli_res.verifier_type == "llm":
-                                nli_llm_evaluated_count += 1
-
-                            # Off-topic Claim Guardrail:
-                            # A claim can only count towards supported_claims_count if it mentions at least one entity of the research goal.
+                            # Off-topic Claim Guardrail (run BEFORE NLI to preserve LLM budget):
+                            # A claim can only count towards supported_claims_count if either:
+                            # (a) the claim itself mentions a goal entity, OR
+                            # (b) the subject of a cited evidence matches a goal entity (handles pronouns like "It achieves...").
                             is_on_topic = (
                                 not goal_core_entities
                                 or any(
                                     check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
                                     for ent in goal_core_entities
+                                )
+                                or any(
+                                    ev.get("subject") and any(
+                                        check_entity_in_text(ent, ev.get("subject", "")) or subject_matches_entity(ev.get("subject", ""), ent)
+                                        for ent in goal_core_entities
+                                    )
+                                    for ev in cited_evs
                                 )
                             )
 
@@ -1166,40 +1167,71 @@ class ResearchEngine:
                                 claim_status = "OFF_TOPIC"
                                 is_verified = False
                                 off_topic_claims_count += 1
+                                cited_claims_count += 1
                                 logger.info(
-                                    f"[{state.session_id}][WRITE] Claim marked OFF_TOPIC (does not mention any goal entity {goal_core_entities}): '{sent[:80]}...'"
+                                    f"[{state.session_id}][WRITE] Claim marked OFF_TOPIC (neither claim text nor cited evidence subjects mention goal entities {goal_core_entities}): '{sent[:80]}...'"
+                                )
+                                self.claim_repo.add(
+                                    claim_id=claim_id,
+                                    session_id=state.session_id,
+                                    text=sent,
+                                    evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
+                                    verification={
+                                        "verified": False,
+                                        "is_on_topic": False,
+                                        "entailment": NLILabel.NOT_SUPPORTED.value,
+                                        "entailment_confidence": 1.0,
+                                        "entailment_reason": "Claim and cited evidence do not address any goal core entity; NLI evaluation skipped to preserve budget",
+                                        "verifier_type": "guardrail",
+                                        "numeric_match": True,
+                                        "citation_indices": valid_cites_in_sent,
+                                        "citation_index": valid_cites_in_sent[0],
+                                        "quote": cited_evs[0].get("exact_quote"),
+                                        "source_id": cited_evs[0].get("source_id")
+                                    },
+                                    status="OFF_TOPIC"
                                 )
                             else:
+                                # Cited, numerically consistent, and on-topic -> Plan 23 NLI Entailment Verification
+                                quotes_for_nli = [
+                                    ev.get("exact_quote") or ev.get("raw_quote") or "" for ev in cited_evs
+                                    if (ev.get("exact_quote") or ev.get("raw_quote"))
+                                ]
+                                nli_res = self.claim_verification_pipeline.verify_claim_against_quotes(
+                                    sent, quotes_for_nli, budget_tracker=budget, known_entities=goal_core_entities
+                                )
+                                if nli_res.verifier_type == "llm":
+                                    nli_llm_evaluated_count += 1
+
                                 claim_status = "CITED"
                                 is_verified = (nli_res.label == NLILabel.SUPPORTED)
                                 if nli_res.label == NLILabel.SUPPORTED:
                                     supported_claims_count += 1
+                                if nli_res.label == NLILabel.CONTRADICTED:
+                                    contradicted_claims_count += 1
 
-                            if nli_res.label == NLILabel.CONTRADICTED:
-                                contradicted_claims_count += 1
+                                cited_claims_count += 1
 
-                            cited_claims_count += 1
-
-                            self.claim_repo.add(
-                                claim_id=claim_id,
-                                session_id=state.session_id,
-                                text=sent,
-                                evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
-                                verification={
-                                    "verified": is_verified,
-                                    "is_on_topic": is_on_topic,
-                                    "entailment": nli_res.label.value,
-                                    "entailment_confidence": nli_res.confidence,
-                                    "entailment_reason": nli_res.reason,
-                                    "verifier_type": nli_res.verifier_type,
-                                    "numeric_match": True,
-                                    "citation_indices": valid_cites_in_sent,
-                                    "citation_index": valid_cites_in_sent[0],
-                                    "quote": cited_evs[0].get("exact_quote"),
-                                    "source_id": cited_evs[0].get("source_id")
-                                },
-                                status=claim_status
-                            )
+                                self.claim_repo.add(
+                                    claim_id=claim_id,
+                                    session_id=state.session_id,
+                                    text=sent,
+                                    evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
+                                    verification={
+                                        "verified": is_verified,
+                                        "is_on_topic": True,
+                                        "entailment": nli_res.label.value,
+                                        "entailment_confidence": nli_res.confidence,
+                                        "entailment_reason": nli_res.reason,
+                                        "verifier_type": nli_res.verifier_type,
+                                        "numeric_match": True,
+                                        "citation_indices": valid_cites_in_sent,
+                                        "citation_index": valid_cites_in_sent[0],
+                                        "quote": cited_evs[0].get("exact_quote"),
+                                        "source_id": cited_evs[0].get("source_id")
+                                    },
+                                    status=claim_status
+                                )
                     elif substantive_numbers:
                         # Sentence contains substantive metrics/numbers but has NO citation!
                         claim_id = f"clm_{uuid.uuid4().hex[:8]}"
@@ -1354,39 +1386,66 @@ class ResearchEngine:
             if not quotes:
                 continue
 
-            res = self.claim_verification_pipeline.verify_claim_against_quotes(
-                claim["text"], quotes, budget_tracker=budget_tracker, known_entities=known_entities
-            )
-
             current_verif = claim.get("verification") or {}
             numeric_match = current_verif.get("numeric_match", True)
-
-            # Off-topic check
             sent = claim.get("text", "")
+
+            # Off-topic check (checked BEFORE NLI to preserve LLM budget and handles pronouns via cited evidence subjects)
+            cited_ev_items = [evidence_map[eid] for eid in ev_ids if eid in evidence_map]
             is_on_topic = (
                 not known_entities
                 or any(
                     check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
                     for ent in known_entities
                 )
+                or any(
+                    ev.get("subject") and any(
+                        check_entity_in_text(ent, ev.get("subject", "")) or subject_matches_entity(ev.get("subject", ""), ent)
+                        for ent in known_entities
+                    )
+                    for ev in cited_ev_items
+                )
             )
-            claim_status = "OFF_TOPIC" if not is_on_topic else claim.get("status", "CITED")
-            is_verified = (res.label == NLILabel.SUPPORTED and numeric_match and is_on_topic)
+
+            if not is_on_topic:
+                current_verif.update({
+                    "is_on_topic": False,
+                    "verified": False,
+                    "entailment": NLILabel.NOT_SUPPORTED.value,
+                    "entailment_confidence": 1.0,
+                    "entailment_reason": "Claim and cited evidence do not address any goal core entity; NLI evaluation skipped to preserve budget",
+                    "verifier_type": "guardrail"
+                })
+                self.claim_repo.update_verification(
+                    claim_id=claim["claim_id"],
+                    verification=current_verif,
+                    status="OFF_TOPIC"
+                )
+                updated = self.claim_repo.get_by_id(claim["claim_id"])
+                if updated:
+                    updated_claims.append(updated)
+                continue
+
+            # On-topic -> run NLI verification
+            res = self.claim_verification_pipeline.verify_claim_against_quotes(
+                claim["text"], quotes, budget_tracker=budget_tracker, known_entities=known_entities
+            )
+            is_verified = (res.label == NLILabel.SUPPORTED and numeric_match)
 
             current_verif.update({
                 "entailment": res.label.value,
                 "entailment_confidence": res.confidence,
                 "entailment_reason": res.reason,
                 "verifier_type": res.verifier_type,
-                "is_on_topic": is_on_topic,
+                "is_on_topic": True,
                 "verified": is_verified
             })
 
-            # Keep status according to numeric rules (CITED) or OFF_TOPIC
+            # Keep status according to numeric rules (CITED)
             self.claim_repo.update_verification(
                 claim_id=claim["claim_id"],
                 verification=current_verif,
-                status=claim_status
+                status=claim.get("status", "CITED")
             )
             updated = self.claim_repo.get_by_id(claim["claim_id"])
             if updated:

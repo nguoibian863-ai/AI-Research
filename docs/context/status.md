@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết đồng bộ Chunker/Extractor limit, đo lường NLI Calibration 20 cặp và bổ sung Off-Topic Claim Guardrail.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau khi hoàn thành đo lường Standalone LLM NLI 30 cặp (FP 0.0%), tối ưu Off-Topic Guardrail trước NLI và đếm khoảng trắng chunker.
 
 ## Tiến độ
 
@@ -9,37 +9,35 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | NLI Verifier đạt 90.0% accuracy trên 20 cặp calibration (0.0% FP trên negatives); bổ sung Off-Topic Claim Guardrail; đồng bộ chunk limit <= 1800 chars. Còn: writer theo section, UI đầy đủ |
+| 4 — Verification + UI | 🟢 đang thực hiện | Standalone LLM đạt 0.0% FP và bắt 9/9 CONTRADICTED trên 30 cặp calibration; Off-Topic chặn trước NLI + hỗ trợ đại từ; Chunker đếm khoảng trắng; Session Viewer có màu OFF_TOPIC. Còn: writer theo section, UI hoàn chỉnh |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: **132 passed, 0 skipped** (130 unit tests + 2 calibration/live tests).
+Test: **134 passed, 0 skipped** (132 unit tests + 2 calibration/live tests).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 
-## Đã giải quyết (Chunker Limit, NLI Calibration & Off-Topic Claim Guardrail)
+## Đã giải quyết (Standalone LLM Benchmark 30 cặp, Pronoun Off-Topic & Chunker Precision)
 
-- **Đồng bộ giới hạn Chunker & Extractor (loại bỏ cắt thô bạo tail chunk)**:
-  - `SectionAwareChunker` trong `backend/parsing/chunker.py` bổ sung tham số `max_chunk_chars: int = 1800` (đồng thời giảm `max_chunk_tokens: int = 350`), kiểm soát độ dài ký tự và token ngay tại các ranh giới tự nhiên (khối câu / đoạn văn).
-  - Loại bỏ hoàn toàn lệnh cắt đuôi cưỡng bức `c_text = c_text[:1800]` trong `EvidenceExtractor` (chỉ giữ log cảnh báo nếu chunk vượt giới hạn), ngăn chặn việc mất 9% nội dung kết luận/số liệu ở cuối chunk.
-  - Cập nhật `EXTRACTOR_PROMPT_VERSION = "v1.3"` và chỉ dẫn trích xuất "1 to 3 key atomic facts".
-  - Bổ sung unit tests trong `tests/test_parsing.py` và `tests/test_evidence.py`.
-- **Hiệu chuẩn NLI Verifier (NLI Calibration) với 20 cặp ground truth**:
-  - Tạo bộ fixture `tests/fixtures/nli_calibration.jsonl` gồm 20 cặp câu khẳng định - bằng chứng trích xuất từ dữ liệu thực tế (8 SUPPORTED, 6 NOT_SUPPORTED, 6 CONTRADICTED).
-  - Tạo script đánh giá `scripts/calibrate_nli.py` và test case `@pytest.mark.slow` trong `tests/test_nli_calibration.py`.
-  - Kết quả chạy trực tiếp với model SmolLM3:
-    - **False Positive SUPPORTED rate on negatives**: **0/12 (0.0%)** (yêu cầu `< 20%`).
-    - **Label SUPPORTED**: **8/8 (100.0%)**.
-    - **Label CONTRADICTED**: **6/6 (100.0%)**.
-    - **Label NOT_SUPPORTED**: **4/6 (66.7%)** (2 ca chuyển sang CONTRADICTED, an toàn tuyệt đối vì không bị false positive).
-    - **Overall Accuracy**: **90.0% (18/20)**.
-- **Guardrail chống claim ngoài luồng (Off-Topic Claim Guardrail)**:
-  - Một claim trích dẫn hợp lệ chỉ được tính vào `supported_claims_count` khi câu văn đề cập trực tiếp đến ít nhất một thực thể cốt lõi của đề tài (`goal_core_entities`).
-  - Nếu claim chỉ nói về thực thể khác (ví dụ YOLOv10 khi đề tài là YOLOv8 vs RT-DETR), claim được gán trạng thái `status="OFF_TOPIC"` và `verified: False`, không được tính vào `supported_claims_count`.
-  - Nếu báo cáo chỉ toàn claim ngoài luồng, phiên nghiên cứu chuyển trạng thái `PARTIAL` với lý do minh bạch: `"Report claims do not address the research goal entities (off-topic)"`.
-  - Bổ sung unit test `test_off_topic_claim_guardrail_marks_off_topic_and_session_partial` trong `tests/test_engine.py`.
-- **Báo cáo chi tiết phiên `sess_2137844bb549`**:
-  - Đã xuất và phân tích toàn văn report, evidence và 5 claims của phiên: giải thích rõ tại sao phiên dừng ở `PARTIAL` (thiếu evidence cho `yolov8, rt-detr`, có claim UNSUPPORTED, và 4 claim CITED thực tế nói về YOLOv10).
+- **Đo lường độc lập Standalone LLM (`scripts/calibrate_nli.py`) trên 30 cặp benchmark**:
+  - Tách bạch đo lường riêng `LLMNLIVerifier` (bỏ qua bộ luật) và bảng tổng hợp `CompositeNLIVerifier`.
+  - Sửa nhãn cặp #14 thành `CONTRADICTED` (phủ định trực tiếp câu khẳng định).
+  - Bổ sung 10 cặp kiểm thử thực tế (#21–#30): số của model khác (YOLOv10 vs YOLOv8), đúng số nhưng sai dataset (nuScenes vs Waymo, COCO vs VOC), đúng số sai biến thể (R50 vs R101), tổng hợp hai quote, suy diễn quá đà từ session thật.
+  - **Kết quả Standalone LLM (SmolLM3)**:
+    - **False Positive SUPPORTED rate on negatives**: **0/20 (0.0%)** (vượt chuẩn `< 20%`).
+    - **CONTRADICTED recall**: **9/9 (100.0%)** (bắt trọn 100% các ca mâu thuẫn).
+    - **Label SUPPORTED**: **10/10 (100.0%)**.
+    - **Label NOT_SUPPORTED**: **6/11 (54.5%)** (5 ca còn lại model xếp thành CONTRADICTED, an toàn tuyệt đối vì không bị false positive).
+    - **Overall Accuracy**: **83.3% (25/30)**.
+  - **Kết quả Composite System**: Routing: 10/30 (33.3%) xử lý bằng luật CPU (0 token), 20/30 (66.7%) xử lý bằng LLM; FP rate = 0.0%, Accuracy = 83.3%.
+- **Chặn claim lạc đề TRƯỚC NLI & xử lý đại từ qua evidence subject**:
+  - Chuyển `is_on_topic` lên trước khi gọi NLI trong cả `run_basic_answer` và `verify_session_claims`. Claim lạc đề không tiêu tốn lượt gọi hay token của LLM.
+  - Xét thêm `subject` của các evidence được trích dẫn: claim dùng đại từ như `"It achieves 53.9% AP [E1]"` được nhận diện ON_TOPIC chính xác và được NLI xác thực bình thường.
+- **Tính khoảng trắng nối chunk và truyền cấu hình giới hạn**:
+  - Truyền `max_chunk_chars=self.limits.max_chunk_chars` khi Engine khởi tạo `SectionAwareChunker`.
+  - Tính cả khoảng trắng/dòng trống nối giữa các khối và câu (`potential_chars = b['char_end'] - curr_blocks[0]['char_start']`), triệt tiêu hoàn toàn hiện tượng chunk vượt quá 1800 ký tự.
+- **Màu badge OFF_TOPIC trên Session Viewer**:
+  - Bổ sung class `.OFF_TOPIC { color: var(--offtopic); }` trong `backend/ui/index.html` với màu tím/violet nổi bật riêng biệt.
 
 ## Đã giải quyết (Plan 12.5 & 43.1)
 

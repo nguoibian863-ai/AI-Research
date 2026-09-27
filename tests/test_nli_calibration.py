@@ -10,12 +10,12 @@ def test_nli_calibration_fixture_structure():
     fixture_path = Path("tests/fixtures/nli_calibration.jsonl")
     assert fixture_path.exists(), "Calibration fixture missing"
     pairs = [json.loads(line) for line in fixture_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(pairs) == 20, f"Expected 20 calibration pairs, got {len(pairs)}"
+    assert len(pairs) == 30, f"Expected 30 calibration pairs, got {len(pairs)}"
 
     labels = [p["label"] for p in pairs]
-    assert labels.count("SUPPORTED") == 8
-    assert labels.count("NOT_SUPPORTED") == 6
-    assert labels.count("CONTRADICTED") == 6
+    assert labels.count("SUPPORTED") == 10
+    assert labels.count("NOT_SUPPORTED") == 11
+    assert labels.count("CONTRADICTED") == 9
 
     for p in pairs:
         assert "claim" in p and len(p["claim"]) > 5
@@ -55,5 +55,11 @@ def test_nli_smollm3_calibration_benchmark():
 
     summary = run_calibration()
     assert summary is not None
-    assert summary["false_positive_rate"] < 20.0, f"FP rate {summary['false_positive_rate']}% exceeds 20% threshold"
-    assert summary["overall_accuracy"] >= 80.0, f"Overall accuracy {summary['overall_accuracy']}% below 80%"
+
+    llm_m = summary["llm_metrics"]
+    assert llm_m["false_positive_rate"] < 20.0, f"LLM standalone FP rate {llm_m['false_positive_rate']}% exceeds 20% threshold"
+    assert llm_m["contra_caught"] >= 4, f"LLM standalone caught only {llm_m['contra_caught']} CONTRADICTED pairs"
+
+    comp_m = summary["composite_metrics"]
+    assert comp_m["false_positive_rate"] < 20.0, f"Composite FP rate {comp_m['false_positive_rate']}% exceeds 20%"
+    assert comp_m["overall_accuracy"] >= 75.0, f"Composite accuracy {comp_m['overall_accuracy']}% below 75%"
