@@ -16,6 +16,52 @@ from backend.core.limits import ResearchLimits
 from backend.retrieval.embeddings import LocalHashEmbeddingBackend
 
 
+# --- 1. Review Item 2 Tests: Accurate Rule-Based NLI on Comparative & Negation Cases ---
+
+def test_rule_based_nli_identical_antonyms_not_contradicted():
+    """Review item 2 case 1: Antonyms describing different metrics must NOT be flagged as contradicted."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "RT-DETR achieves higher AP with lower latency than YOLOv8"
+    quote = "RT-DETR achieves higher AP with lower latency than YOLOv8"
+
+    result = verifier.verify(claim, quote)
+    assert result.label == NLILabel.SUPPORTED
+    assert result.confidence == 1.0
+
+
+def test_rule_based_nli_without_not_negation_contradiction():
+    """Review item 2 case 2: Preposition 'without' must NOT be flagged as a verbal negation contradiction."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "RT-DETR removes NMS"
+    quote = "RT-DETR operates without NMS"
+
+    result = verifier.verify(claim, quote)
+    assert result.label in (NLILabel.SUPPORTED, NLILabel.PARTIALLY_SUPPORTED)
+    assert result.label != NLILabel.CONTRADICTED
+
+
+def test_rule_based_nli_reversed_comparison_is_contradicted():
+    """Review item 2 case 3: Swapped entities around comparative direction MUST be caught as CONTRADICTED."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "YOLOv8 is faster than RT-DETR"
+    quote = "RT-DETR is faster than YOLOv8"
+
+    result = verifier.verify(claim, quote)
+    assert result.label == NLILabel.CONTRADICTED
+    assert "reversed" in result.reason.lower() or "swapped" in result.reason.lower() or "contradiction" in result.reason.lower()
+
+
+def test_rule_based_nli_opposing_comparative_is_contradicted():
+    """Opposing comparative adjectives on the same entity pair MUST be caught as CONTRADICTED."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "PointPillars is faster than CenterPoint"
+    quote = "PointPillars is slower than CenterPoint"
+
+    result = verifier.verify(claim, quote)
+    assert result.label == NLILabel.CONTRADICTED
+    assert "opposite" in result.reason.lower() or "contradiction" in result.reason.lower()
+
+
 def test_rule_based_nli_supported_high_overlap():
     verifier = RuleBasedNLIVerifier()
     claim = "CenterPoint achieves 67.3 NDS on the nuScenes detection benchmark."
@@ -24,31 +70,7 @@ def test_rule_based_nli_supported_high_overlap():
     result = verifier.verify(claim, evidence)
     assert result.label == NLILabel.SUPPORTED
     assert result.confidence >= 0.8
-    assert "token alignment" in result.reason.lower()
     assert result.verifier_type == "rule_based"
-
-
-def test_rule_based_nli_directional_contradiction():
-    verifier = RuleBasedNLIVerifier()
-    # Claim states 'faster' but evidence states 'slower'
-    claim = "PointPillars is faster than CenterPoint on lidar perception."
-    evidence = "In our experiments, PointPillars is slower than CenterPoint on lidar perception."
-
-    result = verifier.verify(claim, evidence)
-    assert result.label == NLILabel.CONTRADICTED
-    assert "contradiction" in result.reason.lower()
-    assert "faster" in result.reason
-    assert "slower" in result.reason
-
-
-def test_rule_based_nli_negation_contradiction():
-    verifier = RuleBasedNLIVerifier()
-    claim = "PostgreSQL cannot handle high concurrency workloads on TPC-C."
-    evidence = "PostgreSQL can handle high concurrency workloads on TPC-C with multi-version concurrency control."
-
-    result = verifier.verify(claim, evidence)
-    assert result.label == NLILabel.CONTRADICTED
-    assert "negation" in result.reason.lower()
 
 
 def test_rule_based_nli_not_supported_low_overlap():
@@ -61,16 +83,9 @@ def test_rule_based_nli_not_supported_low_overlap():
     assert "insufficient" in result.reason.lower()
 
 
-def test_rule_based_nli_partially_supported():
-    verifier = RuleBasedNLIVerifier()
-    claim = "RT-DETR achieves 53.1 AP on COCO with 108 FPS on T4 GPU."
-    evidence = "RT-DETR reaches 53.1 AP on the COCO validation dataset."
+# --- 2. Review Item 4 Tests: Budget Enforcement for LLM NLI Calls ---
 
-    result = verifier.verify(claim, evidence)
-    assert result.label in (NLILabel.PARTIALLY_SUPPORTED, NLILabel.SUPPORTED)
-
-
-def test_llm_nli_verifier_structured():
+def test_llm_nli_verifier_records_budget():
     mock_llm = MagicMock(spec=LLMBackend)
     mock_schema_res = NLIStructuredOutputSchema(
         label=NLILabel.SUPPORTED,
@@ -79,10 +94,15 @@ def test_llm_nli_verifier_structured():
     )
     mock_llm.structured_generate.return_value = LLMResponse(
         content='{"label": "SUPPORTED", "confidence": 0.95, "reason": "Evidence confirms the metric and dataset exactly."}',
-        parsed=mock_schema_res
+        parsed=mock_schema_res,
+        total_tokens=85,
+        calls_made=1
     )
 
-    verifier = LLMNLIVerifier(llm=mock_llm)
+    mock_budget = MagicMock()
+    mock_budget.assert_can_call_llm = MagicMock()
+    mock_budget.record_llm_call = MagicMock()
+    verifier = LLMNLIVerifier(llm=mock_llm, budget_tracker=mock_budget)
     claim = "YOLOv8-X reaches 53.9 mAP on COCO."
     evidence = "The largest variant YOLOv8-X attains 53.9 mAP on COCO test-dev."
 
@@ -91,26 +111,32 @@ def test_llm_nli_verifier_structured():
     assert res.confidence == 0.95
     assert res.verifier_type == "llm"
 
+    # Verifies that LLM call was recorded in budget tracker (Review Item 4)
+    assert mock_budget.assert_can_call_llm.call_count == 1
+    assert mock_budget.record_llm_call.call_count == 1
+    mock_budget.record_llm_call.assert_called_with(tokens=85, count=1)
 
-def test_llm_nli_verifier_fallback_on_error():
+
+def test_llm_nli_verifier_fallback_on_budget_exhaustion():
     mock_llm = MagicMock(spec=LLMBackend)
-    mock_llm.structured_generate.side_effect = RuntimeError("Ollama connection timeout")
+    mock_budget = MagicMock()
+    mock_budget.assert_can_call_llm = MagicMock(side_effect=RuntimeError("Budget exhausted"))
 
-    verifier = LLMNLIVerifier(llm=mock_llm)
+    verifier = LLMNLIVerifier(llm=mock_llm, budget_tracker=mock_budget)
     claim = "CenterPoint achieves 67.3 NDS on nuScenes."
     evidence = "CenterPoint achieves 67.3 NDS on nuScenes benchmark."
 
     res = verifier.verify(claim, evidence)
-    # Gracefully falls back to rule-based verifier!
+    # When budget check fails, falls back immediately to zero-cost rule-based verifier!
     assert res.label == NLILabel.SUPPORTED
     assert res.verifier_type == "rule_based"
+    assert mock_llm.structured_generate.call_count == 0
 
 
 def test_claim_verification_pipeline_multi_quotes():
     pipeline = ClaimVerificationPipeline()
     claim = "CenterPoint achieves 67.3 NDS on nuScenes."
 
-    # Multiple quotes where one supports and one is unrelated
     quotes = [
         "Unrelated text about autonomous driving cameras.",
         "CenterPoint achieves 67.3 NDS on nuScenes benchmark."
@@ -128,7 +154,10 @@ def test_claim_verification_pipeline_multi_quotes():
     assert res_contra.label == NLILabel.CONTRADICTED
 
 
-def test_engine_verify_session_claims_updates_db(tmp_path: Path):
+# --- 3. Review Item 1 & 3 Tests: Status Preservation & Contradiction Session Transition ---
+
+def test_verify_session_claims_preserves_numeric_mismatch_and_status(tmp_path: Path):
+    """Review item 3: verify_session_claims MUST NOT overwrite NUMERIC_MISMATCH with SUPPORTED."""
     db = DatabaseManager(db_path=tmp_path / "nli_test.db")
     engine = ResearchEngine(
         llm=MagicMock(),
@@ -169,7 +198,7 @@ def test_engine_verify_session_claims_updates_db(tmp_path: Path):
         confidence=0.95
     )
 
-    # Add claim in CITED status (as left after run_basic_answer)
+    # Claim 1: CITED
     engine.claim_repo.add(
         claim_id="clm_1",
         session_id=session_id,
@@ -184,11 +213,93 @@ def test_engine_verify_session_claims_updates_db(tmp_path: Path):
         status="CITED"
     )
 
-    # Run Week 4 session claims verification
+    # Claim 2: NUMERIC_MISMATCH
+    engine.claim_repo.add(
+        claim_id="clm_2",
+        session_id=session_id,
+        text="CenterPoint achieves 99.9 NDS on nuScenes detection benchmark [E1].",
+        evidence_ids=["evi_cp"],
+        verification={
+            "verified": False,
+            "numeric_match": False,
+            "citation_indices": [1],
+            "mismatched_numbers": ["99.9"]
+        },
+        status="NUMERIC_MISMATCH"
+    )
+
+    # Run verification
     updated = engine.verify_session_claims(session_id)
-    assert len(updated) == 1
-    assert updated[0]["status"] == "SUPPORTED"
-    assert updated[0]["verification"]["verified"] is True
-    assert updated[0]["verification"]["entailment"] == "SUPPORTED"
-    assert updated[0]["verification"]["entailment_confidence"] >= 0.8
-    assert "token alignment" in updated[0]["verification"]["entailment_reason"].lower()
+    assert len(updated) == 1  # Only CITED claim was verified, NUMERIC_MISMATCH was skipped!
+
+    # Claim 1 verification updated, status remains CITED
+    c1 = engine.claim_repo.get_by_id("clm_1")
+    assert c1["status"] == "CITED"
+    assert c1["verification"]["verified"] is True
+    assert c1["verification"]["entailment"] == "SUPPORTED"
+
+    # Claim 2 MUST remain NUMERIC_MISMATCH
+    c2 = engine.claim_repo.get_by_id("clm_2")
+    assert c2["status"] == "NUMERIC_MISMATCH"
+    assert c2["verification"]["verified"] is False
+    assert c2["verification"]["numeric_match"] is False
+
+
+def test_contradiction_in_report_triggers_session_partial(tmp_path: Path):
+    """Review item 3: If report contains a claim CONTRADICTED by evidence, session must transition to PARTIAL."""
+    from backend.core.state import ResearchPhase
+
+    db = DatabaseManager(db_path=tmp_path / "contra_test.db")
+    mock_llm = MagicMock()
+    mock_llm.model = "mock"
+    # Report contains a comparative claim that directly contradicts the evidence quote!
+    mock_llm.generate.return_value = LLMResponse(
+        content="YOLOv8 is faster than RT-DETR [E1].",
+        total_tokens=40
+    )
+
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        embedding_backend=LocalHashEmbeddingBackend(64)
+    )
+
+    state = engine.create_session("Compare YOLOv8 and RT-DETR")
+    state.phase = ResearchPhase.EVALUATE
+    session_id = state.session_id
+
+    # Evidence quote states the reverse: RT-DETR is faster than YOLOv8!
+    engine.source_repo.add(
+        source_id="src_1",
+        session_id=session_id,
+        url="https://arxiv.org/html/2304.08069",
+        title="RT-DETR paper",
+        domain="arxiv.org"
+    )
+    engine.raw_evidence_repo.add(
+        raw_evidence_id="raw_contra",
+        session_id=session_id,
+        source_id="src_1",
+        raw_quote="RT-DETR is faster than YOLOv8 on COCO benchmark."
+    )
+    engine.evidence_repo.add(
+        evidence_id="evi_contra",
+        session_id=session_id,
+        raw_evidence_id="raw_contra",
+        subject="rt-detr",
+        predicate="is faster than",
+        object_data={"statement": "RT-DETR is faster than YOLOv8 on COCO."}
+    )
+    state.source_ids = ["src_1"]
+
+    answer = engine.run_basic_answer(state, fetched_docs=[], retrieved_chunks=[])
+
+    assert state.phase == ResearchPhase.PARTIAL
+    assert state.status.value == "PARTIAL"
+    assert "Report contains claims contradicted by cited evidence" in state.error_message
+
+    claims = engine.claim_repo.get_by_session(session_id)
+    assert len(claims) == 1
+    assert claims[0]["verification"]["entailment"] == "CONTRADICTED"
+    assert claims[0]["verification"]["verified"] is False

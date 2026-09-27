@@ -132,6 +132,12 @@ class ResearchEngine:
         if hasattr(self, "evidence_extractor") and self.evidence_extractor is not None:
             self.evidence_extractor.llm = val
 
+    def _get_model_source(self) -> str:
+        model = getattr(self.llm, "model", None)
+        if isinstance(model, str) and model:
+            return model
+        return "mock"
+
     @staticmethod
     def _goal_subject_entities(goal: str) -> List[str]:
         """Core entities of the goal that are compared subjects (datasets/benchmarks/context excluded)."""
@@ -376,7 +382,7 @@ class ResearchEngine:
                 trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
                 session_id=state.session_id,
                 task_type="planning",
-                model_source=getattr(self.llm, "model", "mock"),
+                model_source=self._get_model_source(),
                 payload={"goal": state.goal, "plan": state.plan.model_dump()},
                 partition="raw"
             )
@@ -504,7 +510,7 @@ class ResearchEngine:
                 trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
                 session_id=state.session_id,
                 task_type="query_generation",
-                model_source=getattr(self.llm, "model", "mock"),
+                model_source=self._get_model_source(),
                 payload={
                     "goal": state.goal,
                     "plan": state.plan.model_dump() if state.plan else None,
@@ -515,7 +521,7 @@ class ResearchEngine:
                     "total_sources": len(state.source_ids),
                     "metadata": {
                         "task_type": "query_generation",
-                        "model_source": getattr(self.llm, "model", "mock"),
+                        "model_source": self._get_model_source(),
                         "query_origin": query_origin,
                         "verified": False,
                         "quality_score": min(1.0, len(found_urls) / max(1, len(queries_to_run))),
@@ -1063,6 +1069,7 @@ class ResearchEngine:
             supported_claims_count = 0
             numeric_mismatch_claims_count = 0
             uncited_numeric_claims_count = 0
+            contradicted_claims_count = 0
 
             if evidence_items:
                 augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(raw_report, evidence_items)
@@ -1129,15 +1136,32 @@ class ResearchEngine:
                             )
                             numeric_mismatch_claims_count += 1
                         else:
-                            # Cited and numerically consistent; entailment check is pending (plan 23/24)
+                            # Cited and numerically consistent -> Plan 23 NLI Entailment Verification
+                            quotes_for_nli = [
+                                ev.get("exact_quote") or ev.get("raw_quote") or "" for ev in cited_evs
+                                if (ev.get("exact_quote") or ev.get("raw_quote"))
+                            ]
+                            nli_res = self.claim_verification_pipeline.verify_claim_against_quotes(
+                                sent, quotes_for_nli, budget_tracker=budget
+                            )
+
+                            is_verified = (nli_res.label == NLILabel.SUPPORTED)
+                            if nli_res.label == NLILabel.CONTRADICTED:
+                                contradicted_claims_count += 1
+
+                            supported_claims_count += 1
+
                             self.claim_repo.add(
                                 claim_id=claim_id,
                                 session_id=state.session_id,
                                 text=sent,
                                 evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
                                 verification={
-                                    "verified": False,
-                                    "entailment": "PENDING",
+                                    "verified": is_verified,
+                                    "entailment": nli_res.label.value,
+                                    "entailment_confidence": nli_res.confidence,
+                                    "entailment_reason": nli_res.reason,
+                                    "verifier_type": nli_res.verifier_type,
                                     "numeric_match": True,
                                     "citation_indices": valid_cites_in_sent,
                                     "citation_index": valid_cites_in_sent[0],
@@ -1146,7 +1170,6 @@ class ResearchEngine:
                                 },
                                 status="CITED"
                             )
-                            supported_claims_count += 1
                     elif substantive_numbers:
                         # Sentence contains substantive metrics/numbers but has NO citation!
                         claim_id = f"clm_{uuid.uuid4().hex[:8]}"
@@ -1198,6 +1221,7 @@ class ResearchEngine:
                 and len(evidence_items) > 0
                 and supported_claims_count > 0
                 and total_unsupported_numeric == 0
+                and contradicted_claims_count == 0
             )
 
             # Record transparent reasons if transitioning to PARTIAL
@@ -1213,6 +1237,8 @@ class ResearchEngine:
                     partial_reasons.append("Report contains numeric claims mismatched with cited evidence")
                 if uncited_numeric_claims_count > 0:
                     partial_reasons.append("Report contains unsupported numeric claims without citations")
+                if contradicted_claims_count > 0:
+                    partial_reasons.append("Report contains claims contradicted by cited evidence")
                 if is_insufficient:
                     partial_reasons.append("Insufficient information in gathered context")
 
@@ -1243,7 +1269,7 @@ class ResearchEngine:
                 trajectory_id=f"traj_{uuid.uuid4().hex[:12]}",
                 session_id=state.session_id,
                 task_type="answer_synthesis",
-                model_source=getattr(self.llm, "model", "mock"),
+                model_source=self._get_model_source(),
                 payload={"goal": state.goal, "answer": answer, "sources_count": len(state.source_ids)},
                 verified=False,
                 quality_score=0.0,
@@ -1256,17 +1282,22 @@ class ResearchEngine:
             self._handle_phase_error(state, e, "WRITE")
             raise
 
-    def verify_session_claims(self, session_id: str) -> List[Dict[str, Any]]:
+    def verify_session_claims(self, session_id: str, budget_tracker: Optional[ExecutionBudgetTracker] = None) -> List[Dict[str, Any]]:
         """
         Week 4 Plan 23: Entailment Verification across all claims in a session.
         Takes claims currently in CITED status, checks semantic entailment against cited evidence quotes,
         and updates claim records with verified status, entailment label, confidence, and reason.
+        Never overwrites NUMERIC_MISMATCH or UNSUPPORTED claims. Status is kept per numeric rules.
         """
         claims = self.claim_repo.get_by_session(session_id)
         evidence_map = {e["evidence_id"]: e for e in self.evidence_repo.get_full_evidence_by_session(session_id)}
         updated_claims = []
 
         for claim in claims:
+            # DO NOT touch NUMERIC_MISMATCH or UNSUPPORTED claims! (Review item 3)
+            if claim.get("status") in ("NUMERIC_MISMATCH", "UNSUPPORTED"):
+                continue
+
             ev_ids = claim.get("evidence_ids") or []
             if not ev_ids:
                 continue
@@ -1282,7 +1313,9 @@ class ResearchEngine:
             if not quotes:
                 continue
 
-            res = self.claim_verification_pipeline.verify_claim_against_quotes(claim["text"], quotes)
+            res = self.claim_verification_pipeline.verify_claim_against_quotes(
+                claim["text"], quotes, budget_tracker=budget_tracker
+            )
 
             current_verif = claim.get("verification") or {}
             numeric_match = current_verif.get("numeric_match", True)
@@ -1295,11 +1328,11 @@ class ResearchEngine:
                 "verified": is_verified
             })
 
-            new_status = res.label.value
+            # Keep status according to numeric rules (CITED), do not overwrite with NLI label!
             self.claim_repo.update_verification(
                 claim_id=claim["claim_id"],
                 verification=current_verif,
-                status=new_status
+                status=claim.get("status", "CITED")
             )
             updated = self.claim_repo.get_by_id(claim["claim_id"])
             if updated:

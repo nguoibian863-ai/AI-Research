@@ -31,9 +31,9 @@
   .session .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
            border: 1px solid currentColor; }
-  .DONE, .COMPLETED, .CITED { color: var(--done); }
-  .PARTIAL, .NUMERIC_MISMATCH, .UNSUPPORTED { color: var(--partial); }
-  .FAILED, .CANCELLED { color: var(--failed); }
+  .DONE, .COMPLETED, .CITED, .SUPPORTED { color: var(--done); }
+  .PARTIAL, .PARTIALLY_SUPPORTED, .NUMERIC_MISMATCH, .UNSUPPORTED, .NOT_SUPPORTED { color: var(--partial); }
+  .FAILED, .CANCELLED, .CONTRADICTED { color: var(--failed); }
   h2 { font-size: 20px; margin: 0 0 6px; }
   h3 { font-size: 15px; margin: 24px 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
   .reason { color: var(--partial); margin: 6px 0; }
@@ -197,9 +197,13 @@ function renderSession(d) {
   if (!claims.length) out.push(el("div", { className: "muted", text: "Không có claim." }));
   for (const c of claims) {
     const v = c.verification || {};
-    const note = v.reason || (v.mismatched_numbers ? "Số không khớp: " + v.mismatched_numbers.join(", ") : "");
+    const note = v.entailment_reason || v.reason || (v.mismatched_numbers ? "Số không khớp: " + v.mismatched_numbers.join(", ") : "");
+    const entailBadge = v.entailment && v.entailment !== "PENDING" && v.entailment !== c.status ? badge(v.entailment) : null;
     out.push(el("div", { className: "card" },
-      badge(c.status), el("span", { text: " " + (c.text || "") }),
+      badge(c.status),
+      entailBadge ? el("span", { text: " " }) : null,
+      entailBadge,
+      el("span", { text: " " + (c.text || "") }),
       note ? el("div", { className: "muted", text: note }) : null
     ));
   }

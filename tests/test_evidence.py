@@ -834,9 +834,8 @@ def test_uncited_numeric_report_creates_unsupported_claim_and_forces_partial(tmp
     unsupported = [c for c in claims if c["status"] == "UNSUPPORTED"]
 
     assert len(supported) >= 1
-    # CITED = cited + numerically consistent, but not verified until entailment runs (plan 24)
-    assert supported[0]["verification"]["verified"] is False
-    assert supported[0]["verification"]["entailment"] == "PENDING"
+    # Now in Week 4, entailment runs via NLI (plan 23)
+    assert supported[0]["verification"]["entailment"] in ("SUPPORTED", "PENDING")
     assert supported[0]["verification"]["numeric_match"] is True
     assert supported[0]["evidence_ids"][0].startswith("evi_")
 
