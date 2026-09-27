@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.llm.ollama import OllamaBackend
-from backend.verification.nli import LLMNLIVerifier, RuleBasedNLIVerifier
+from backend.verification.nli import LLMNLIVerifier, RuleBasedNLIVerifier, NLI_PROMPT_VERSION
 from backend.verification.schemas import NLILabel
 
 
@@ -156,11 +156,47 @@ def run_calibration(
 
     composite_metrics = compute_metrics(composite_results, "COMPOSITE SYSTEM (Rules + LLM)")
 
+    # Save reproducible calibration report to data/eval/nli_calibration_<model>_<version>.json
+    eval_dir = Path("data/eval")
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    import re
+    from datetime import datetime
+    model_safe = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", model_name.split("/")[-1].split(":")[0])
+    version_safe = NLI_PROMPT_VERSION.replace(".", "_")
+    out_file = eval_dir / f"nli_calibration_{model_safe}_{version_safe}.json"
+
+    export_data = {
+        "model": model_name,
+        "nli_prompt_version": NLI_PROMPT_VERSION,
+        "timestamp": datetime.now().isoformat(),
+        "total_pairs": len(pairs),
+        "llm_metrics": llm_metrics,
+        "composite_metrics": composite_metrics,
+        "results": [
+            {
+                "id": p["id"],
+                "category": p.get("category", ""),
+                "expected": p["label"],
+                "llm_got": llm_results[i]["got"],
+                "llm_confidence": llm_results[i]["confidence"],
+                "llm_reason": llm_results[i]["reason"],
+                "llm_matched": llm_results[i]["matched"],
+                "composite_got": composite_results[i]["got"],
+                "composite_verifier_type": composite_results[i]["verifier_type"],
+                "composite_matched": composite_results[i]["matched"]
+            }
+            for i, p in enumerate(pairs)
+        ]
+    }
+    out_file.write_text(json.dumps(export_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\n[Saved Calibration Report] {out_file}", flush=True)
+
     return {
         "llm_results": llm_results,
         "llm_metrics": llm_metrics,
         "composite_results": composite_results,
         "composite_metrics": composite_metrics,
+        "report_file": str(out_file),
         # Backward compatibility fields
         "false_positive_rate": composite_metrics["false_positive_rate"],
         "overall_accuracy": composite_metrics["overall_accuracy"]

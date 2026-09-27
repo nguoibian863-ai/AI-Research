@@ -60,7 +60,20 @@ from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
 from backend.sources.dedup import compute_canonical_key
 from backend.sources.credibility import score_source_credibility
-from backend.verification.nli import BaseNLIVerifier, CompositeNLIVerifier, ClaimVerificationPipeline
+from backend.verification.nli import (
+    BaseNLIVerifier,
+    CompositeNLIVerifier,
+    ClaimVerificationPipeline,
+    NLI_PROMPT_VERSION,
+    ALL_KNOWN_METRICS,
+    HARDWARE_ENV_TERMS,
+    STOPWORDS,
+    LINKING_VERBS,
+    GENERIC_DOMAIN_NOUNS,
+    ALL_COMPARATIVES,
+    CONTEXT_EXCLUDED,
+    strip_citation_markers,
+)
 from backend.verification.schemas import NLILabel
 
 logger = logging.getLogger(__name__)
@@ -148,6 +161,63 @@ class ResearchEngine:
         context = set(DATASET_BENCHMARK_TERMS) | extract_context_entities(goal)
         subjects = [e for e in extract_core_entities(goal) if e not in context]
         return subjects or extract_core_entities(goal)
+
+    @classmethod
+    def _is_claim_on_topic(cls, sent: str, cited_evs: List[Dict[str, Any]], goal_core_entities: Optional[List[str]]) -> bool:
+        """
+        Determines whether a cited claim is on-topic relative to the research goal entities.
+        Rules:
+        1. If the claim text directly mentions any goal entity -> ON_TOPIC.
+        2. If the claim explicitly mentions OTHER model/architecture names (e.g. YOLOv10, YOLOv6) without naming any goal entity -> strictly OFF_TOPIC (even if cited evidence has goal subject!).
+        3. If the claim contains NO other model names (e.g. pronoun 'It achieves...', 'This model reaches...') -> check if cited evidence subject matches a goal entity.
+        """
+        if not goal_core_entities:
+            return True
+
+        # 1. Direct mention in claim text
+        has_goal_entity = any(
+            check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
+            for ent in goal_core_entities
+        )
+        if has_goal_entity:
+            return True
+
+        # 2. Extract model/architecture names from claim
+        sent_clean = strip_citation_markers(sent)
+        non_model = (
+            DATASET_BENCHMARK_TERMS
+            | HARDWARE_ENV_TERMS
+            | ALL_KNOWN_METRICS
+            | STOPWORDS
+            | LINKING_VERBS
+            | GENERIC_DOMAIN_NOUNS
+            | ALL_COMPARATIVES
+            | CONTEXT_EXCLUDED
+            | GENERIC_RESEARCH_TERMS
+            | {
+                "according", "val", "train", "test", "dataset", "datasets",
+                "benchmark", "benchmarks", "paper", "authors", "result", "results"
+            }
+        )
+        claim_models = [
+            e for e in extract_core_entities(sent_clean)
+            if e not in non_model and len(e) > 1 and not e.isdigit() and not re.match(r"^e\d+$", e)
+        ]
+
+        # If claim explicitly names other models without naming any goal entity -> OFF_TOPIC
+        if claim_models:
+            return False
+
+        # 3. Only for pronoun / generic references: check cited evidence subjects
+        for ev in cited_evs:
+            ev_subj = ev.get("subject") or ""
+            if ev_subj and any(
+                check_entity_in_text(ent, ev_subj) or subject_matches_entity(ev_subj, ent)
+                for ent in goal_core_entities
+            ):
+                return True
+
+        return False
 
     def get_session_retriever(self, session_id: str) -> HybridRetriever:
         """Returns or creates an isolated HybridRetriever per session."""
@@ -934,6 +1004,24 @@ class ResearchEngine:
             return "".join(f"[E{n}]" for n in nums) if nums and all(valid(n) for n in nums) else m.group(0)
         report = re.sub(r"\[E\d+(?:\s*[,;]\s*E\d+)+\]", split_group, report)
 
+        # [Evidence 1] / [evidence 1] -> [E1]
+        report = re.sub(
+            r"\[(?:Evidence|evidence)\s*(\d+)\]",
+            lambda m: f"[E{m.group(1)}]" if valid(m.group(1)) else m.group(0),
+            report,
+        )
+        # "According to Evidence 1" / "According to evidence 1" -> "According to [E1]"
+        report = re.sub(
+            r"\b(?:[Aa]ccording to|[Ii]n)\s+(?:Evidence|evidence)\s+(\d+)\b",
+            lambda m: f"According to [E{m.group(1)}]" if valid(m.group(1)) else m.group(0),
+            report,
+        )
+        # "Evidence 1 states" / "evidence 1 reports" -> "[E1] states"
+        report = re.sub(
+            r"\b(?:Evidence|evidence)\s+(\d+)\b",
+            lambda m: f"[E{m.group(1)}]" if valid(m.group(1)) else m.group(0),
+            report,
+        )
         # **E1** / __E1__ / (E1) -> [E1]
         report = re.sub(
             r"(\*\*|__|\()E(\d+)(\*\*|__|\))",
@@ -1038,20 +1126,22 @@ class ResearchEngine:
                 evidence_items = sorted(evidence_items, key=lambda ev: -(ev.get("source_score") or 0.0))
                 evidence_prompt_text = CitationVerifier.format_evidence_for_prompt(evidence_items)
                 prompt = (
-                    f"You are a Research Analyst. Provide a clear, factual, and strictly grounded research answer to the question "
-                    f"based on the verified atomic evidence items below.\n\n"
+                    f"You are a Research Analyst. Provide a clear, factual research answer to the question "
+                    f"based STRICTLY on the verified atomic evidence items below.\n\n"
                     f"Question: {state.goal}\n\n"
                     f"VERIFIED EVIDENCE ITEMS:\n{evidence_prompt_text}\n\n"
+                    f"INSTRUCTIONS:\n"
+                    f"Provide your response in two clear sections:\n"
+                    f"1. Executive Summary: A brief factual summary addressing the question based on the evidence.\n"
+                    f"2. Evidence Findings: A bulleted list where EVERY bullet begins with its citation marker [E1], [E2], etc. "
+                    f"stating the key facts and numbers from that evidence item:\n"
+                    f"   - [E1] (exact fact and numbers from evidence 1)\n"
+                    f"   - [E2] (exact fact and numbers from evidence 2)\n\n"
                     f"CRITICAL CITATION RULES:\n"
-                    f"1. For every substantive claim, metric, or finding, you MUST explicitly cite the supporting evidence using [E1], [E2], etc.\n"
-                    f"2. Example: 'Model A achieves 60.3 mAP [E1], whereas Model B achieves 59.2 mAP [E2].'\n"
-                    f"3. Do NOT make claims that cannot be grounded in the provided evidence.\n"
-                    f"4. Write citations exactly as [E1], [E2] at the END of the sentence. Never write E1, **E1** or (E1), "
-                    f"and never use [E1] as a paragraph label.\n"
-                    f"5. Every sentence that contains a number must end with the [E#] citation of the evidence holding that number, "
-                    f"including summary sentences. Do not repeat numbers in a summary without citing them.\n"
-                    f"6. If the evidence does not cover an entity in the question, say so explicitly.\n\n"
-                    f"Synthesize the key findings, comparisons, and metrics directly addressing the question with strict [E#] citations."
+                    f"- Every bullet in Evidence Findings MUST begin with [E1], [E2], etc.\n"
+                    f"- Do not alter numbers or make ungrounded claims.\n"
+                    f"- If an entity in the question is not covered in the evidence, state so in the summary.\n\n"
+                    f"Synthesize the research answer now:"
                 )
             else:
                 prompt = (
@@ -1088,6 +1178,13 @@ class ResearchEngine:
                 # Claim Lineage: Extract substantive sentences from the report body
                 # Each claim in the claims table MUST originate from a sentence in the report!
                 clean_body = raw_report.split("### Evidence & Provenance Table")[0].strip()
+                # Fold trailing citation lines like "- Source: [E1]" or "Source: [E1]" into preceding statement
+                clean_body = re.sub(
+                    r"\n\s*[-*]?\s*(?:Source|Ref|Reference)s?:\s*(\[E\d+(?:[,\s]+E\d+)*\])",
+                    r" \1",
+                    clean_body,
+                    flags=re.IGNORECASE
+                )
                 report_sentences = [
                     s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", clean_body)
                     if s.strip() and len(s.strip()) >= 10
@@ -1099,8 +1196,9 @@ class ResearchEngine:
                     if trimmed.startswith("#") or trimmed.startswith("---") or trimmed.startswith("|"):
                         continue
                     lower_sent = trimmed.lower()
+                    clean_lower = re.sub(r"^[-*\d.\s]+", "", lower_sent)
                     if (
-                        lower_sent.startswith(("source:", "sources:", "url:", "urls:", "ref:", "reference:", "references:"))
+                        clean_lower.startswith(("source:", "sources:", "url:", "urls:", "ref:", "reference:", "references:", "quote:", "quotes:"))
                         or lower_sent.startswith(("http://", "https://"))
                         or lower_sent.startswith(("**citation", "**source", "**reference"))
                     ):
@@ -1145,23 +1243,11 @@ class ResearchEngine:
                             numeric_mismatch_claims_count += 1
                         else:
                             # Off-topic Claim Guardrail (run BEFORE NLI to preserve LLM budget):
-                            # A claim can only count towards supported_claims_count if either:
-                            # (a) the claim itself mentions a goal entity, OR
-                            # (b) the subject of a cited evidence matches a goal entity (handles pronouns like "It achieves...").
-                            is_on_topic = (
-                                not goal_core_entities
-                                or any(
-                                    check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
-                                    for ent in goal_core_entities
-                                )
-                                or any(
-                                    ev.get("subject") and any(
-                                        check_entity_in_text(ent, ev.get("subject", "")) or subject_matches_entity(ev.get("subject", ""), ent)
-                                        for ent in goal_core_entities
-                                    )
-                                    for ev in cited_evs
-                                )
-                            )
+                            # Stricter rule:
+                            # 1. Direct mention in claim -> ON_TOPIC
+                            # 2. Claim mentions other models without goal models -> OFF_TOPIC (even if evidence belongs to goal!)
+                            # 3. Only pronoun claims use evidence subject.
+                            is_on_topic = self._is_claim_on_topic(sent, cited_evs, goal_core_entities)
 
                             if not is_on_topic:
                                 claim_status = "OFF_TOPIC"
@@ -1169,7 +1255,7 @@ class ResearchEngine:
                                 off_topic_claims_count += 1
                                 cited_claims_count += 1
                                 logger.info(
-                                    f"[{state.session_id}][WRITE] Claim marked OFF_TOPIC (neither claim text nor cited evidence subjects mention goal entities {goal_core_entities}): '{sent[:80]}...'"
+                                    f"[{state.session_id}][WRITE] Claim marked OFF_TOPIC (not on goal entities {goal_core_entities}): '{sent[:80]}...'"
                                 )
                                 self.claim_repo.add(
                                     claim_id=claim_id,
@@ -1181,8 +1267,9 @@ class ResearchEngine:
                                         "is_on_topic": False,
                                         "entailment": NLILabel.NOT_SUPPORTED.value,
                                         "entailment_confidence": 1.0,
-                                        "entailment_reason": "Claim and cited evidence do not address any goal core entity; NLI evaluation skipped to preserve budget",
+                                        "entailment_reason": "Claim does not address any goal core entity; NLI evaluation skipped to preserve budget",
                                         "verifier_type": "guardrail",
+                                        "nli_prompt_version": NLI_PROMPT_VERSION,
                                         "numeric_match": True,
                                         "citation_indices": valid_cites_in_sent,
                                         "citation_index": valid_cites_in_sent[0],
@@ -1224,6 +1311,7 @@ class ResearchEngine:
                                         "entailment_confidence": nli_res.confidence,
                                         "entailment_reason": nli_res.reason,
                                         "verifier_type": nli_res.verifier_type,
+                                        "nli_prompt_version": NLI_PROMPT_VERSION,
                                         "numeric_match": True,
                                         "citation_indices": valid_cites_in_sent,
                                         "citation_index": valid_cites_in_sent[0],
@@ -1392,20 +1480,7 @@ class ResearchEngine:
 
             # Off-topic check (checked BEFORE NLI to preserve LLM budget and handles pronouns via cited evidence subjects)
             cited_ev_items = [evidence_map[eid] for eid in ev_ids if eid in evidence_map]
-            is_on_topic = (
-                not known_entities
-                or any(
-                    check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
-                    for ent in known_entities
-                )
-                or any(
-                    ev.get("subject") and any(
-                        check_entity_in_text(ent, ev.get("subject", "")) or subject_matches_entity(ev.get("subject", ""), ent)
-                        for ent in known_entities
-                    )
-                    for ev in cited_ev_items
-                )
-            )
+            is_on_topic = self._is_claim_on_topic(sent, cited_ev_items, known_entities)
 
             if not is_on_topic:
                 current_verif.update({
@@ -1413,8 +1488,9 @@ class ResearchEngine:
                     "verified": False,
                     "entailment": NLILabel.NOT_SUPPORTED.value,
                     "entailment_confidence": 1.0,
-                    "entailment_reason": "Claim and cited evidence do not address any goal core entity; NLI evaluation skipped to preserve budget",
-                    "verifier_type": "guardrail"
+                    "entailment_reason": "Claim does not address any goal core entity; NLI evaluation skipped to preserve budget",
+                    "verifier_type": "guardrail",
+                    "nli_prompt_version": NLI_PROMPT_VERSION
                 })
                 self.claim_repo.update_verification(
                     claim_id=claim["claim_id"],
@@ -1437,6 +1513,7 @@ class ResearchEngine:
                 "entailment_confidence": res.confidence,
                 "entailment_reason": res.reason,
                 "verifier_type": res.verifier_type,
+                "nli_prompt_version": NLI_PROMPT_VERSION,
                 "is_on_topic": True,
                 "verified": is_verified
             })

@@ -117,9 +117,11 @@ def render_session(db: DatabaseManager, session_id: str) -> str:
         ver_conf = ver.get("entailment_confidence") if ver.get("entailment_confidence") is not None else ver.get("confidence", 0)
         ver_reason = ver.get("entailment_reason") or ver.get("reason")
         ver_type = ver.get("verifier_type", "")
+        ver_prompt_v = ver.get("prompt_version") or ver.get("nli_prompt_version")
         ver_info = ""
         if ver_label:
-            ver_info = f" [NLI: {ver_label} ({ver_conf:.2f}) by {ver_type}]"
+            v_tag = f" {ver_prompt_v}" if ver_prompt_v else ""
+            ver_info = f" [NLI: {ver_label} ({ver_conf:.2f}) by {ver_type}{v_tag}]"
         out.append(f"- **{c['status']}**{ver_info}: {short(c.get('text'), 160)}")
         if ver_reason:
             out.append(f"  > Lý do NLI: {ver_reason}")

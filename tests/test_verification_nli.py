@@ -734,3 +734,51 @@ def test_entities_match_different_model_variants_distinct():
     assert res.label != NLILabel.CONTRADICTED
 
 
+def test_llm_nli_downgrades_falsely_attributed_contradictions_to_not_supported():
+    """
+    Verifies that when LLM emits CONTRADICTED on entity/dataset/variant mismatches,
+    the guardrail downgrades them to NOT_SUPPORTED (not CONTRADICTED).
+    Also confirms genuine contradictions remain CONTRADICTED.
+    """
+    from backend.llm.mock import MockLLMBackend
+    from backend.verification.nli import LLMNLIVerifier, NLI_PROMPT_VERSION
+
+    canned = {
+        "NLIStructuredOutputSchema": {
+            "label": "CONTRADICTED",
+            "confidence": 0.90,
+            "reason": "Evidence contradicts the model or dataset."
+        }
+    }
+    mock_llm = MockLLMBackend(canned)
+    verifier = LLMNLIVerifier(llm=mock_llm)
+
+    # 1. Different model attribution (Pair #21)
+    c1 = "YOLOv8-X achieves 52.5 AP with 29.5M parameters on COCO val2017."
+    e1 = "YOLOv10-X achieves 52.5 AP with 29.5M parameters on COCO val2017."
+    res1 = verifier.verify(c1, e1)
+    assert res1.label == NLILabel.NOT_SUPPORTED
+    assert "mismatch" in res1.reason.lower()
+    assert res1.prompt_version == NLI_PROMPT_VERSION
+
+    # 2. Dataset mismatch (Pair #23)
+    c2 = "CenterPoint achieves 67.3 NDS on the Waymo Open Dataset."
+    e2 = "CenterPoint achieves 67.3 NDS on the nuScenes 3D detection benchmark."
+    res2 = verifier.verify(c2, e2)
+    assert res2.label == NLILabel.NOT_SUPPORTED
+    assert "mismatch" in res2.reason.lower()
+
+    # 3. Model variant mismatch (Pair #26)
+    c3 = "RT-DETR-L achieves 53.1% AP with an execution time of 9.2 ms."
+    e3 = "RT-DETR-R50 achieves 53.1% AP with an execution time of 9.2 ms."
+    res3 = verifier.verify(c3, e3)
+    assert res3.label == NLILabel.NOT_SUPPORTED
+    assert "mismatch" in res3.reason.lower()
+
+    # 4. Genuine contradiction (Pair #15: reversed comparison direction)
+    c4 = "YOLOv8 is faster than RT-DETR."
+    e4 = "RT-DETR is faster than YOLOv8."
+    res4 = verifier.verify(c4, e4)
+    assert res4.label == NLILabel.CONTRADICTED
+
+

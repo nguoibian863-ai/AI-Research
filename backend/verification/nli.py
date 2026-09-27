@@ -8,10 +8,13 @@ from backend.llm.backend import LLMBackend
 from backend.core.coverage import (
     extract_substantive_numbers,
     subject_matches_entity,
+    extract_core_entities,
     DATASET_BENCHMARK_TERMS,
 )
 
 logger = logging.getLogger(__name__)
+
+NLI_PROMPT_VERSION = "v1.1"
 
 STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "with",
@@ -227,6 +230,20 @@ def strip_citation_markers(text: str) -> str:
     t = re.sub(r"\*\*E\d+\*\*", " ", t)
     t = re.sub(r"\(E\d+\)", " ", t)
     return re.sub(r"\s+", " ", t).strip()
+
+
+def clean_claim_for_nli(claim: str) -> str:
+    """Removes citation markers and attribution phrases like 'According to [E1], ' so NLI only evaluates the factual assertion."""
+    t = re.sub(r"^(?:according\s+to|as\s+stated\s+in|as\s+reported\s+in|per|in)\s+\[?E\d+\]?[\s,:]*", "", claim, flags=re.IGNORECASE)
+    t = re.sub(r"^\[?E\d+\]?\s+(?:reports|states|shows|indicates|mentions|demonstrates)\s+that\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\[E\d+\]", "", t)
+    t = re.sub(r"\*\*E\d+\*\*", "", t)
+    t = re.sub(r"\(E\d+\)", "", t)
+    t = re.sub(r"\s+([.,;:!?])", r"\1", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if t and t[0].islower():
+        t = t[0].upper() + t[1:]
+    return t
 
 
 def _normalize_text_for_match(text: str) -> str:
@@ -739,16 +756,17 @@ class LLMNLIVerifier(BaseNLIVerifier):
                     claim, evidence, budget_tracker=tracker, all_quotes=all_quotes, known_entities=known_entities
                 )
 
+        claim_to_check = clean_claim_for_nli(claim) or claim
         prompt = (
             f"You are a strict factual entailment checker.\n"
             f"Determine whether the Evidence text entails, contradicts, partially supports, or does not support the Claim.\n\n"
             f"Evidence: \"{evidence}\"\n"
-            f"Claim: \"{claim}\"\n\n"
+            f"Claim: \"{claim_to_check}\"\n\n"
             f"Classification rules:\n"
-            f"- SUPPORTED: Evidence explicitly confirms and proves the claim.\n"
+            f"- SUPPORTED: Evidence explicitly confirms and proves the claim with matching model, metric, and numbers.\n"
             f"- PARTIALLY_SUPPORTED: Evidence provides some facts but leaves key parts unproven or ambiguous.\n"
-            f"- NOT_SUPPORTED: Evidence does not contain relevant information to judge the claim.\n"
-            f"- CONTRADICTED: Evidence directly refutes or contradicts the claim."
+            f"- NOT_SUPPORTED: Evidence does not contain relevant information to judge the claim, OR mentions a DIFFERENT model/entity, DIFFERENT dataset/benchmark, or DIFFERENT variant (e.g. evidence about Model A does NOT contradict a claim about Model B; attributing numbers to another model or dataset is NOT_SUPPORTED, not CONTRADICTED).\n"
+            f"- CONTRADICTED: Evidence directly discusses the EXACT SAME model/entity and explicitly refutes the claim (e.g. reversed comparison direction, opposite polarity, or conflicting numbers for that exact same entity)."
         )
 
         try:
@@ -763,19 +781,104 @@ class LLMNLIVerifier(BaseNLIVerifier):
                 tracker.record_llm_call(tokens=tokens, count=calls)
 
             parsed: NLIStructuredOutputSchema = res.parsed
+            label = parsed.label
+            confidence = parsed.confidence
+            reason = parsed.reason
+
+            # Guardrail: Distinguish genuine CONTRADICTED from attribution / entity / dataset mismatch
+            if label == NLILabel.CONTRADICTED:
+                is_genuine, conflict_reason = self._is_genuine_contradiction(
+                    claim, evidence, known_entities=known_entities
+                )
+                if not is_genuine:
+                    logger.info(f"[NLI Guardrail] Downgrading LLM CONTRADICTED to NOT_SUPPORTED ({conflict_reason}) for claim: '{claim[:60]}...'")
+                    label = NLILabel.NOT_SUPPORTED
+                    confidence = 0.85
+                    reason = f"Entity/dataset mismatch: {conflict_reason}"
+
             return NLIVerificationResult(
-                label=parsed.label,
-                confidence=parsed.confidence,
-                reason=parsed.reason,
+                label=label,
+                confidence=confidence,
+                reason=reason,
                 verifier_type="llm",
                 claim_text=claim,
-                evidence_quote=evidence
+                evidence_quote=evidence,
+                prompt_version=NLI_PROMPT_VERSION
             )
         except Exception as e:
             logger.warning(f"LLM NLI verification failed ({e}). Falling back to rule-based verifier.")
             return self.fallback.verify(
                 claim, evidence, budget_tracker=tracker, all_quotes=all_quotes, known_entities=known_entities
             )
+
+    def _is_genuine_contradiction(
+        self,
+        claim: str,
+        evidence: str,
+        known_entities: Optional[List[str]] = None
+    ) -> Tuple[bool, str]:
+        """
+        Validates whether an LLM CONTRADICTED verdict represents a genuine semantic/factual conflict
+        or an entity/dataset mismatch that should be downgraded to NOT_SUPPORTED.
+        """
+        c_clean = strip_citation_markers(claim.strip())
+        e_clean = evidence.strip()
+
+        # 1. Rule verifier detected contradiction (reversed comparison, opposite polarity, etc.)
+        rule_res = self.fallback.verify(c_clean, e_clean, known_entities=known_entities)
+        if rule_res.label == NLILabel.CONTRADICTED:
+            return True, rule_res.reason
+
+        # 2. Verbal negation mismatch with matching core entities (e.g. pair #14)
+        c_has_neg = any(re.search(rf"\b{re.escape(neg)}\b", c_clean.lower()) for neg in VERBAL_NEGATIONS)
+        e_has_neg = any(re.search(rf"\b{re.escape(neg)}\b", e_clean.lower()) for neg in VERBAL_NEGATIONS)
+        if c_has_neg != e_has_neg:
+            c_ents = extract_core_entities(c_clean)
+            e_ents = extract_core_entities(e_clean)
+            if any(ce in e_ents or any(_entities_match(ce, ee) for ee in e_ents) for ce in c_ents):
+                return True, "Direct verbal negation conflict on matching entities"
+
+        # 3. Check for Entity / Dataset / Variant mismatch:
+        # If claim asserts facts about an entity, dataset, or variant that is absent from evidence,
+        # the evidence cannot contradict it (e.g. quote about YOLOv10 cannot contradict a claim about YOLOv8).
+        c_ents = [
+            e for e in extract_core_entities(c_clean)
+            if e not in CONTEXT_EXCLUDED and not _is_number_or_unit(e)
+        ]
+        e_ents = [
+            e for e in extract_core_entities(e_clean)
+            if e not in CONTEXT_EXCLUDED and not _is_number_or_unit(e)
+        ]
+
+        if c_ents and e_ents:
+            shared_entity = any(
+                any(_entities_match(ce, ee) for ee in e_ents)
+                for ce in c_ents
+            )
+            if not shared_entity:
+                return False, f"Claim entities {c_ents} not discussed in evidence entities {e_ents}"
+
+        c_datasets = {e for e in extract_core_entities(c_clean) if e in DATASET_BENCHMARK_TERMS}
+        e_datasets = {e for e in extract_core_entities(e_clean) if e in DATASET_BENCHMARK_TERMS}
+        if c_datasets and e_datasets and not (c_datasets & e_datasets):
+            return False, f"Claim references dataset {c_datasets} but evidence references {e_datasets}"
+
+        # 4. Check for conflicting numbers on the same entity and metric (e.g. pair #25)
+        c_nums = extract_substantive_numbers(c_clean)
+        e_nums = extract_substantive_numbers(e_clean)
+        if c_nums and e_nums:
+            c_subj = c_ents[0] if c_ents else None
+            if c_subj and any(_entities_match(c_subj, ee) for ee in e_ents):
+                if not set(c_nums).issubset(set(e_nums)):
+                    return True, f"Conflicting numeric metrics for {c_subj} (claim has {c_nums}, evidence has {e_nums})"
+
+        # 5. Check comparative triples
+        c_triples = extract_comparative_triples(c_clean, known_entities=known_entities)
+        e_triples = extract_comparative_triples(e_clean, known_entities=known_entities)
+        if c_triples and (e_triples or e_ents):
+            return True, "Comparative assertion evaluated against evidence"
+
+        return False, "Evidence does not substantiate a direct contradiction against the claimed entity"
 
 
 class CompositeNLIVerifier(BaseNLIVerifier):

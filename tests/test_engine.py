@@ -519,6 +519,72 @@ def test_off_topic_guardrail_allows_pronoun_when_evidence_subject_matches(tmp_pa
     verif = claim.get("verification") or {}
     assert verif.get("is_on_topic") is True
     assert verif.get("verified") is True
+    assert verif.get("nli_prompt_version") == "v1.1"
+
+
+def test_off_topic_guardrail_rejects_other_model_even_if_evidence_has_goal_subject(tmp_path):
+    """
+    Regression test: Verifies that if a claim explicitly names other models (e.g. YOLOv10 vs YOLOv6)
+    without naming any goal entity, it MUST be marked OFF_TOPIC even if the cited evidence's
+    subject belongs to the goal (e.g. YOLOv8).
+    """
+    canned = {
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence explicitly confirms AP."
+        },
+        "generate": "According to [E1], YOLOv10 is faster than YOLOv6."
+    }
+    mock_llm = MockLLMBackend(canned)
+    db = DatabaseManager(db_path=tmp_path / "other_model_off_topic.db")
+    engine = ResearchEngine(llm=mock_llm, db=db)
+
+    state = engine.create_session("Compare YOLOv8 and RT-DETR accuracy and latency on COCO")
+    source_id = "src_1"
+    engine.source_repo.add(
+        source_id=source_id,
+        session_id=state.session_id,
+        url="https://example.com/yolov8",
+        title="YOLOv8 Paper",
+        domain="example.com"
+    )
+    state.source_ids.append(source_id)
+
+    raw_ev_id = "rev_1"
+    engine.raw_evidence_repo.add(
+        raw_evidence_id=raw_ev_id,
+        session_id=state.session_id,
+        source_id=source_id,
+        raw_quote="YOLOv8 achieves 53.9% AP on COCO val."
+    )
+    engine.evidence_repo.add(
+        evidence_id="evi_1",
+        session_id=state.session_id,
+        raw_evidence_id=raw_ev_id,
+        subject="YOLOv8",
+        predicate="achieves",
+        object_data={
+            "statement": "YOLOv8 achieves 53.9% AP on COCO val.",
+            "raw_quote": "YOLOv8 achieves 53.9% AP on COCO val.",
+            "url": "https://example.com/yolov8"
+        },
+        confidence=1.0
+    )
+
+    state.phase = ResearchPhase.EVALUATE
+    engine.save_state(state)
+
+    _ = engine.run_basic_answer(state)
+
+    claims = engine.claim_repo.get_by_session(state.session_id)
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["status"] == "OFF_TOPIC"
+    verif = claim.get("verification") or {}
+    assert verif.get("is_on_topic") is False
+    assert verif.get("verified") is False
+    assert verif.get("nli_prompt_version") == "v1.1"
 
 
 

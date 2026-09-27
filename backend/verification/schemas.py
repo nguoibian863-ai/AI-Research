@@ -19,6 +19,7 @@ class NLIVerificationResult(BaseModel):
     claim_text: str = Field(default="", description="The evaluated claim")
     evidence_quote: str = Field(default="", description="The cited evidence quote")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional debug/metric info")
+    prompt_version: Optional[str] = Field(default=None, description="Version of NLI prompt used")
 
 
 class NLIStructuredOutputSchema(BaseModel):

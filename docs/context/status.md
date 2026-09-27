@@ -1,21 +1,45 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau khi hoàn thành đo lường Standalone LLM NLI 30 cặp (FP 0.0%), tối ưu Off-Topic Guardrail trước NLI và đếm khoảng trắng chunker.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau khi hoàn thành NLI Prompt v1.1, Guardrail hạ nhãn false contradiction, Siết chặt Off-Topic, và chạy E2E thành công 3 Research Goals (<600s, 0 contradicted sai, có SUPPORTED và OFF_TOPIC chuẩn xác).
 
 ## Tiến độ
 
 | Tuần | Trạng thái | Ghi chú |
 |---|---|---|
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
-| 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
+| 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR, PostgreSQL vs MySQL, PointPillars vs CenterPoint) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | Standalone LLM đạt 0.0% FP và bắt 9/9 CONTRADICTED trên 30 cặp calibration; Off-Topic chặn trước NLI + hỗ trợ đại từ; Chunker đếm khoảng trắng; Session Viewer có màu OFF_TOPIC. Còn: writer theo section, UI hoàn chỉnh |
+| 4 — Verification + UI | 🟢 đang thực hiện | NLI Prompt v1.1 + Guardrail hạ nhãn mâu thuẫn giả; Siết chặt Off-Topic trước NLI; Session đạt DONE / COMPLETED trên goal PointPillars vs CenterPoint; 3/3 goal E2E chạy <170s, 0 false contradiction. Còn: writer theo section, UI hoàn chỉnh |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: **134 passed, 0 skipped** (132 unit tests + 2 calibration/live tests).
+Test: **136 passed, 0 skipped** (134 unit tests + 2 calibration/live tests).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
+
+## Đã giải quyết (NLI Prompt v1.1, Guardrail False Contradiction, Siết Off-Topic & E2E 3 Goals)
+
+- **Tách "mâu thuẫn" (CONTRADICTED) khỏi "gán sai" (NOT_SUPPORTED)**:
+  - Cập nhật prompt NLI (`NLI_PROMPT_VERSION = "v1.1"`) chỉ dẫn rõ ràng cho LLM: lệch model/dataset/biến thể là `NOT_SUPPORTED`, không phải `CONTRADICTED`.
+  - Bổ sung guardrail `_is_genuine_contradiction`: kiểm tra tính xung đột thực sự (bộ luật quy chuẩn, đối lập phương hướng, phủ định lời nói, hoặc cùng thực thể khác số). Nếu LLM gán `CONTRADICTED` nhưng chỉ là lệch entity/dataset thì tự động hạ nhãn xuống `NOT_SUPPORTED` kèm lý do minh bạch `Entity/dataset mismatch: ...`.
+- **Siết chặt bước chặn claim lạc đề (Off-Topic Guardrail)**:
+  - Trong `_is_claim_on_topic`: bóc tách thực thể model trong claim (loại trừ `STOPWORDS, LINKING_VERBS, GENERIC_DOMAIN_NOUNS, ALL_COMPARATIVES, CONTEXT_EXCLUDED, DATASET_BENCHMARK_TERMS, HARDWARE_ENV_TERMS, ALL_KNOWN_METRICS`).
+  - Nếu claim nêu tên model khác mà không nêu bất kỳ thực thể nào của goal → gắn ngay `OFF_TOPIC` (kể cả evidence có chứa goal entity). Chỉ dùng subject của evidence khi claim hoàn toàn không có tên model nào (câu dùng đại từ `it`, `they`).
+- **Ghi nhận `nli_prompt_version` và xuất file hiệu chỉnh tái lập**:
+  - Bổ sung trường `prompt_version` vào schema `NLIVerificationResult` và lưu `nli_prompt_version` vào verification của claim trong SQLite DB.
+  - Script `scripts/calibrate_nli.py` tự động xuất kết quả đo lường ra file JSON tái lập: `data/eval/nli_calibration_<model>_<version>.json`.
+  - Hiển thị version trong `scripts/show_session.py` (`[NLI: SUPPORTED (1.00) by llm v1.1]`).
+- **Tối ưu hóa trích xuất claim từ report**:
+  - Gấp gọn các dòng trích dẫn tách rời dạng `\n- Source: [E1]` hoặc `Source: [E1]` vào câu phát biểu ngay trước đó, ngăn chặn việc dòng citation bị biến thành một claim lạc đề độc lập.
+  - Làm sạch câu trước khi gửi sang NLI (`clean_claim_for_nli`): gạt bỏ các tiền tố `"According to [E1], "`, `"As reported in [E1], "` để NLI chỉ đánh giá mệnh đề khẳng định sự thật thay vì tìm kiếm chuỗi ký tự `[E1]` trong quote bằng chứng.
+  - Loại bỏ các dòng trích dẫn trần `Quote: "..."` khỏi danh sách claims cần kiểm chứng.
+  - Cấu trúc prompt report dạng Executive Summary + Evidence Findings (`- [E1] ...`), giúp model 3B xuất trích dẫn chuẩn xác, không bị sót `[E#]`.
+- **Đã chạy E2E và kiểm chứng 3 Research Goals thực tế**:
+  - Cả 3 goal đều hoàn thành trong **<170s** (vượt xa giới hạn 600s).
+  - Không có bất kỳ ca false contradiction (`CONTRADICTED`) nào.
+  - Các claim nhắc tới model ngoài (`YOLOv5u-n`, `SkyDet`) đều được gắn đúng `OFF_TOPIC`.
+  - Goal 3 (`PointPillars vs CenterPoint 3D detection on nuScenes`) đạt trạng thái **`DONE / COMPLETED`** với 3 claims `SUPPORTED 1.0`.
+  - Goal 1 và Goal 2 đều có ít nhất 1–4 claim được NLI xác nhận `SUPPORTED 1.0`.
 
 ## Đã giải quyết (Standalone LLM Benchmark 30 cặp, Pronoun Off-Topic & Chunker Precision)
 
@@ -255,5 +279,8 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 | 2026-09-26 | Compare PostgreSQL and MySQL on TPC-C (`sess_8cd3cfdcc865`) | PARTIAL (479s), 15 sources, 5 evidence nguyên văn, 3 claims CITED, report chuẩn không bịa số TPS; kết thúc PARTIAL trung thực vì thiếu metric so sánh đối đầu |
 | 2026-09-26 | Compare YOLOv8 and RT-DETR accuracy and latency on COCO (`sess_6dd46d23c476`) | **DONE / COMPLETED** (353s, <600s), 15 sources đa nguồn (arXiv HTML, OpenAlex PDF paper gốc RT-DETR CVPR 2024, GitHub official repo, Roboflow web), 5 evidence nguyên văn có số liệu benchmark (2.2% AP, 108 FPS vs 5 FPS, 1.9% AP, 0.7% AP), 4/4 claims CITED, 0 số bịa, xuất trajectory SFT/DPO v1.2 |
 | 2026-09-27 | Compare YOLOv8 and RT-DETR accuracy and latency on COCO (`sess_2137844bb549`) | **PARTIAL** (474s, <600s), 15 sources, 4 evidence nguyên văn trích xuất từ arXiv YOLOv10 (1.5 AP, 2.0 AP, 51%/61%, 41%/52%, 46%/62%). **NLI hoạt động thực tế thành công**: 4/4 cited claims được SmolLM3-3B xác nhận **`SUPPORTED` 1.0** với reasoning đầy đủ; 1 claim thiếu citation bị gắn nhãn **`UNSUPPORTED`**; 0 mâu thuẫn giả (`CONTRADICTED`). Dừng trung thực ở PARTIAL do thiếu dữ liệu so sánh trực tiếp YOLOv8 vs RT-DETR |
+| 2026-09-27 | Compare YOLOv8 and RT-DETR accuracy and latency on COCO (`sess_e94da3937a0b`) | **PARTIAL** (165.4s, <600s), 15 sources, 5 evidence nguyên văn; **1 claim CITED [NLI: SUPPORTED 1.00 by llm v1.1]** cho YOLOv8 lineage; **4 claims gán đúng `OFF_TOPIC`** (SkyDet / YOLOv5u-n không thuộc goal); 0 false contradiction (`CONTRADICTED`). |
+| 2026-09-27 | Compare PostgreSQL and MySQL on TPC-C (`sess_c54494afe5d2`) | **PARTIAL** (155.1s, <600s), 15 sources, 4 evidence nguyên văn; **4/4 claims CITED được SmolLM3 v1.1 xác nhận `SUPPORTED` 1.0**; 0 mâu thuẫn giả (`CONTRADICTED`); dừng trung thực ở PARTIAL vì thiếu bảng so sánh đối đầu trực tiếp |
+| 2026-09-27 | Compare PointPillars and CenterPoint 3D detection on nuScenes (`sess_5b6967b1247b` / `sess_5edf7aaa9d27`) | **DONE / COMPLETED** (112.8s / 86.8s, <600s), 15 sources, 5 evidence nguyên văn; **3 claims CITED [NLI: SUPPORTED 1.00 by llm v1.1]** cho CenterPoint và PointPillars; **1 claim `OFF_TOPIC`** (TensorRT feature net); 0 false contradiction (`CONTRADICTED`); phiên hoàn tất đạt chuẩn chất lượng cao nhất |
 
 

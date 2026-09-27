@@ -1,0 +1,414 @@
+{
+  "model": "hf.co/ggml-org/SmolLM3-3B-GGUF:Q4_K_M",
+  "nli_prompt_version": "v1.1",
+  "timestamp": "2026-09-27T17:32:40.965816",
+  "total_pairs": 30,
+  "llm_metrics": {
+    "false_positives": 0,
+    "negative_count": 20,
+    "false_positive_rate": 0.0,
+    "contra_caught": 6,
+    "contra_count": 9,
+    "contra_recall": 66.66666666666666,
+    "by_label": {
+      "SUPPORTED": {
+        "total": 10,
+        "correct": 10
+      },
+      "NOT_SUPPORTED": {
+        "total": 11,
+        "correct": 8
+      },
+      "CONTRADICTED": {
+        "total": 9,
+        "correct": 6
+      }
+    },
+    "overall_accuracy": 80.0
+  },
+  "composite_metrics": {
+    "false_positives": 0,
+    "negative_count": 20,
+    "false_positive_rate": 0.0,
+    "contra_caught": 7,
+    "contra_count": 9,
+    "contra_recall": 77.77777777777779,
+    "by_label": {
+      "SUPPORTED": {
+        "total": 10,
+        "correct": 10
+      },
+      "NOT_SUPPORTED": {
+        "total": 11,
+        "correct": 8
+      },
+      "CONTRADICTED": {
+        "total": 9,
+        "correct": 7
+      }
+    },
+    "overall_accuracy": 83.33333333333334
+  },
+  "results": [
+    {
+      "id": 1,
+      "category": "exact_quote",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by stating that RT-DETR achieves superior trade-offs between accuracy and speed.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 2,
+      "category": "partial_fact",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by comparing RT-DETR-R50 to DINO-Deformable-DETR-R50, mentioning a 2.2% improvement in accuracy and a 21 times speed increase compared to DINO-Deformable-DETR-R50.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 3,
+      "category": "exact_numbers",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by mentioning the same model, metric, and numbers for variant B's accuracy and latency improvements.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 4,
+      "category": "exact_quote",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by stating that CenterPoint achieves 67.3 NDS on the nuScenes benchmark.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 5,
+      "category": "exact_quote",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by stating that PointPillars achieves 59.2 NDS on nuScenes.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 6,
+      "category": "paraphrase",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim with the same model, metric, and numbers.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 7,
+      "category": "partial_fact",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by stating that YOLOv10-N/S outperforms YOLOv6-3.0-N/S by 1.5 AP and 2.0 AP.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 8,
+      "category": "paraphrase",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR eliminates the need for a hand-crafted NMS step, which directly supports the claim that RT-DETR eliminates the need for hand-crafted NMS.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 9,
+      "category": "exaggeration",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.0,
+      "llm_reason": "The evidence discusses CenterPoint's performance on the nuScenes benchmark, but does not confirm that it is the fastest detector ever built.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 10,
+      "category": "unsupported_number",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR outperforms YOLOv8 in speed on T4 GPU, while the claim states that RT-DETR is 10x faster than YOLOv8 on NVIDIA A100. The models, metrics, and datasets differ, making the claim contradict the evidence.",
+      "llm_matched": false,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": false
+    },
+    {
+      "id": 11,
+      "category": "hallucinated_metric",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.0,
+      "llm_reason": "Evidence discusses BenchBase and TPC-C benchmarks, while the claim refers to PostgreSQL and TPS on TPC-C benchmark.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 12,
+      "category": "false_attribution",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.0,
+      "llm_reason": "The evidence discusses Ultralytics releasing YOLOv8 with an improved anchor-free architecture, but does not mention the development of YOLOv8 by Baidu researchers in 2024.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 13,
+      "category": "unsupported_dataset_metric",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.0,
+      "llm_reason": "The evidence discusses PointPillars achieving 59.2 NDS on the nuScenes 3D detection benchmark, while the claim states PointPillars achieves 95.0 mAP on the COCO object detection benchmark.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 14,
+      "category": "verbal_negation",
+      "expected": "CONTRADICTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR is faster than YOLOv8 on COCO, which directly contradicts the claim that RT-DETR is not faster than YOLOv8 on COCO.",
+      "llm_matched": true,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 15,
+      "category": "reversed_direction",
+      "expected": "CONTRADICTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR is faster than YOLOv8, which directly contradicts the claim that YOLOv8 is faster than RT-DETR.",
+      "llm_matched": true,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 16,
+      "category": "antonym_verb",
+      "expected": "CONTRADICTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.0,
+      "llm_reason": "The evidence states that CenterPoint trails PointPillars, achieving a lower score on nuScenes, which contradicts the claim that CenterPoint exceeds PointPillars on nuScenes.",
+      "llm_matched": false,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 17,
+      "category": "opposite_polarity",
+      "expected": "CONTRADICTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR has lower latency than YOLOv8, which directly contradicts the claim that RT-DETR has higher latency than YOLOv8.",
+      "llm_matched": true,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 18,
+      "category": "antonym_adjective",
+      "expected": "CONTRADICTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that PointPillars is faster than CenterPoint, which directly contradicts the claim that PointPillars is slower than CenterPoint.",
+      "llm_matched": true,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 19,
+      "category": "antonym_verb",
+      "expected": "CONTRADICTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR outperforms YOLOv8 in accuracy, which directly contradicts the claim that RT-DETR underperforms YOLOv8 in accuracy.",
+      "llm_matched": true,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 20,
+      "category": "clashing_metric_polarity",
+      "expected": "CONTRADICTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR-R50 achieves higher accuracy than YOLOv8, while the claim states that RT-DETR-R50 has a higher error rate than YOLOv8. These statements are contradictory because higher accuracy implies lower error rate.",
+      "llm_matched": true,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "rule",
+      "composite_matched": true
+    },
+    {
+      "id": 21,
+      "category": "wrong_model_attribution",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.5,
+      "llm_reason": "The evidence discusses YOLOv10-X, while the claim refers to YOLOv8-X.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 22,
+      "category": "wrong_model_attribution",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that YOLOv10-N outperforms YOLOv6-3.0-N by 1.5 AP on COCO, while the claim states that YOLOv8 outperforms YOLOv6 by 1.5 AP on COCO. The models and datasets mentioned in the evidence and claim are different, leading to a contradiction.",
+      "llm_matched": false,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": false
+    },
+    {
+      "id": 23,
+      "category": "wrong_dataset",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.5,
+      "llm_reason": "The evidence discusses the nuScenes 3D detection benchmark, while the claim refers to the Waymo Open Dataset.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 24,
+      "category": "wrong_dataset",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.5,
+      "llm_reason": "The Evidence discusses YOLOv8-X achieving 53.9 mAP on COCO val2017, while the Claim mentions Pascal VOC 2012. These are different datasets/benchmarks, so the Evidence does not support or contradict the Claim.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 25,
+      "category": "wrong_variant_direct_contradiction",
+      "expected": "CONTRADICTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.5,
+      "llm_reason": "The evidence discusses RT-DETR-R101 and RT-DETR-R50 on COCO val2017, but the claim refers to RT-DETR-R50 achieving 54.3% AP on COCO val2017, which is not explicitly mentioned in the evidence.",
+      "llm_matched": false,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": false
+    },
+    {
+      "id": 26,
+      "category": "wrong_variant_unsupported",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.0,
+      "llm_reason": "The Evidence discusses RT-DETR-R50, while the Claim refers to RT-DETR-L.",
+      "llm_matched": true,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 27,
+      "category": "multi_quote_synthesis",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that RT-DETR-R50 achieves 53.1% AP on COCO val2017, while YOLOv8-L achieves 52.9% AP on the same dataset. This directly supports the claim that RT-DETR-R50 achieves higher accuracy than YOLOv8-L on COCO.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    },
+    {
+      "id": 28,
+      "category": "contradicted_multi_quote_synthesis",
+      "expected": "CONTRADICTED",
+      "llm_got": "NOT_SUPPORTED",
+      "llm_confidence": 0.5,
+      "llm_reason": "The evidence discusses RT-DETR-R50 and YOLOv8-L on T4 GPU, but does not explicitly confirm or refute the claim that RT-DETR-R50 delivers higher FPS than YOLOv8-L. The numbers provided are 108 FPS for RT-DETR-R50 and 125 FPS for YOLOv8-L, which do not support the claim that RT-DETR-R50 has higher FPS.",
+      "llm_matched": false,
+      "composite_got": "NOT_SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": false
+    },
+    {
+      "id": 29,
+      "category": "unsupported_extrapolation",
+      "expected": "NOT_SUPPORTED",
+      "llm_got": "CONTRADICTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence states that YOLOv10 exhibits superior trade-offs between accuracy and computational cost, while the claim states that YOLOv10 outperforms YOLOv8 in accuracy and latency across all benchmark tests. The evidence does not explicitly confirm the claim, and the comparison is not made between YOLOv10 and YOLOv8 in the same way as the claim suggests.",
+      "llm_matched": false,
+      "composite_got": "CONTRADICTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": false
+    },
+    {
+      "id": 30,
+      "category": "multi_metric_exact",
+      "expected": "SUPPORTED",
+      "llm_got": "SUPPORTED",
+      "llm_confidence": 1.0,
+      "llm_reason": "The evidence explicitly confirms the claim by stating that YOLOv10-B reduces latency by 46% and 25% fewer parameters compared to YOLOv9-C, matching the claim's numbers and comparison.",
+      "llm_matched": true,
+      "composite_got": "SUPPORTED",
+      "composite_verifier_type": "llm",
+      "composite_matched": true
+    }
+  ]
+}
