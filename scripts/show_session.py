@@ -106,7 +106,23 @@ def render_session(db: DatabaseManager, session_id: str) -> str:
     out.append(f"## Claims trong report ({len(claims)})")
     out.append("")
     for c in claims:
-        out.append(f"- **{c['status']}**: {short(c.get('text'), 160)}")
+        ver = c.get("verification") or {}
+        if not ver and c.get("verification_json"):
+            try:
+                import json
+                ver = json.loads(c["verification_json"])
+            except Exception:
+                ver = {}
+        ver_label = ver.get("entailment") or ver.get("label")
+        ver_conf = ver.get("entailment_confidence") if ver.get("entailment_confidence") is not None else ver.get("confidence", 0)
+        ver_reason = ver.get("entailment_reason") or ver.get("reason")
+        ver_type = ver.get("verifier_type", "")
+        ver_info = ""
+        if ver_label:
+            ver_info = f" [NLI: {ver_label} ({ver_conf:.2f}) by {ver_type}]"
+        out.append(f"- **{c['status']}**{ver_info}: {short(c.get('text'), 160)}")
+        if ver_reason:
+            out.append(f"  > Lý do NLI: {ver_reason}")
     out.append("")
 
     out.append("## Report")

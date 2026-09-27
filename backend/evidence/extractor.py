@@ -381,20 +381,20 @@ class EvidenceExtractor:
             sec_info = f", Section: '{c_sec}'" if c_sec else ""
             page_info = f", Page: {c_page}" if c_page else ""
             c_text = target_chunk.get("text", "").strip()
-            # Ensure chunk text does not exceed ~600 tokens for 2048 context (Issue 1)
-            if len(c_text) > 2400:
+            # Ensure chunk text does not exceed ~450 tokens (1800 chars) for 2048 context
+            if len(c_text) > 1800:
                 logger.warning(
                     f"[EvidenceExtractor] Chunk {target_chunk.get('chunk_id')} length ({len(c_text)} chars) "
-                    f"exceeds 2400 chars. Truncating tail to fit LLM context."
+                    f"exceeds 1800 chars. Truncating tail to fit LLM context."
                 )
-                c_text = c_text[:2400]
+                c_text = c_text[:1800]
 
             if len(c_text) < 20:
                 continue
 
             # Focused prompt with neutral few-shot example for high JSON compliance with small models
             prompt = (
-                f"You are an expert factual research extractor. Extract key atomic facts from the chunk below.\n\n"
+                f"You are an expert factual research extractor. Extract 1 to 3 key atomic facts directly relevant to the goal from the chunk below. Keep raw_quote concise and verbatim.\n\n"
                 f"NEUTRAL FEW-SHOT EXAMPLE:\n"
                 f'Input Chunk: "RocksDB introduces a log-structured merge-tree architecture that achieves 150,000 writes/sec on NVMe storage."\n'
                 f"Output:\n"
