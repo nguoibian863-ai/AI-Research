@@ -388,22 +388,25 @@ def test_extract_early_stopping_on_comparative_subjects_with_dataset_goal(isolat
 
 
 def test_extract_write_reservation_dynamic(isolated_engine):
-    """Verifies that extraction stops early when remaining time is insufficient for WRITE (Issue 3 fix)."""
+    """Verifies that extraction stops early when remaining time is insufficient for WRITE (Issue 1 fix)."""
     engine = isolated_engine
     goal = "Compare PostgreSQL and MySQL on TPC-C"
 
     chunk1 = {"chunk_id": "c1", "text": "PostgreSQL achieves 1000 TPS on TPC-C benchmark.", "source_id": "s1"}
     chunk2 = {"chunk_id": "c2", "text": "MySQL achieves 950 TPS on TPC-C benchmark.", "source_id": "s1"}
 
-    # Remaining time is 130s (600 - 470).
-    # On old code: threshold was 120s (90 + 30), so 130s did NOT stop (bug).
-    # On new code: threshold is 170s (90 + 80), so 130s stops cleanly before chunk 1.
+    # Mock budget tracker with explicit assert_can_call_llm to avoid MagicMock AttributeError masking
     mock_tracker = MagicMock()
     mock_tracker.can_call_llm.return_value = True
+    mock_tracker.assert_can_call_llm = MagicMock()
+    mock_tracker.record_llm_call = MagicMock()
     mock_tracker.limits.max_runtime_seconds = 600
     mock_tracker.limits.write_reserved_seconds = 90.0
-    mock_tracker.elapsed_seconds = 470.0
 
+    # Branch A: remaining time is 130s (600 - 470).
+    # On old code: threshold was 120s (90 + 30), so 130s did NOT stop -> would call LLM.
+    # On new code: threshold is 170s (90 + 80), so 130s stops cleanly before chunk 1.
+    mock_tracker.elapsed_seconds = 470.0
     engine.evidence_extractor.llm.structured_generate = MagicMock()
 
     extracted = engine.evidence_extractor.extract_from_chunks(
@@ -417,6 +420,24 @@ def test_extract_write_reservation_dynamic(isolated_engine):
     # Stopped before even starting chunk 1!
     assert len(extracted) == 0
     assert engine.evidence_extractor.llm.structured_generate.call_count == 0
+
+    # Branch B: remaining time is 220s (600 - 380) > 170s threshold.
+    # LLM MUST be called when time is sufficient!
+    mock_tracker.elapsed_seconds = 380.0
+    mock_res = MagicMock()
+    mock_res.parsed.evidences = []
+    mock_res.total_tokens = 50
+    mock_res.calls_made = 1
+    engine.evidence_extractor.llm.structured_generate = MagicMock(return_value=mock_res)
+
+    engine.evidence_extractor.extract_from_chunks(
+        session_id="sess_reserve_test",
+        goal=goal,
+        chunks=[chunk1, chunk2],
+        budget_tracker=mock_tracker,
+        max_evidence=5
+    )
+    assert engine.evidence_extractor.llm.structured_generate.call_count > 0
 
 
 def test_subject_matches_entity_strict_semantics():
@@ -437,7 +458,7 @@ def test_subject_matches_entity_strict_semantics():
 
 
 def test_ollama_backend_clamps_predict_to_stay_within_context():
-    """Verifies OllamaBackend clamps num_predict so prompt + predict <= context_window (Issue 1)."""
+    """Verifies OllamaBackend clamps num_predict so prompt + predict <= context_window (Issue 1 & 3)."""
     from backend.llm.ollama import OllamaBackend
     backend = OllamaBackend(context_window=2048, max_output_tokens=1024)
 
@@ -449,6 +470,25 @@ def test_ollama_backend_clamps_predict_to_stay_within_context():
     # num_predict must be clamped from 1024 so prompt (~1714) + num_predict <= 2048
     assert num_predict < 1024
     assert num_predict + int(len(long_prompt) / 3.5) <= 2048
+
+
+def test_ollama_backend_raises_when_prompt_exceeds_context():
+    """Verifies OllamaBackend rejects prompts that exceed num_ctx or leave insufficient output room (Issue 3)."""
+    from backend.llm.ollama import OllamaBackend
+    from backend.core.errors import ModelInferenceError
+    backend = OllamaBackend(context_window=2048, max_output_tokens=1024)
+
+    # Prompt of ~2100 tokens (> 2048)
+    huge_prompt = "test " * 1500
+    with pytest.raises(ModelInferenceError) as exc_info:
+        backend._resolve_context_and_predict(huge_prompt, None, {})
+    assert "Prompt is too large" in str(exc_info.value)
+
+    # Prompt leaving < 64 tokens headroom (e.g. 2000 tokens)
+    tight_prompt = "test " * 1410
+    with pytest.raises(ModelInferenceError) as exc_info:
+        backend._resolve_context_and_predict(tight_prompt, None, {})
+    assert "insufficient output headroom" in str(exc_info.value)
 
 
 def test_arxiv_html_fallback_to_pdf_in_fetch(isolated_engine):

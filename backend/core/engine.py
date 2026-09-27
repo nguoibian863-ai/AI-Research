@@ -59,6 +59,8 @@ from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
 from backend.sources.dedup import compute_canonical_key
 from backend.sources.credibility import score_source_credibility
+from backend.verification.nli import BaseNLIVerifier, CompositeNLIVerifier, ClaimVerificationPipeline
+from backend.verification.schemas import NLILabel
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,8 @@ class ResearchEngine:
         pdf_tool: Optional[PDFFetchTool] = None,
         embedding_backend: Optional[EmbeddingBackend] = None,
         chunker: Optional[SectionAwareChunker] = None,
-        hybrid_retriever: Optional[HybridRetriever] = None
+        hybrid_retriever: Optional[HybridRetriever] = None,
+        nli_verifier: Optional[BaseNLIVerifier] = None
     ):
         self._llm = llm
         self.db = db
@@ -113,6 +116,8 @@ class ResearchEngine:
         self.trajectory_repo = TrajectoryRepository(self.db)
         self.evidence_extractor = EvidenceExtractor(llm=self.llm, db=self.db)
         self.citation_verifier = CitationVerifier()
+        self.nli_verifier = nli_verifier or CompositeNLIVerifier(llm=self.llm)
+        self.claim_verification_pipeline = ClaimVerificationPipeline(verifier=self.nli_verifier)
 
         # Session Budget Trackers (cached in-memory, backed by SQLite)
         self._budget_trackers: Dict[str, ExecutionBudgetTracker] = {}
@@ -1250,6 +1255,57 @@ class ResearchEngine:
         except Exception as e:
             self._handle_phase_error(state, e, "WRITE")
             raise
+
+    def verify_session_claims(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Week 4 Plan 23: Entailment Verification across all claims in a session.
+        Takes claims currently in CITED status, checks semantic entailment against cited evidence quotes,
+        and updates claim records with verified status, entailment label, confidence, and reason.
+        """
+        claims = self.claim_repo.get_by_session(session_id)
+        evidence_map = {e["evidence_id"]: e for e in self.evidence_repo.get_full_evidence_by_session(session_id)}
+        updated_claims = []
+
+        for claim in claims:
+            ev_ids = claim.get("evidence_ids") or []
+            if not ev_ids:
+                continue
+
+            quotes = []
+            for eid in ev_ids:
+                ev = evidence_map.get(eid)
+                if ev:
+                    quote = ev.get("exact_quote") or ev.get("raw_quote") or ""
+                    if quote.strip():
+                        quotes.append(quote.strip())
+
+            if not quotes:
+                continue
+
+            res = self.claim_verification_pipeline.verify_claim_against_quotes(claim["text"], quotes)
+
+            current_verif = claim.get("verification") or {}
+            numeric_match = current_verif.get("numeric_match", True)
+            is_verified = (res.label == NLILabel.SUPPORTED and numeric_match)
+            current_verif.update({
+                "entailment": res.label.value,
+                "entailment_confidence": res.confidence,
+                "entailment_reason": res.reason,
+                "verifier_type": res.verifier_type,
+                "verified": is_verified
+            })
+
+            new_status = res.label.value
+            self.claim_repo.update_verification(
+                claim_id=claim["claim_id"],
+                verification=current_verif,
+                status=new_status
+            )
+            updated = self.claim_repo.get_by_id(claim["claim_id"])
+            if updated:
+                updated_claims.append(updated)
+
+        return updated_claims
 
     def run_week1(self, session_or_goal: Union[ResearchState, str]) -> Dict[str, Any]:
         """

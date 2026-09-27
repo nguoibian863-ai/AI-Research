@@ -27,7 +27,7 @@ class SectionAwareChunker:
     Hierarchy: Section -> Heading -> Paragraph -> Sentence -> Token Limit.
     """
 
-    def __init__(self, max_chunk_tokens: int = 600, chunk_overlap_tokens: int = 80):
+    def __init__(self, max_chunk_tokens: int = 450, chunk_overlap_tokens: int = 80):
         self.max_chunk_tokens = max_chunk_tokens
         self.chunk_overlap_tokens = chunk_overlap_tokens
 

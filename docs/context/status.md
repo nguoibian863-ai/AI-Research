@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `da1697b`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `0374bbd`.
 
 ## Tiến độ
 
@@ -9,10 +9,10 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 bắt đầu | Đã có Session Viewer (/ui). Còn: NLI, writer theo section, UI đầy đủ |
-| 5 — Evaluation + Trajectory | chưa bắt đầu | |
+| 4 — Verification + UI | 🟢 đang thực hiện | Đã có Session Viewer (/ui) và NLI Entailment Verifier (Plan 23). Còn: writer theo section, UI đầy đủ |
+| 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: 97 passed (hoặc 96 passed + 1 skipped nếu chưa tải cache FastEmbed).
+Test: 107 passed (hoàn toàn offline không cần GPU hay mạng).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -89,13 +89,29 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
   - Sửa `test_extract_write_reservation_dynamic`: kiểm tra thời gian còn lại 130s (`elapsed_seconds = 470.0`), phân biệt rõ ngưỡng cũ (120s) và ngưỡng động mới (170s).
   - Bổ sung 2 regression test mới: `test_subject_matches_entity_strict_semantics` và `test_ollama_backend_clamps_predict_to_stay_within_context`.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống) — review `da1697b`
+## Đã giải quyết (review `0374bbd`)
 
-1. **`test_extract_write_reservation_dynamic` vẫn không kiểm tra được gì** (vẫn pass trên `a05af31`). `mock_tracker` là `MagicMock` không có spec, và `MagicMock` từ chối mọi thuộc tính bắt đầu bằng `assert_`. Vì vậy `budget_tracker.assert_can_call_llm()` ném `AttributeError`, lỗi này bị `except` nuốt, và `structured_generate` không bao giờ được gọi, bất kể ngưỡng thời gian. Cách sửa: thêm `mock_tracker.assert_can_call_llm = MagicMock()` hoặc dùng `ExecutionBudgetTracker` thật. Đã thử: sau khi thêm dòng đó, test fail trên `a05af31` và pass trên HEAD.
-2. **Cắt chunk ở 2400 ký tự làm mất phần cuối chunk mà không báo.** Chunker cho phép tới 600 token ước lượng (khoảng 460 từ, tức khoảng 2700–3000 ký tự), nên chunk dài mất khoảng 10–20% cuối. Nếu câu làm chunk được retrieve nằm ở đoạn cuối này thì không bao giờ được trích xuất. Nên giảm `max_chunk_tokens` (khoảng 450) để chunk vừa ngân sách, thay vì cắt; hoặc ít nhất ghi log khi cắt.
-3. `num_predict` chỉ được tính một lần từ prompt gốc. Ở lần retry, prompt có thêm thông báo lỗi validation nhưng không được tính lại. Khi prompt tự nó đã vượt `num_ctx`, code chỉ hạ `num_predict` xuống 128 (Ollama vẫn cắt đầu prompt); nên cắt input hoặc báo lỗi rõ ràng.
-4. Statement đọc sai quote nhưng trùng từ nhiều → cần NLI (plan 23, Tuần 4).
-5. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+- **Sửa triệt để `test_extract_write_reservation_dynamic`**: Gán tường minh `mock_tracker.assert_can_call_llm = MagicMock()`, loại bỏ việc `MagicMock` ném `AttributeError` giả bị `except` nuốt; đồng thời kiểm tra cả 2 chiều:
+  - Khi còn 130s (< 170s ngưỡng động): dừng hoàn toàn trước chunk 1 (`call_count == 0`).
+  - Khi còn 220s (> 170s ngưỡng động): LLM bắt buộc được gọi (`call_count > 0`).
+- **Giảm `max_chunk_tokens` xuống 450 và log cảnh báo khi cắt chunk**:
+  - Cập nhật mặc định `max_chunk_tokens = 450` trong `backend/core/limits.py`, `config/settings.yaml`, và `SectionAwareChunker`.
+  - Các chunk sau parsing tự nhiên nằm trong ngưỡng an toàn ~1800 ký tự, không bị cụt phần đuôi khi chuyển sang EXTRACT.
+  - Thêm log cảnh báo chi tiết nếu có chunk bất thường vượt 2400 ký tự trong `EvidenceExtractor`.
+- **Bảo vệ context window 2048 & tính lại token trên retry**:
+  - Trong `OllamaBackend._resolve_context_and_predict`: nếu prompt $\ge num\_ctx$ hoặc headroom còn lại $< 64$ token, ném `ModelInferenceError` rõ ràng thay vì để Ollama âm thầm cắt đầu prompt.
+  - Trong `structured_generate`: tính lại `num_predict` và kiểm tra context trên từng attempt (bao gồm retry khi output lỗi schema). Giới hạn độ dài thông báo lỗi retry ($\le 400$ ký tự) tránh bùng nổ token.
+  - Bổ sung test kiểm tra `ModelInferenceError` khi prompt quá dài.
+- **Khởi động NLI Verifier cho Tuần 4 (Plan 23)**:
+  - Xây dựng module `backend/verification/`: `NLILabel`, `NLIVerificationResult`, `RuleBasedNLIVerifier` (kiểm tra đối lập phương hướng, nghịch đảo phủ định, token overlap), `LLMNLIVerifier`, `CompositeNLIVerifier`, và `ClaimVerificationPipeline`.
+  - Tích hợp phương thức `ResearchEngine.verify_session_claims(session_id)`: kiểm chứng ngữ nghĩa entailment các claim `CITED` với các quote bằng chứng đã trích dẫn, cập nhật trạng thái `SUPPORTED` / `CONTRADICTED` và ghi nhận độ tin cậy cùng lý do.
+  - Bổ sung 9 unit test cho toàn bộ pipeline NLI trong `tests/test_verification_nli.py`.
+
+## Vấn đề còn mở (ưu tiên từ trên xuống)
+
+1. Chạy E2E thật lại 2–3 goal để xem lỗi JSON bị cắt hoặc số lần retry có tăng khi context còn 2048 không (chạy với model SmolLM3 thật).
+2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+3. Tuần 4 tiếp theo: writer theo section (plan 28), UI đầy đủ.
 
 ## Lịch sử kết quả chạy thật
 

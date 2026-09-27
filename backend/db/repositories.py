@@ -358,6 +358,29 @@ class ClaimRepository:
                 rows.append(item)
             return rows
 
+    def get_by_id(self, claim_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cur = conn.execute("SELECT * FROM claims WHERE claim_id = ?", (claim_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["evidence_ids"] = json.loads(item["evidence_ids_json"]) if item.get("evidence_ids_json") else []
+            item["verification"] = json.loads(item["verification_json"]) if item.get("verification_json") else {}
+            return item
+
+    def update_verification(self, claim_id: str, verification: Dict[str, Any], status: str) -> None:
+        ver_json = json.dumps(verification)
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                UPDATE claims
+                SET verification_json = ?, status = ?
+                WHERE claim_id = ?
+                """,
+                (ver_json, status, claim_id)
+            )
+
 
 class ReportRepository:
     def __init__(self, db: DatabaseManager):

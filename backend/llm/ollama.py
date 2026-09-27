@@ -60,21 +60,34 @@ class OllamaBackend(LLMBackend):
         num_predict = kwargs.get("num_predict", self.max_output_tokens)
         est_prompt = estimate_token_count(prompt) + (estimate_token_count(system) if system else 0)
 
-        # Guardrail: check prompt + num_predict <= num_ctx (Issue 1)
+        # Guardrail: prompt must not exceed or saturate num_ctx
+        if est_prompt >= num_ctx:
+            logger.error(
+                f"[OllamaBackend] Prompt is too large (~{est_prompt} tokens) for context window {num_ctx}."
+            )
+            raise ModelInferenceError(
+                f"Prompt is too large (~{est_prompt} tokens) for context window {num_ctx}. "
+                "Cannot generate output without silent truncation."
+            )
+
+        available = num_ctx - est_prompt
+        if available < 64:
+            logger.error(
+                f"[OllamaBackend] Prompt (~{est_prompt} tokens) leaves insufficient output headroom "
+                f"({available} < 64 tokens) in context window {num_ctx}."
+            )
+            raise ModelInferenceError(
+                f"Prompt (~{est_prompt} tokens) leaves insufficient output headroom "
+                f"({available} < 64 tokens) in context window {num_ctx}."
+            )
+
         if est_prompt + num_predict > num_ctx:
-            available = num_ctx - est_prompt
-            if available < 128:
-                logger.warning(
-                    f"[OllamaBackend] Prompt is large (~{est_prompt} tokens) for num_ctx={num_ctx}. "
-                    f"Clamping num_predict from {num_predict} to 128."
-                )
-                num_predict = 128
-            else:
-                logger.info(
-                    f"[OllamaBackend] Adjusting num_predict from {num_predict} to {available} "
-                    f"so prompt (~{est_prompt}) + output <= num_ctx ({num_ctx})."
-                )
-                num_predict = available
+            logger.info(
+                f"[OllamaBackend] Adjusting num_predict from {num_predict} to {available} "
+                f"so prompt (~{est_prompt}) + output <= num_ctx ({num_ctx})."
+            )
+            num_predict = available
+
         return num_ctx, num_predict
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
@@ -132,8 +145,6 @@ class OllamaBackend(LLMBackend):
             "Do not include markdown codeblocks or preamble.\n"
             f"JSON Schema: {json.dumps(schema_dict)}"
         )
-        num_ctx, num_predict = self._resolve_context_and_predict(prompt, enriched_system, kwargs)
-
         current_prompt = prompt
         accumulated_prompt_tokens = 0
         accumulated_eval_tokens = 0
@@ -142,6 +153,8 @@ class OllamaBackend(LLMBackend):
 
         for attempt in range(2):
             calls_made += 1
+            # Recalculate context & predict on each attempt (handles retry prompt expansion)
+            num_ctx, num_predict = self._resolve_context_and_predict(current_prompt, enriched_system, kwargs)
             payload = {
                 "model": kwargs.get("model", self.model),
                 "prompt": current_prompt,
@@ -190,10 +203,13 @@ class OllamaBackend(LLMBackend):
             except (ValidationError, json.JSONDecodeError) as ve:
                 if attempt == 0:
                     logger.warning(f"Ollama structured output attempt 1 failed validation ({ve}). Retrying with error feedback...")
+                    err_msg = str(ve)
+                    if len(err_msg) > 400:
+                        err_msg = err_msg[:400] + "... (truncated)"
                     current_prompt = (
                         f"{prompt}\n\n"
                         f"IMPORTANT: Your previous output failed schema validation:\n"
-                        f"{ve}\n"
+                        f"{err_msg}\n"
                         f"Please fix the error and output valid JSON strictly matching the schema."
                     )
                     continue

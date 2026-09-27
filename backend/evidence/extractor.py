@@ -383,6 +383,10 @@ class EvidenceExtractor:
             c_text = target_chunk.get("text", "").strip()
             # Ensure chunk text does not exceed ~600 tokens for 2048 context (Issue 1)
             if len(c_text) > 2400:
+                logger.warning(
+                    f"[EvidenceExtractor] Chunk {target_chunk.get('chunk_id')} length ({len(c_text)} chars) "
+                    f"exceeds 2400 chars. Truncating tail to fit LLM context."
+                )
                 c_text = c_text[:2400]
 
             if len(c_text) < 20:
