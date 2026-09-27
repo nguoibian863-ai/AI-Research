@@ -386,4 +386,76 @@ def test_entity_balanced_context_generation(tmp_path):
     assert "SystemBeta metric" in prompt_sent
 
 
+def test_off_topic_claim_guardrail_marks_off_topic_and_session_partial(tmp_path):
+    """
+    Verifies that claims discussing entities unrelated to the goal core entities:
+    1. Are marked OFF_TOPIC (not CITED/SUPPORTED).
+    2. Do NOT increment supported_claims_count.
+    3. Cause session to end in PARTIAL with 'Report claims do not address the research goal entities (off-topic)'.
+    """
+    from backend.verification.schemas import NLIStructuredOutputSchema
+
+    canned = {
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence explicitly confirms YOLOv10 AP."
+        },
+        "generate": "According to [E1], YOLOv10 achieves 46.8% AP on COCO val."
+    }
+    mock_llm = MockLLMBackend(canned)
+    db = DatabaseManager(db_path=tmp_path / "off_topic.db")
+    engine = ResearchEngine(llm=mock_llm, db=db)
+
+    state = engine.create_session("Compare YOLOv8 and RT-DETR on COCO benchmark")
+    source_id = "src_1"
+    engine.source_repo.add(
+        source_id=source_id,
+        session_id=state.session_id,
+        url="https://example.com/yolov10",
+        title="YOLOv10 Paper",
+        domain="example.com"
+    )
+    state.source_ids.append(source_id)
+
+    raw_ev_id = "rev_1"
+    engine.raw_evidence_repo.add(
+        raw_evidence_id=raw_ev_id,
+        session_id=state.session_id,
+        source_id=source_id,
+        raw_quote="YOLOv10 achieves 46.8% AP on COCO val."
+    )
+    engine.evidence_repo.add(
+        evidence_id="evi_1",
+        session_id=state.session_id,
+        raw_evidence_id=raw_ev_id,
+        subject="YOLOv10",
+        predicate="achieves",
+        object_data={
+            "statement": "YOLOv10 achieves 46.8% AP on COCO val.",
+            "raw_quote": "YOLOv10 achieves 46.8% AP on COCO val.",
+            "url": "https://example.com/yolov10",
+            "value": "46.8%"
+        },
+        confidence=1.0
+    )
+
+    state.phase = ResearchPhase.EVALUATE
+    engine.save_state(state)
+
+    _ = engine.run_basic_answer(state)
+
+    claims = engine.claim_repo.get_by_session(state.session_id)
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["status"] == "OFF_TOPIC"
+    verif = claim.get("verification") or {}
+    assert verif.get("is_on_topic") is False
+    assert verif.get("verified") is False
+
+    assert state.phase == ResearchPhase.PARTIAL
+    assert "Report claims do not address the research goal entities (off-topic)" in state.error_message
+
+
+
 

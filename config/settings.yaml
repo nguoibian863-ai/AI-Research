@@ -47,7 +47,8 @@ limits:
   max_search_results: 8
   max_sources_per_run: 15
   max_total_chunks: 300
-  max_chunk_tokens: 450
+  max_chunk_tokens: 350
+  max_chunk_chars: 1800
   max_evidence_items: 30
   retrieval_top_k: 5
   max_llm_calls: 30

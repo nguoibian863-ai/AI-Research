@@ -175,3 +175,40 @@ def test_pdf_fetch_tool_local(tmp_path):
     assert content is not None
     assert "FlashAttention-2" in content.text
     assert content.is_cached
+
+
+def test_section_aware_chunker_enforces_max_chunk_chars_limit():
+    """
+    Verifies that SectionAwareChunker strictly enforces max_chunk_chars <= 1800,
+    even when blocks contain long sentences or paragraphs.
+    """
+    from backend.parsing.html_cleaner import CleanedDocument, ParsedSection
+
+    long_sentence = "This is a detailed factual sentence about detection performance on COCO benchmark. " * 30
+    very_long_block = (long_sentence + "\n\n") * 5  # > 6000 chars
+
+    doc = CleanedDocument(
+        text=very_long_block,
+        title="Oversized Document Test",
+        sections=[
+            ParsedSection(
+                title="Results",
+                content=very_long_block,
+                page=1,
+                page_start=1,
+                page_end=1,
+                char_start=0,
+                char_end=len(very_long_block),
+                blocks=[{"text": very_long_block, "page": 1, "char_start": 0, "char_end": len(very_long_block)}]
+            )
+        ]
+    )
+
+    chunker = SectionAwareChunker(max_chunk_tokens=350, max_chunk_chars=1800)
+    chunks = chunker.chunk_document(doc_id="doc_oversized", document=doc)
+
+    assert len(chunks) > 1
+    for c in chunks:
+        assert len(c.text) <= 1800, f"Chunk {c.chunk_id} length ({len(c.text)}) exceeds 1800 chars limit"
+        assert doc.text[c.char_start:c.char_end] == c.text
+

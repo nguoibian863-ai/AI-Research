@@ -53,7 +53,8 @@ from backend.core.coverage import (
     DATASET_BENCHMARK_TERMS,
     extract_context_entities,
     text_mentions_entity,
-    extract_substantive_numbers
+    extract_substantive_numbers,
+    subject_matches_entity
 )
 from backend.evidence.extractor import EvidenceExtractor
 from backend.evidence.verifier import CitationVerifier
@@ -1071,6 +1072,7 @@ class ResearchEngine:
             numeric_mismatch_claims_count = 0
             uncited_numeric_claims_count = 0
             contradicted_claims_count = 0
+            off_topic_claims_count = 0
             nli_llm_evaluated_count = 0
             goal_core_entities = self._goal_subject_entities(state.goal)
 
@@ -1150,11 +1152,31 @@ class ResearchEngine:
                             if nli_res.verifier_type == "llm":
                                 nli_llm_evaluated_count += 1
 
-                            is_verified = (nli_res.label == NLILabel.SUPPORTED)
+                            # Off-topic Claim Guardrail:
+                            # A claim can only count towards supported_claims_count if it mentions at least one entity of the research goal.
+                            is_on_topic = (
+                                not goal_core_entities
+                                or any(
+                                    check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
+                                    for ent in goal_core_entities
+                                )
+                            )
+
+                            if not is_on_topic:
+                                claim_status = "OFF_TOPIC"
+                                is_verified = False
+                                off_topic_claims_count += 1
+                                logger.info(
+                                    f"[{state.session_id}][WRITE] Claim marked OFF_TOPIC (does not mention any goal entity {goal_core_entities}): '{sent[:80]}...'"
+                                )
+                            else:
+                                claim_status = "CITED"
+                                is_verified = (nli_res.label == NLILabel.SUPPORTED)
+                                if nli_res.label == NLILabel.SUPPORTED:
+                                    supported_claims_count += 1
+
                             if nli_res.label == NLILabel.CONTRADICTED:
                                 contradicted_claims_count += 1
-                            elif nli_res.label == NLILabel.SUPPORTED:
-                                supported_claims_count += 1
 
                             cited_claims_count += 1
 
@@ -1165,6 +1187,7 @@ class ResearchEngine:
                                 evidence_ids=[ev.get("evidence_id") for ev in cited_evs],
                                 verification={
                                     "verified": is_verified,
+                                    "is_on_topic": is_on_topic,
                                     "entailment": nli_res.label.value,
                                     "entailment_confidence": nli_res.confidence,
                                     "entailment_reason": nli_res.reason,
@@ -1175,7 +1198,7 @@ class ResearchEngine:
                                     "quote": cited_evs[0].get("exact_quote"),
                                     "source_id": cited_evs[0].get("source_id")
                                 },
-                                status="CITED"
+                                status=claim_status
                             )
                     elif substantive_numbers:
                         # Sentence contains substantive metrics/numbers but has NO citation!
@@ -1240,6 +1263,8 @@ class ResearchEngine:
                     partial_reasons.append(f"Missing evidence for: {', '.join(missing_evidence_entities)}")
                 if cited_claims_count == 0 and numeric_mismatch_claims_count == 0 and evidence_items:
                     partial_reasons.append("Report contains no valid citations")
+                elif off_topic_claims_count > 0 and supported_claims_count == 0:
+                    partial_reasons.append("Report claims do not address the research goal entities (off-topic)")
                 elif cited_claims_count > 0 and supported_claims_count == 0 and numeric_mismatch_claims_count == 0:
                     if nli_llm_evaluated_count == 0:
                         partial_reasons.append("NLI unavailable – claims not verified")
@@ -1310,8 +1335,8 @@ class ResearchEngine:
         known_entities = self._goal_subject_entities(goal) if goal else None
 
         for claim in claims:
-            # DO NOT touch NUMERIC_MISMATCH or UNSUPPORTED claims! (Review item 3)
-            if claim.get("status") in ("NUMERIC_MISMATCH", "UNSUPPORTED"):
+            # DO NOT touch NUMERIC_MISMATCH, UNSUPPORTED, or OFF_TOPIC claims! (Review item 3)
+            if claim.get("status") in ("NUMERIC_MISMATCH", "UNSUPPORTED", "OFF_TOPIC"):
                 continue
 
             ev_ids = claim.get("evidence_ids") or []
@@ -1335,20 +1360,33 @@ class ResearchEngine:
 
             current_verif = claim.get("verification") or {}
             numeric_match = current_verif.get("numeric_match", True)
-            is_verified = (res.label == NLILabel.SUPPORTED and numeric_match)
+
+            # Off-topic check
+            sent = claim.get("text", "")
+            is_on_topic = (
+                not known_entities
+                or any(
+                    check_entity_in_text(ent, sent) or subject_matches_entity(sent, ent)
+                    for ent in known_entities
+                )
+            )
+            claim_status = "OFF_TOPIC" if not is_on_topic else claim.get("status", "CITED")
+            is_verified = (res.label == NLILabel.SUPPORTED and numeric_match and is_on_topic)
+
             current_verif.update({
                 "entailment": res.label.value,
                 "entailment_confidence": res.confidence,
                 "entailment_reason": res.reason,
                 "verifier_type": res.verifier_type,
+                "is_on_topic": is_on_topic,
                 "verified": is_verified
             })
 
-            # Keep status according to numeric rules (CITED), do not overwrite with NLI label!
+            # Keep status according to numeric rules (CITED) or OFF_TOPIC
             self.claim_repo.update_verification(
                 claim_id=claim["claim_id"],
                 verification=current_verif,
-                status=claim.get("status", "CITED")
+                status=claim_status
             )
             updated = self.claim_repo.get_by_id(claim["claim_id"])
             if updated:

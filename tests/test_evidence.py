@@ -1398,3 +1398,35 @@ def test_planner_and_query_prompts_forbid_running_experiments(isolated_engine):
     assert "Do NOT plan to run experiments" in prompts[0]
     assert "Do NOT search for configuration parameters" in prompts[1]
     assert state.phase == ResearchPhase.SEARCH
+
+
+def test_extractor_prompt_version_and_constraints(tmp_path):
+    """
+    Verifies that EXTRACTOR_PROMPT_VERSION is bumped to v1.3 and that the prompt
+    explicitly instructs the model to extract '1 to 3' key atomic facts.
+    """
+    from backend.evidence.extractor import EXTRACTOR_PROMPT_VERSION, EvidenceExtractor
+
+    assert EXTRACTOR_PROMPT_VERSION == "v1.3"
+
+    mock_llm = MockLLMBackend({
+        "ExtractedEvidencesSchema": {
+            "facts": []
+        }
+    })
+    db = DatabaseManager(db_path=tmp_path / "test_prompt.db")
+    extractor = EvidenceExtractor(llm=mock_llm, db=db)
+
+    test_chunk = {
+        "chunk_id": "c1",
+        "text": "YOLOv8 reaches 53.9 mAP on COCO val while operating at 280 FPS on T4 GPU.",
+        "source_id": "src_1",
+        "url": "https://example.com/yolov8"
+    }
+    extractor.extract_from_chunks(session_id="s1", goal="Compare YOLOv8 and RT-DETR", chunks=[test_chunk])
+
+    assert len(mock_llm.call_history) >= 1
+    prompt = mock_llm.call_history[0]["prompt"]
+    assert "1 to 3" in prompt
+    assert "Extract 1 to 3 key atomic facts" in prompt
+

@@ -257,7 +257,7 @@ def verify_atomic_fact(
     return True, "VERIFIED"
 
 
-EXTRACTOR_PROMPT_VERSION = "v1.2"
+EXTRACTOR_PROMPT_VERSION = "v1.3"
 
 
 class EvidenceExtractor:
@@ -381,13 +381,12 @@ class EvidenceExtractor:
             sec_info = f", Section: '{c_sec}'" if c_sec else ""
             page_info = f", Page: {c_page}" if c_page else ""
             c_text = target_chunk.get("text", "").strip()
-            # Ensure chunk text does not exceed ~450 tokens (1800 chars) for 2048 context
+            # Chunker strictly enforces max_chunk_chars <= 1800 to avoid losing end-of-chunk facts
             if len(c_text) > 1800:
                 logger.warning(
                     f"[EvidenceExtractor] Chunk {target_chunk.get('chunk_id')} length ({len(c_text)} chars) "
-                    f"exceeds 1800 chars. Truncating tail to fit LLM context."
+                    f"exceeds 1800 chars. Chunker configuration should enforce max_chunk_chars <= 1800."
                 )
-                c_text = c_text[:1800]
 
             if len(c_text) < 20:
                 continue

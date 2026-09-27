@@ -27,9 +27,10 @@ class SectionAwareChunker:
     Hierarchy: Section -> Heading -> Paragraph -> Sentence -> Token Limit.
     """
 
-    def __init__(self, max_chunk_tokens: int = 450, chunk_overlap_tokens: int = 80):
+    def __init__(self, max_chunk_tokens: int = 350, chunk_overlap_tokens: int = 80, max_chunk_chars: int = 1800):
         self.max_chunk_tokens = max_chunk_tokens
         self.chunk_overlap_tokens = chunk_overlap_tokens
+        self.max_chunk_chars = max_chunk_chars
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -98,6 +99,7 @@ class SectionAwareChunker:
         section_chunks: List[ParsedChunk] = []
         curr_blocks: List[Dict[str, Any]] = []
         curr_tokens = 0
+        curr_chars = 0
 
         def emit_chunk(b_list: List[Dict[str, Any]], chunk_num: int) -> Optional[ParsedChunk]:
             if not b_list:
@@ -120,41 +122,46 @@ class SectionAwareChunker:
                 token_count=t_count
             )
 
-
         for b in blocks:
             b_text = b["text"]
             b_tokens = self.estimate_tokens(b_text)
+            b_chars = len(b_text)
 
-            # If a single block exceeds max_chunk_tokens, split it by sentence
-            if b_tokens > self.max_chunk_tokens:
+            # If a single block exceeds max_chunk_tokens or max_chunk_chars, split it by sentence
+            if b_tokens > self.max_chunk_tokens or b_chars > self.max_chunk_chars:
                 if curr_blocks:
                     c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
                     if c:
                         section_chunks.append(c)
                     curr_blocks = []
                     curr_tokens = 0
+                    curr_chars = 0
 
                 sub_chunks = self._chunk_large_block(doc_id, section, b, full_text, start_idx + len(section_chunks))
                 section_chunks.extend(sub_chunks)
                 continue
 
-            if curr_tokens + b_tokens > self.max_chunk_tokens and curr_blocks:
+            if (curr_tokens + b_tokens > self.max_chunk_tokens or curr_chars + b_chars > self.max_chunk_chars) and curr_blocks:
                 c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
                 if c:
                     section_chunks.append(c)
 
-                # Check if last block can be kept as overlap
+                # Check if last block can be kept as overlap within character limit
                 last_b = curr_blocks[-1]
                 last_b_tokens = self.estimate_tokens(last_b["text"])
-                if last_b_tokens <= self.chunk_overlap_tokens:
+                last_b_chars = len(last_b["text"])
+                if last_b_tokens <= self.chunk_overlap_tokens and last_b_chars + b_chars <= self.max_chunk_chars:
                     curr_blocks = [last_b, b]
                     curr_tokens = last_b_tokens + b_tokens
+                    curr_chars = last_b_chars + b_chars
                 else:
                     curr_blocks = [b]
                     curr_tokens = b_tokens
+                    curr_chars = b_chars
             else:
                 curr_blocks.append(b)
                 curr_tokens += b_tokens
+                curr_chars += b_chars
 
         if curr_blocks:
             c = emit_chunk(curr_blocks, start_idx + len(section_chunks))
@@ -184,6 +191,7 @@ class SectionAwareChunker:
         chunks: List[ParsedChunk] = []
         curr_spans = []
         curr_tokens = 0
+        curr_chars = 0
 
         def emit_sentence_chunk(spans: List[tuple], chunk_idx: int) -> Optional[ParsedChunk]:
             if not spans:
@@ -207,27 +215,53 @@ class SectionAwareChunker:
                 token_count=self.estimate_tokens(chunk_text)
             )
 
-
         for span in sentence_spans:
             s_text = b_text[span[0]:span[1]]
             s_tokens = self.estimate_tokens(s_text)
+            s_chars = len(s_text)
 
-            if curr_tokens + s_tokens > self.max_chunk_tokens and curr_spans:
+            # If a single sentence exceeds max_chunk_chars, split it cleanly
+            if s_chars > self.max_chunk_chars:
+                if curr_spans:
+                    c = emit_sentence_chunk(curr_spans, start_num + len(chunks))
+                    if c:
+                        chunks.append(c)
+                    curr_spans = []
+                    curr_tokens = 0
+                    curr_chars = 0
+                sub_start = span[0]
+                while sub_start < span[1]:
+                    sub_end = min(span[1], sub_start + self.max_chunk_chars)
+                    if sub_end < span[1]:
+                        space_idx = b_text.rfind(" ", sub_start, sub_end)
+                        if space_idx > sub_start + 100:
+                            sub_end = space_idx
+                    c = emit_sentence_chunk([(sub_start, sub_end)], start_num + len(chunks))
+                    if c:
+                        chunks.append(c)
+                    sub_start = sub_end
+                continue
+
+            if (curr_tokens + s_tokens > self.max_chunk_tokens or curr_chars + s_chars > self.max_chunk_chars) and curr_spans:
                 c = emit_sentence_chunk(curr_spans, start_num + len(chunks))
                 if c:
                     chunks.append(c)
 
                 last_span = curr_spans[-1]
-                last_tokens = self.estimate_tokens(b_text[last_span[0]:last_span[1]])
-                if last_tokens <= self.chunk_overlap_tokens:
+                last_text = b_text[last_span[0]:last_span[1]]
+                last_tokens = self.estimate_tokens(last_text)
+                if last_tokens <= self.chunk_overlap_tokens and len(last_text) + s_chars <= self.max_chunk_chars:
                     curr_spans = [last_span, span]
                     curr_tokens = last_tokens + s_tokens
+                    curr_chars = len(last_text) + s_chars
                 else:
                     curr_spans = [span]
                     curr_tokens = s_tokens
+                    curr_chars = s_chars
             else:
                 curr_spans.append(span)
                 curr_tokens += s_tokens
+                curr_chars += s_chars
 
         if curr_spans:
             c = emit_sentence_chunk(curr_spans, start_num + len(chunks))

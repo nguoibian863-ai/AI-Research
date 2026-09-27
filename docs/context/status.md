@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `19b14d0` (clause-aware comparative scoping, metric comparability guard & model variant differentiation).
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết đồng bộ Chunker/Extractor limit, đo lường NLI Calibration 20 cặp và bổ sung Off-Topic Claim Guardrail.
 
 ## Tiến độ
 
@@ -9,13 +9,37 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: clause-aware comparative scoping, metric comparability guardrail chống false CONTRADICTED, model variant suffixes differentiation. Còn: writer theo section, UI đầy đủ |
+| 4 — Verification + UI | 🟢 đang thực hiện | NLI Verifier đạt 90.0% accuracy trên 20 cặp calibration (0.0% FP trên negatives); bổ sung Off-Topic Claim Guardrail; đồng bộ chunk limit <= 1800 chars. Còn: writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: **126 passed, 0 skipped**.
+Test: **132 passed, 0 skipped** (130 unit tests + 2 calibration/live tests).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
+
+## Đã giải quyết (Chunker Limit, NLI Calibration & Off-Topic Claim Guardrail)
+
+- **Đồng bộ giới hạn Chunker & Extractor (loại bỏ cắt thô bạo tail chunk)**:
+  - `SectionAwareChunker` trong `backend/parsing/chunker.py` bổ sung tham số `max_chunk_chars: int = 1800` (đồng thời giảm `max_chunk_tokens: int = 350`), kiểm soát độ dài ký tự và token ngay tại các ranh giới tự nhiên (khối câu / đoạn văn).
+  - Loại bỏ hoàn toàn lệnh cắt đuôi cưỡng bức `c_text = c_text[:1800]` trong `EvidenceExtractor` (chỉ giữ log cảnh báo nếu chunk vượt giới hạn), ngăn chặn việc mất 9% nội dung kết luận/số liệu ở cuối chunk.
+  - Cập nhật `EXTRACTOR_PROMPT_VERSION = "v1.3"` và chỉ dẫn trích xuất "1 to 3 key atomic facts".
+  - Bổ sung unit tests trong `tests/test_parsing.py` và `tests/test_evidence.py`.
+- **Hiệu chuẩn NLI Verifier (NLI Calibration) với 20 cặp ground truth**:
+  - Tạo bộ fixture `tests/fixtures/nli_calibration.jsonl` gồm 20 cặp câu khẳng định - bằng chứng trích xuất từ dữ liệu thực tế (8 SUPPORTED, 6 NOT_SUPPORTED, 6 CONTRADICTED).
+  - Tạo script đánh giá `scripts/calibrate_nli.py` và test case `@pytest.mark.slow` trong `tests/test_nli_calibration.py`.
+  - Kết quả chạy trực tiếp với model SmolLM3:
+    - **False Positive SUPPORTED rate on negatives**: **0/12 (0.0%)** (yêu cầu `< 20%`).
+    - **Label SUPPORTED**: **8/8 (100.0%)**.
+    - **Label CONTRADICTED**: **6/6 (100.0%)**.
+    - **Label NOT_SUPPORTED**: **4/6 (66.7%)** (2 ca chuyển sang CONTRADICTED, an toàn tuyệt đối vì không bị false positive).
+    - **Overall Accuracy**: **90.0% (18/20)**.
+- **Guardrail chống claim ngoài luồng (Off-Topic Claim Guardrail)**:
+  - Một claim trích dẫn hợp lệ chỉ được tính vào `supported_claims_count` khi câu văn đề cập trực tiếp đến ít nhất một thực thể cốt lõi của đề tài (`goal_core_entities`).
+  - Nếu claim chỉ nói về thực thể khác (ví dụ YOLOv10 khi đề tài là YOLOv8 vs RT-DETR), claim được gán trạng thái `status="OFF_TOPIC"` và `verified: False`, không được tính vào `supported_claims_count`.
+  - Nếu báo cáo chỉ toàn claim ngoài luồng, phiên nghiên cứu chuyển trạng thái `PARTIAL` với lý do minh bạch: `"Report claims do not address the research goal entities (off-topic)"`.
+  - Bổ sung unit test `test_off_topic_claim_guardrail_marks_off_topic_and_session_partial` trong `tests/test_engine.py`.
+- **Báo cáo chi tiết phiên `sess_2137844bb549`**:
+  - Đã xuất và phân tích toàn văn report, evidence và 5 claims của phiên: giải thích rõ tại sao phiên dừng ở `PARTIAL` (thiếu evidence cho `yolov8, rt-detr`, có claim UNSUPPORTED, và 4 claim CITED thực tế nói về YOLOv10).
 
 ## Đã giải quyết (Plan 12.5 & 43.1)
 
