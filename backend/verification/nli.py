@@ -56,17 +56,20 @@ CONTEXT_EXCLUDED = DATASET_BENCHMARK_TERMS | HARDWARE_ENV_TERMS | LINKING_VERBS 
 # Metric polarities (Plan 23 & Review items 3)
 LOWER_IS_BETTER_METRICS: Set[str] = {
     "latency", "error", "error rate", "loss", "runtime", "time", "ms",
-    "params", "parameters", "flops", "memory", "footprint", "vram", "cost", "delay"
+    "params", "parameters", "flops", "memory", "footprint", "vram", "cost", "delay",
+    "training time", "train time", "inference time", "size", "model size"
 }
 HIGHER_IS_BETTER_METRICS: Set[str] = {
     "accuracy", "acc", "ap", "map", "nds", "throughput", "fps", "score",
-    "f1", "precision", "recall", "speedup", "tps"
+    "f1", "precision", "recall", "speedup", "tps", "speed", "efficiency",
+    "inference speed", "sample efficiency"
 }
 ALL_KNOWN_METRICS: Set[str] = LOWER_IS_BETTER_METRICS | HIGHER_IS_BETTER_METRICS
 
 SPEED_METRIC_TERMS: Set[str] = {
-    "latency", "speed", "fps", "ms", "throughput", "runtime", "time", "inference time",
-    "inference latency", "delay", "speedup", "tps"
+    "latency", "speed", "fps", "ms", "throughput", "runtime", "time", "inference",
+    "inference time", "inference latency", "inference speed", "delay", "speedup",
+    "tps", "training time", "train time"
 }
 ACCURACY_METRIC_TERMS: Set[str] = {
     "accuracy", "acc", "ap", "map", "nds", "score", "f1", "precision", "recall",
@@ -183,28 +186,39 @@ def _resolve_polarity_and_domain(comp: str, metrics: Set[str]) -> Tuple[int, str
     of a comparative relation given the comparative word and context metrics.
     """
     c = comp.lower().strip()
-    if c in {"faster", "slower"}:
-        return (1 if c == "faster" else -1), "speed"
-    if c in {"outperforms", "beats", "exceeds"}:
-        return 1, "general"
-    if c in {"underperforms", "trails", "loses to"}:
-        return -1, "general"
 
+    # 1. Determine domain from context metrics if available
+    domain = "general"
+    for m in metrics:
+        if m in SPEED_METRIC_TERMS:
+            domain = "speed"
+            break
+        elif m in ACCURACY_METRIC_TERMS:
+            domain = "accuracy"
+            break
+
+    # 2. Check metric-specific polarity
     for m in metrics:
         pol = _get_metric_polarity(c, m)
         if pol != 0:
-            domain = "general"
-            if m in SPEED_METRIC_TERMS:
-                domain = "speed"
-            elif m in ACCURACY_METRIC_TERMS:
-                domain = "accuracy"
             return pol, domain
 
+    # 3. Check inherent polarity of comparative word
+    if c in {"faster"}:
+        return 1, "speed"
+    if c in {"slower"}:
+        return -1, "speed"
+    if c in {"better", "superior", "outperforms", "exceeds", "beats"}:
+        return 1, domain
+    if c in {"worse", "inferior", "underperforms", "trails", "loses to"}:
+        return -1, domain
+
+    # 4. Fallback for generic relative comparatives without metric (higher, lower)
     pol = _get_metric_polarity(c, "")
     if pol != 0:
-        return pol, "general"
+        return pol, domain
 
-    return 0, "unknown"
+    return 0, domain if domain != "general" else "unknown"
 
 
 def strip_citation_markers(text: str) -> str:
@@ -224,13 +238,58 @@ def _normalize_text_for_match(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+VARIANT_SUFFIX_PATTERN = re.compile(
+    r"^(?:[nsmlx]|nano|tiny|small|base|large|xlarge|huge|r\d+|d\d+|b\d+|v\d+|\d+)$",
+    re.IGNORECASE
+)
+
+
+def _extract_base_and_suffix(entity: str) -> Tuple[str, str]:
+    """
+    Separates a model entity into its base family and variant suffix.
+    E.g.:
+      'yolov8-l' -> ('yolov8', 'l')
+      'yolov8_n' -> ('yolov8', 'n')
+      'yolov8n'  -> ('yolov8', 'n')
+      'rt-detr-r50' -> ('rt-detr', 'r50')
+      'rt-detr'  -> ('rt-detr', '')
+      'yolov8'   -> ('yolov8', '')
+      'resnet50' -> ('resnet', '50')
+    """
+    ent = entity.lower().strip()
+    # 1. Hyphen or underscore followed by recognized variant: e.g. -l, -r50, -nano
+    m = re.match(r"^([a-z0-9_\-\.]+)[-_]([a-z0-9]+)$", ent)
+    if m and VARIANT_SUFFIX_PATTERN.match(m.group(2)):
+        return m.group(1), m.group(2)
+
+    # 2. Attached letter variant for common models: yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
+    m2 = re.match(r"^(yolo[v\d]+|rt-?detr|resnet\d*|vit[-_]?[a-z\d]*)([nsmlx])$", ent)
+    if m2:
+        return m2.group(1), m2.group(2)
+
+    # 3. Model family followed by numeric variant: resnet50, resnet101, vgg16, etc.
+    m3 = re.match(r"^(resnet|vgg|densenet|efficientnet[-_]?[b\d]*|mobilenet[-_]?[v\d]*)[-_]?(\d+)$", ent)
+    if m3:
+        return m3.group(1), m3.group(2)
+
+    return ent, ""
+
+
 def _entities_match(e1: str, e2: str) -> bool:
-    """Checks whether two entities are identical or variants of the same model/subject."""
+    """Checks whether two entities are identical or compatible variants of the same model/subject."""
     if not e1 or not e2:
         return False
     e1_l, e2_l = e1.lower().strip(), e2.lower().strip()
     if e1_l == e2_l:
         return True
+
+    b1, s1 = _extract_base_and_suffix(e1_l)
+    b2, s2 = _extract_base_and_suffix(e2_l)
+
+    # If both have different non-empty variant suffixes, they are DIFFERENT model variants!
+    if s1 and s2 and s1 != s2:
+        return False
+
     return subject_matches_entity(e1_l, e2_l) or subject_matches_entity(e2_l, e1_l)
 
 
@@ -247,66 +306,89 @@ def _tokenize_content_words(text: str) -> List[str]:
 def extract_comparative_triples(text: str, known_entities: Optional[List[str]] = None) -> List[Tuple[str, str, str]]:
     """
     Extracts structured comparative relations from text: (subject, comparative_word, object).
-    Uses strict word boundaries, prioritizes known research goal entities, and searches backward for the subject.
+    Uses strict word boundaries, clause-aware comparative scoping, and prioritizes known research goal entities.
     """
     clean_text = strip_citation_markers(text).lower()
     triples: List[Tuple[str, str, str]] = []
 
     # 1. Pattern: <EntityA> ... <comp_word> ... than <EntityB>
     than_matches = list(re.finditer(r"\bthan\s+([a-zA-Z0-9_\-\.]+)\b", clean_text))
+    all_than_objects = {tm.group(1).strip() for tm in than_matches}
+
+    prev_than_end = -1
     for tm in than_matches:
         obj_entity = tm.group(1).strip()
-        before_than = clean_text[:tm.start()]
+        than_start = tm.start()
+
+        if obj_entity in STOPWORDS or obj_entity in CONTEXT_EXCLUDED or _is_number_or_unit(obj_entity):
+            prev_than_end = tm.end()
+            continue
+
+        before_than = clean_text[:than_start]
 
         # Search for comparative words using word boundaries
-        found_comps: List[Tuple[int, int, str]] = []
+        # For this 'than', only look for comparative words that appear AFTER the previous 'than'!
+        clause_comps: List[Tuple[int, int, str]] = []
         for comp in ALL_COMPARATIVES:
             for cm in re.finditer(rf"\b{re.escape(comp)}\b", before_than):
-                found_comps.append((cm.start(), cm.end(), comp))
+                if cm.start() > prev_than_end:
+                    clause_comps.append((cm.start(), cm.end(), comp))
 
-        found_comps.sort(key=lambda x: x[0])
+        prev_than_end = tm.end()
+        if not clause_comps:
+            continue
 
-        for c_start, c_end, comp in found_comps:
-            text_before_comp = before_than[:c_start].strip()
-            tokens_before = re.findall(r"\b[a-zA-Z0-9_\-\.]+\b", text_before_comp)
+        # Per review guidelines: For each 'than', pick the CLOSEST comparative word preceding it
+        clause_comps.sort(key=lambda x: x[0])
+        c_start, c_end, comp = clause_comps[-1]  # Closest comparative word before 'than'
 
-            # Search backwards from comparative word to find closest substantive subject
-            sub_entity = None
+        text_before_comp = before_than[:c_start].strip()
+        tokens_before = re.findall(r"\b[a-zA-Z0-9_\-\.]+\b", text_before_comp)
 
-            # Priority 1: Check if any token matches known research goal entities
-            if known_entities:
-                for tok in reversed(tokens_before):
-                    if any(_entities_match(tok, ke) for ke in known_entities):
-                        sub_entity = tok
-                        break
+        # Search backwards from comparative word to find closest substantive subject
+        sub_entity = None
 
-            # Priority 2: Substantive token excluding stopwords, numbers, hardware, and generic domain nouns
-            if not sub_entity:
-                for tok in reversed(tokens_before):
-                    if (
-                        tok not in STOPWORDS
-                        and tok not in CONTEXT_EXCLUDED
-                        and not _is_number_or_unit(tok)
-                        and len(tok) > 1
-                    ):
-                        sub_entity = tok
-                        break
+        # Priority 1: Check if any token matches known research goal entities
+        # Skip tokens that are objects of 'than' clauses or comparative words to avoid picking previous clause elements as subject
+        if known_entities:
+            for tok in reversed(tokens_before):
+                if tok in all_than_objects or tok in ALL_COMPARATIVES:
+                    continue
+                if any(_entities_match(tok, ke) for ke in known_entities):
+                    sub_entity = tok
+                    break
 
-            if not sub_entity:
-                for tok in reversed(tokens_before):
-                    if (
-                        tok not in STOPWORDS
-                        and not _is_number_or_unit(tok)
-                        and len(tok) > 1
-                    ):
-                        sub_entity = tok
-                        break
+        # Priority 2: Substantive token excluding stopwords, numbers, hardware, generic domain nouns, comparatives, and than-objects
+        if not sub_entity:
+            for tok in reversed(tokens_before):
+                if tok in all_than_objects or tok in ALL_COMPARATIVES:
+                    continue
+                if (
+                    tok not in STOPWORDS
+                    and tok not in CONTEXT_EXCLUDED
+                    and not _is_number_or_unit(tok)
+                    and len(tok) > 1
+                ):
+                    sub_entity = tok
+                    break
 
-            if sub_entity and not _entities_match(sub_entity, obj_entity):
-                triples.append((sub_entity, comp, obj_entity))
+        if not sub_entity:
+            for tok in reversed(tokens_before):
+                if tok in all_than_objects or tok in ALL_COMPARATIVES:
+                    continue
+                if (
+                    tok not in STOPWORDS
+                    and not _is_number_or_unit(tok)
+                    and len(tok) > 1
+                ):
+                    sub_entity = tok
+                    break
+
+        if sub_entity and not _entities_match(sub_entity, obj_entity):
+            triples.append((sub_entity, comp, obj_entity))
 
     # 2. Pattern: <EntityA> (outperforms|underperforms|beats|trails|exceeds) <EntityB>
-    verb_pattern = r"\b([a-zA-Z0-9_\-\.]+)\b\s+(?:[a-zA-Z0-9_\-\.]+\s+){0,2}?\b(outperforms|underperforms|beats|trails|exceeds)\b\s+\b([a-zA-Z0-9_\-\.]+)\b"
+    verb_pattern = r"\b([a-zA-Z0-9_\-\.]+)\b\s+(?:[a-zA-Z0-9_\-\.]+\s+){0,2}?\b(outperforms|underperforms|beats|trails|exceeds)\b\s+(?:(?:the|all|prior|other|both|existing|baseline)\s+)*\b([a-zA-Z0-9_\-\.]+)\b"
     for m in re.finditer(verb_pattern, clean_text):
         sub, comp, obj = m.group(1), m.group(2), m.group(3)
         if (
@@ -423,25 +505,31 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
             # Check if this triple is already explicitly supported by evidence
             has_agreeing = False
             for e_s, e_c, e_o in e_triples:
-                if not (_entities_match(c_sub, e_s) and _entities_match(c_obj, e_o)):
-                    continue
                 e_metrics = _extract_metric_terms(e_clean)
-                e_pol, e_dom = _resolve_polarity_and_domain(e_c, e_metrics)
                 shared_metrics = c_metrics & e_metrics
-                domains_compatible = (
-                    (c_dom == e_dom and c_dom != "unknown")
-                    or bool(shared_metrics)
-                    or (c_dom == "general" or e_dom == "general")
-                )
-                if (c_dom == "speed" and e_dom == "accuracy") or (c_dom == "accuracy" and e_dom == "speed"):
-                    domains_compatible = False
+                e_pol, e_dom = _resolve_polarity_and_domain(e_c, e_metrics)
 
-                if c_comp == e_c and (shared_metrics or not (c_metrics or e_metrics)):
-                    has_agreeing = True
-                    break
-                if domains_compatible and c_pol != 0 and e_pol != 0 and c_pol == e_pol:
-                    has_agreeing = True
-                    break
+                same_specific_domain = (c_dom == e_dom and c_dom in ("speed", "accuracy"))
+                is_metric_comparable = (
+                    same_specific_domain
+                    or bool(shared_metrics)
+                    or (not c_metrics and not e_metrics and c_dom in ("general", "unknown") and e_dom in ("general", "unknown"))
+                )
+
+                # Direct match: same subject and same object
+                if _entities_match(c_sub, e_s) and _entities_match(c_obj, e_o):
+                    if c_comp == e_c and (shared_metrics or not (c_metrics or e_metrics)):
+                        has_agreeing = True
+                        break
+                    if is_metric_comparable and c_pol != 0 and e_pol != 0 and c_pol == e_pol:
+                        has_agreeing = True
+                        break
+
+                # Swapped match with opposite polarity: "A is slower than B" agrees with "B is faster than A"
+                if _entities_match(c_sub, e_o) and _entities_match(c_obj, e_s):
+                    if is_metric_comparable and c_pol != 0 and e_pol != 0 and c_pol == -e_pol:
+                        has_agreeing = True
+                        break
 
             if has_agreeing:
                 continue
@@ -453,17 +541,28 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                 c_pol, c_dom = _resolve_polarity_and_domain(c_comp, c_metrics)
                 e_pol, e_dom = _resolve_polarity_and_domain(e_comp, e_metrics)
 
-                domains_compatible = (
-                    (c_dom == e_dom and c_dom != "unknown")
-                    or bool(shared_metrics)
-                    or (c_dom == "general" or e_dom == "general")
+                # Check if domains directly clash (e.g. speed vs accuracy)
+                cross_domain_clash = (
+                    (c_dom == "speed" and e_dom == "accuracy")
+                    or (c_dom == "accuracy" and e_dom == "speed")
                 )
-                if (c_dom == "speed" and e_dom == "accuracy") or (c_dom == "accuracy" and e_dom == "speed"):
-                    domains_compatible = False
+                if cross_domain_clash:
+                    continue
 
                 # 3a. Reversed comparison direction (e.g. "A is faster than B" vs "B is faster than A")
                 if _entities_match(c_sub, e_obj) and _entities_match(c_obj, e_sub):
-                    if domains_compatible and c_pol != 0 and e_pol != 0 and c_pol == e_pol:
+                    # P0 Guardrail: For swapped entities with inherent comparatives:
+                    # If metrics differ or only one side specifies a metric, do NOT conclude CONTRADICTED! Defer to LLM.
+                    same_specific_domain = (c_dom == e_dom and c_dom in ("speed", "accuracy"))
+                    is_swapped_comparable = (
+                        same_specific_domain
+                        or bool(shared_metrics)
+                        or (not c_metrics and not e_metrics)
+                    )
+                    if not is_swapped_comparable:
+                        continue
+
+                    if c_pol != 0 and e_pol != 0 and c_pol == e_pol:
                         return NLIVerificationResult(
                             label=NLILabel.CONTRADICTED,
                             confidence=0.95,
@@ -473,41 +572,39 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                             evidence_quote=e_clean
                         )
                     elif c_comp == e_comp:
-                        # Exactly identical comparative word on swapped entities
-                        # E.g. A faster than B vs B faster than A -> contradiction
-                        if not (c_metrics and e_metrics and not shared_metrics):
-                            return NLIVerificationResult(
-                                label=NLILabel.CONTRADICTED,
-                                confidence=0.95,
-                                reason=f"Reversed comparison direction between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
-                                verifier_type="rule_based",
-                                claim_text=c_clean,
-                                evidence_quote=e_clean
-                            )
+                        return NLIVerificationResult(
+                            label=NLILabel.CONTRADICTED,
+                            confidence=0.95,
+                            reason=f"Reversed comparison direction between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
+                            verifier_type="rule_based",
+                            claim_text=c_clean,
+                            evidence_quote=e_clean
+                        )
                     elif c_comp in SUPERIOR_TERMS and e_comp in SUPERIOR_TERMS:
-                        if shared_metrics or not (c_metrics or e_metrics):
-                            return NLIVerificationResult(
-                                label=NLILabel.CONTRADICTED,
-                                confidence=0.95,
-                                reason=f"Reversed superior comparison between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
-                                verifier_type="rule_based",
-                                claim_text=c_clean,
-                                evidence_quote=e_clean
-                            )
+                        return NLIVerificationResult(
+                            label=NLILabel.CONTRADICTED,
+                            confidence=0.95,
+                            reason=f"Reversed superior comparison between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
+                            verifier_type="rule_based",
+                            claim_text=c_clean,
+                            evidence_quote=e_clean
+                        )
                     elif c_comp in INFERIOR_TERMS and e_comp in INFERIOR_TERMS:
-                        if shared_metrics or not (c_metrics or e_metrics):
-                            return NLIVerificationResult(
-                                label=NLILabel.CONTRADICTED,
-                                confidence=0.95,
-                                reason=f"Reversed inferior comparison between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
-                                verifier_type="rule_based",
-                                claim_text=c_clean,
-                                evidence_quote=e_clean
-                            )
+                        return NLIVerificationResult(
+                            label=NLILabel.CONTRADICTED,
+                            confidence=0.95,
+                            reason=f"Reversed inferior comparison between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
+                            verifier_type="rule_based",
+                            claim_text=c_clean,
+                            evidence_quote=e_clean
+                        )
 
-                # 3b. Opposite comparative polarity on same entity pair (e.g. "faster" vs "slower")
+                # 3b. Opposite comparative polarity on same entity pair (e.g. "faster" vs "slower", "exceeds" vs "trails")
                 if _entities_match(c_sub, e_sub) and _entities_match(c_obj, e_obj):
-                    if domains_compatible and c_pol != 0 and e_pol != 0 and c_pol != e_pol:
+                    if c_metrics and e_metrics and not shared_metrics and (c_dom != e_dom):
+                        continue
+
+                    if c_pol != 0 and e_pol != 0 and c_pol != e_pol:
                         return NLIVerificationResult(
                             label=NLILabel.CONTRADICTED,
                             confidence=0.95,
@@ -517,7 +614,7 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                             evidence_quote=e_clean
                         )
 
-                    # Case I: Inherent metric-specific opposing pairs (faster vs slower, outperforms vs underperforms)
+                    # Case I: Inherent metric-specific opposing pairs (faster vs slower, outperforms vs underperforms, exceeds vs trails)
                     if INHERENT_OPPOSING_PAIRS.get(c_comp) == e_comp:
                         return NLIVerificationResult(
                             label=NLILabel.CONTRADICTED,
@@ -530,9 +627,6 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
 
                     # Case II: Generic relative comparatives (higher vs lower, more vs less)
                     # ONLY contradicts if comparing the EXACT SAME METRIC!
-                    # E.g. "higher latency" vs "lower latency" -> CONTRADICTED
-                    # "higher accuracy" vs "lower accuracy" -> CONTRADICTED
-                    # But "lower error rate" vs "higher accuracy" -> NOT CONTRADICTED (different metric words, aligned polarity)
                     if OPPOSING_PAIRS.get(c_comp) == e_comp:
                         if shared_metrics:
                             return NLIVerificationResult(

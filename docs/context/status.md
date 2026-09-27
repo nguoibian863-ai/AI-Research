@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `aa5a034` (mock NLI, multi-quote 1-call optimization, metric polarity & generic domain nouns).
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `19b14d0` (clause-aware comparative scoping, metric comparability guard & model variant differentiation).
 
 ## Tiến độ
 
@@ -9,10 +9,10 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: sửa mock NLI strict, pipeline multi-quote 1 LLM call, phân biệt lý do PARTIAL khi NLI unavailable, metric polarity domain matching, lọc generic domain nouns và ưu tiên known_entities. Còn: writer theo section, UI đầy đủ |
+| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: clause-aware comparative scoping, metric comparability guardrail chống false CONTRADICTED, model variant suffixes differentiation. Còn: writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: **123 passed, 0 skipped**.
+Test: **126 passed, 0 skipped**.
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -194,6 +194,25 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
   - Trong `extract_comparative_triples`: ưu tiên 1 so khớp với `known_entities`, ưu tiên 2 bỏ qua `GENERIC_DOMAIN_NOUNS`, giúp câu phức như `"RT-DETR is a real-time detector with higher AP than YOLOv8"` trích xuất chính xác chủ ngữ là `rt-detr`.
 - **Regression Tests**:
   - Đạt **123 passed, 0 skipped** (bổ sung 4 unit test mới kiểm thử hồi quy cho generic nouns, polarity, multi-quote 1-call và nli unavailable trong `tests/test_verification_nli.py`).
+
+## Đã giải quyết (sau review `19b14d0` — Clause-Aware Comparative Scoping, Metric Comparability Guard & Model Variant Differentiation)
+
+- **Ngăn chặn mâu thuẫn giả khi khác metric hoặc một bên không có metric (P0)**:
+  - Bổ sung `speed`, `efficiency`, `inference speed`, `sample efficiency` vào `HIGHER_IS_BETTER_METRICS` & `ALL_KNOWN_METRICS`.
+  - Bổ sung `training time`, `train time`, `inference time`, `size`, `model size` vào `LOWER_IS_BETTER_METRICS`.
+  - Bổ sung `inference`, `training time`, `train time`, `inference speed` vào `SPEED_METRIC_TERMS`.
+  - Với các quan hệ hoán đổi thực thể (swapped entities, 3a): áp dụng guardrail `is_swapped_comparable`. Chỉ kết luận `CONTRADICTED 0.95` khi hai bên cùng so sánh trên cùng domain cụ thể (`speed` vs `speed` hoặc `accuracy` vs `accuracy`), hoặc chia sẻ metric cụ thể (`shared_metrics`), hoặc cả hai đều không nêu metric. Nếu một bên là `accuracy` và bên kia là `speed`, hoặc một bên có metric và bên kia là so sánh chung, rule-based KHÔNG kết luận `CONTRADICTED` mà chuyển quyền đánh giá ngữ nghĩa cho LLM.
+- **Trích xuất quan hệ so sánh theo từng mệnh đề (Clause-Aware Scoping) (P0)**:
+  - Trong `extract_comparative_triples`: với mỗi từ khóa `than <Obj>`, chỉ ghép cặp với từ so sánh gần nhất nằm ngay trước nó (sau `prev_than_end`), loại bỏ việc ghép từ so sánh của mệnh đề trước với tân ngữ của mệnh đề sau.
+  - Quét ngược tìm chủ ngữ loại trừ toàn bộ tân ngữ của các mệnh đề `than` (`all_than_objects`) và toàn bộ từ so sánh (`ALL_COMPARATIVES`), ngăn chặn việc nhầm lẫn tân ngữ của vế trước thành chủ ngữ của vế sau.
+  - Câu phức `"RT-DETR is faster than YOLOv8 but slower than RF-DETR"` trích xuất chính xác 2 triple `(rt-detr, faster, yolov8)` và `(rt-detr, slower, rf-detr)`, hoàn toàn không sinh triple chéo sai `(rt-detr, faster, rf-detr)` hay `(yolov8, slower, rf-detr)`.
+  - Hỗ trợ phát hiện đồng thuận khi hoán đổi thực thể đối lập chiều (`"A is slower than B"` đồng thuận với `"B is faster than A"`).
+- **Phân biệt hậu tố biến thể model (Model Variant Suffixes) (P1)**:
+  - Xây dựng `VARIANT_SUFFIX_PATTERN` bắt các hậu tố kích thước/backbone chuẩn (`-l`, `-n`, `-s`, `-m`, `-x`, `-r50`, `-r101`, `yolov8n`, `resnet50`...). Bảo tồn các tên model họ chung có gạch nối (`rt-detr`, `fast-rcnn`, `mask-rcnn`).
+  - Trong `_entities_match(e1, e2)`: nếu hai thực thể cùng có hậu tố biến thể khác nhau (`s1 and s2 and s1 != s2`, ví dụ `yolov8-l` vs `yolov8-n`, hoặc `rt-detr-r50` vs `rt-detr-r101`), coi chúng là hai thực thể khác biệt và trả về `False`.
+  - Khẳng định `RT-DETR-L is faster than YOLOv8-L` không bị coi là mâu thuẫn với `YOLOv8-N is faster than RT-DETR-L`.
+- **Regression Tests**:
+  - Đạt **126 passed, 0 skipped** (bổ sung 3 unit test hồi quy toàn diện cho 3 vấn đề trong `tests/test_verification_nli.py`).
 
 ## Vấn đề còn mở (ưu tiên từ trên xuống)
 

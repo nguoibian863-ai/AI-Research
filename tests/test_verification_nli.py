@@ -662,3 +662,75 @@ def test_pipeline_multi_quote_single_llm_call_and_no_single_quote_contradiction(
     assert "CenterPoint achieves 67.3 NDS" in prompt_used
     assert "PointPillars achieves 59.2 NDS" in prompt_used
 
+
+def test_rule_based_nli_different_metrics_not_contradicted():
+    """Item 1: Inherent comparatives with different metrics or one-sided metric must NOT be declared CONTRADICTED."""
+    verifier = RuleBasedNLIVerifier()
+
+    # Case A: Accuracy vs Speed (different domains)
+    c1 = "RT-DETR outperforms YOLOv8 in accuracy"
+    q1 = "YOLOv8 outperforms RT-DETR in speed"
+    res1 = verifier.verify(c1, q1)
+    assert res1.label != NLILabel.CONTRADICTED
+    assert res1.confidence <= 0.70
+
+    # Case B: One side has metric, other side is generic
+    c2 = "RT-DETR outperforms YOLOv8 in accuracy"
+    q2 = "YOLOv8 outperforms RT-DETR"
+    res2 = verifier.verify(c2, q2)
+    assert res2.label != NLILabel.CONTRADICTED
+
+    # Case C: Same metric domain (speed vs speed) -> correctly CONTRADICTED
+    c3 = "RT-DETR outperforms YOLOv8 in speed"
+    q3 = "YOLOv8 outperforms RT-DETR in speed"
+    res3 = verifier.verify(c3, q3)
+    assert res3.label == NLILabel.CONTRADICTED
+    assert res3.confidence == 0.95
+
+
+def test_rule_based_nli_compound_than_clauses_no_cross_triple():
+    """Item 2: Compound than-clauses ('A is faster than B but slower than C') must not create cross triples."""
+    from backend.verification.nli import extract_comparative_triples
+
+    text = "RT-DETR is faster than YOLOv8 but slower than RF-DETR"
+    triples = extract_comparative_triples(text, known_entities=["rt-detr", "yolov8", "rf-detr"])
+
+    # Must extract ('rt-detr', 'faster', 'yolov8') and ('rt-detr', 'slower', 'rf-detr')
+    assert ("rt-detr", "faster", "yolov8") in triples
+    assert ("rt-detr", "slower", "rf-detr") in triples
+
+    # Must NOT pair 'faster' with 'rf-detr'
+    assert ("rt-detr", "faster", "rf-detr") not in triples
+    # Must NOT pair 'yolov8' as subject of 'slower'
+    assert ("yolov8", "slower", "rf-detr") not in triples
+
+    # Verifier check: Claim matches quote 'RF-DETR is faster than RT-DETR'
+    verifier = RuleBasedNLIVerifier()
+    quote = "RF-DETR is faster than RT-DETR"
+    res = verifier.verify(text, quote, known_entities=["rt-detr", "yolov8", "rf-detr"])
+    assert res.label != NLILabel.CONTRADICTED
+
+
+def test_entities_match_different_model_variants_distinct():
+    """Item 3: Different model variant suffixes (L vs N, R50 vs R101) must NOT match as identical entities."""
+    from backend.verification.nli import _entities_match
+
+    # Different suffixes -> False
+    assert not _entities_match("yolov8-l", "yolov8-n")
+    assert not _entities_match("yolov8l", "yolov8n")
+    assert not _entities_match("rt-detr-r50", "rt-detr-r101")
+    assert not _entities_match("resnet50", "resnet101")
+
+    # Base matches variant -> True
+    assert _entities_match("yolov8", "yolov8-l")
+    assert _entities_match("yolov8", "yolov8n")
+    assert _entities_match("rt-detr", "rt-detr-r50")
+
+    # Claim comparing L variants vs Quote with N variant must NOT contradict
+    verifier = RuleBasedNLIVerifier()
+    claim = "RT-DETR-L is faster than YOLOv8-L"
+    quote = "YOLOv8-N is faster than RT-DETR-L"
+    res = verifier.verify(claim, quote)
+    assert res.label != NLILabel.CONTRADICTED
+
+
