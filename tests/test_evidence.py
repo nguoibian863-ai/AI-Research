@@ -397,7 +397,8 @@ def test_run_week1_end_to_end_extracts_evidence_without_foreign_key_error(tmp_pa
                     "confidence": 0.99
                 }
             ]
-        }
+        },
+        "generate": "CenterPoint achieves 60.3 mAP [E1] on nuScenes benchmark."
     }
 
     db = DatabaseManager(db_path=tmp_path / "e2e_extract_test.db")
@@ -1334,7 +1335,7 @@ def test_bold_citations_from_small_model_count_as_cited(tmp_path):
              "metric": "NDS", "value": "67.3", "raw_quote": "CenterPoint achieves 60.3 mAP and 67.3 NDS"},
             {"statement": "PointPillars achieves 59.2 NDS on nuScenes.", "subject": "PointPillars", "predicate": "achieves",
              "metric": "NDS", "value": "59.2", "raw_quote": "PointPillars achieves 59.2 NDS"}]},
-        "generate": "CenterPoint reaches 67.3 NDS **E1** while PointPillars reaches 59.2 NDS (E2).",
+        "generate": "CenterPoint achieves 67.3 NDS **E1** and PointPillars achieves 59.2 NDS (E2).",
     }
     engine = ResearchEngine(
         MockLLMBackend(canned), DatabaseManager(db_path=tmp_path / "cite.db"), ResearchLimits(max_research_steps=2),

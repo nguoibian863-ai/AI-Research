@@ -5,7 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 from backend.verification.schemas import NLILabel, NLIVerificationResult, NLIStructuredOutputSchema
 from backend.llm.backend import LLMBackend
-from backend.core.coverage import extract_substantive_numbers
+from backend.core.coverage import (
+    extract_substantive_numbers,
+    subject_matches_entity,
+    DATASET_BENCHMARK_TERMS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,26 +21,89 @@ STOPWORDS = {
     "which", "who", "whom", "what", "as", "if", "so", "too", "very", "our", "their", "of"
 }
 
-# Comparative directional categories
-SUPERIOR_TERMS: Dict[str, str] = {
-    "faster": "slower",
-    "higher": "lower",
-    "more": "less",
-    "better": "worse",
-    "superior": "inferior",
-    "outperforms": "underperforms",
-    "exceeds": "trails",
-    "beats": "loses to",
-    "greater": "smaller",
-    "larger": "smaller"
+HARDWARE_ENV_TERMS = {
+    "t4", "gpu", "gpus", "v100", "a100", "h100", "cpu", "cpus", "cuda",
+    "tensorrt", "trt", "fp16", "fp32", "int8", "bf16", "fps", "latency",
+    "throughput", "ap", "map", "nds", "ms"
 }
-INFERIOR_TERMS: Dict[str, str] = {v: k for k, v in SUPERIOR_TERMS.items()}
-ALL_COMPARATIVES: Set[str] = set(SUPERIOR_TERMS.keys()) | set(INFERIOR_TERMS.keys())
 
-# Explicit verbal negation markers (prepositions like "without" are intentionally excluded)
+LINKING_VERBS = {
+    "is", "are", "was", "were", "be", "been", "being",
+    "run", "runs", "ran", "running",
+    "achieve", "achieves", "achieved", "achieving",
+    "perform", "performs", "performed", "performing",
+    "yield", "yields", "yielded", "yielding",
+    "reach", "reaches", "reached", "reaching",
+    "show", "shows", "shown", "showing",
+    "operate", "operates", "operated", "operating",
+    "use", "uses", "used", "using",
+    "appear", "appears", "appeared", "appearing",
+    "seem", "seems", "seemed", "seeming",
+    "become", "becomes", "became", "becoming",
+}
+
+CONTEXT_EXCLUDED = DATASET_BENCHMARK_TERMS | HARDWARE_ENV_TERMS | LINKING_VERBS
+
+# Direct opposing comparative pairs
+OPPOSING_PAIRS: Dict[str, str] = {
+    "faster": "slower",
+    "slower": "faster",
+    "higher": "lower",
+    "lower": "higher",
+    "more": "less",
+    "less": "more",
+    "better": "worse",
+    "worse": "better",
+    "superior": "inferior",
+    "inferior": "superior",
+    "outperforms": "underperforms",
+    "underperforms": "outperforms",
+    "exceeds": "trails",
+    "trails": "exceeds",
+    "beats": "loses to",
+    "loses to": "beats",
+    "greater": "smaller",
+    "smaller": "greater",
+    "larger": "smaller",
+}
+SUPERIOR_TERMS = {
+    "faster", "higher", "more", "better", "superior",
+    "outperforms", "exceeds", "beats", "greater", "larger"
+}
+INFERIOR_TERMS = {v for k, v in OPPOSING_PAIRS.items() if k in SUPERIOR_TERMS}
+ALL_COMPARATIVES: Set[str] = set(OPPOSING_PAIRS.keys())
+
+# Explicit verbal negation markers
 VERBAL_NEGATIONS: Set[str] = {
     "not", "never", "cannot", "cant", "fails to", "unable to", "neither", "nor"
 }
+
+
+def strip_citation_markers(text: str) -> str:
+    """Removes [E1], **E1**, (E1), E1 citation tags from sentence."""
+    t = re.sub(r"\[E\d+\]", " ", text)
+    t = re.sub(r"\*\*E\d+\*\*", " ", t)
+    t = re.sub(r"\(E\d+\)", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _normalize_text_for_match(text: str) -> str:
+    """Keep decimals like 67.3 intact, strip punctuation and citation brackets, lowercase and whitespace-normalize."""
+    t = strip_citation_markers(text).lower()
+    t = re.sub(r"(?<=\d)\.(?=\d)", "__DOT__", t)
+    t = re.sub(r"[^a-zA-Z0-9_\-\s]", " ", t)
+    t = t.replace("__DOT__", ".")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _entities_match(e1: str, e2: str) -> bool:
+    """Checks whether two entities are identical or variants of the same model/subject."""
+    if not e1 or not e2:
+        return False
+    e1_l, e2_l = e1.lower().strip(), e2.lower().strip()
+    if e1_l == e2_l:
+        return True
+    return subject_matches_entity(e1_l, e2_l) or subject_matches_entity(e2_l, e1_l)
 
 
 def _clean_token(t: str) -> str:
@@ -52,39 +119,50 @@ def _tokenize_content_words(text: str) -> List[str]:
 def extract_comparative_triples(text: str) -> List[Tuple[str, str, str]]:
     """
     Extracts structured comparative relations from text: (subject, comparative_word, object).
-    Examples:
-      - 'YOLOv8 is faster than RT-DETR' -> [('yolov8', 'faster', 'rt-detr')]
-      - 'RT-DETR achieves higher AP with lower latency than YOLOv8' ->
-          [('rt-detr', 'higher', 'yolov8'), ('rt-detr', 'lower', 'yolov8')]
-      - 'RT-DETR outperforms YOLOv8' -> [('rt-detr', 'outperforms', 'yolov8')]
+    Uses strict word boundaries and backward entity search for the subject.
     """
-    t_lower = text.lower()
+    clean_text = strip_citation_markers(text).lower()
     triples: List[Tuple[str, str, str]] = []
 
-    # 1. Pattern: <EntityA> ... <comp_word> (optional metric) than <EntityB>
-    # Look for "than <EntityB>"
-    than_matches = list(re.finditer(r"\bthan\s+([a-zA-Z0-9_\-\.]+)\b", t_lower))
+    # 1. Pattern: <EntityA> ... <comp_word> ... than <EntityB>
+    than_matches = list(re.finditer(r"\bthan\s+([a-zA-Z0-9_\-\.]+)\b", clean_text))
     for tm in than_matches:
-        obj_entity = tm.group(1)
-        before_than = t_lower[:tm.start()]
+        obj_entity = tm.group(1).strip()
+        before_than = clean_text[:tm.start()]
 
-        # Find any comparative words before "than"
+        # Search for comparative words using word boundaries
+        found_comps: List[Tuple[int, int, str]] = []
         for comp in ALL_COMPARATIVES:
-            comp_idx = before_than.rfind(comp)
-            if comp_idx != -1:
-                # Subject is the principal entity before the comparative
-                text_before_comp = before_than[:comp_idx].strip()
-                tokens_before = [w for w in re.findall(r"\b[a-zA-Z0-9_\-\.]+\b", text_before_comp) if w not in STOPWORDS]
-                if tokens_before:
-                    sub_entity = tokens_before[0]
-                    if sub_entity != obj_entity:
-                        triples.append((sub_entity, comp, obj_entity))
+            for cm in re.finditer(rf"\b{re.escape(comp)}\b", before_than):
+                found_comps.append((cm.start(), cm.end(), comp))
+
+        found_comps.sort(key=lambda x: x[0])
+
+        for c_start, c_end, comp in found_comps:
+            text_before_comp = before_than[:c_start].strip()
+            tokens_before = re.findall(r"\b[a-zA-Z0-9_\-\.]+\b", text_before_comp)
+
+            # Search backwards from comparative word to find closest substantive subject
+            sub_entity = None
+            for tok in reversed(tokens_before):
+                if tok not in STOPWORDS and tok not in CONTEXT_EXCLUDED and len(tok) > 1:
+                    sub_entity = tok
+                    break
+
+            if not sub_entity:
+                for tok in reversed(tokens_before):
+                    if tok not in STOPWORDS and len(tok) > 1:
+                        sub_entity = tok
+                        break
+
+            if sub_entity and not _entities_match(sub_entity, obj_entity):
+                triples.append((sub_entity, comp, obj_entity))
 
     # 2. Pattern: <EntityA> (outperforms|underperforms|beats|trails|exceeds) <EntityB>
     verb_pattern = r"\b([a-zA-Z0-9_\-\.]+)\b\s+(?:[a-zA-Z0-9_\-\.]+\s+){0,2}?\b(outperforms|underperforms|beats|trails|exceeds)\b\s+\b([a-zA-Z0-9_\-\.]+)\b"
-    for m in re.finditer(verb_pattern, t_lower):
+    for m in re.finditer(verb_pattern, clean_text):
         sub, comp, obj = m.group(1), m.group(2), m.group(3)
-        if sub not in STOPWORDS and obj not in STOPWORDS and sub != obj:
+        if sub not in STOPWORDS and obj not in STOPWORDS and not _entities_match(sub, obj):
             triples.append((sub, comp, obj))
 
     return triples
@@ -116,9 +194,11 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
     """
     High-precision, zero-latency rule-based entailment checker.
     Specifically checks:
-    1. Near-identity / substring match
-    2. Entity-aware comparative relation and direction consistency
-    3. Token overlap and numbers alignment
+    1. Near-identity / substring match (only source of rule-based SUPPORTED with confidence 1.0)
+    2. Verbal negation guardrails
+    3. Entity-aware comparative relation and direction consistency (detects CONTRADICTED)
+    4. Numeric consistency check
+    5. Token overlap (capped at PARTIALLY_SUPPORTED with confidence 0.70 to never bypass LLM)
     """
 
     def verify(self, claim: str, evidence: str, budget_tracker: Optional[Any] = None) -> NLIVerificationResult:
@@ -135,10 +215,11 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                 evidence_quote=e_clean
             )
 
-        c_norm = re.sub(r"\s+", " ", re.sub(r"[^a-zA-Z0-9_\-\.\s]", "", c_clean.lower()))
-        e_norm = re.sub(r"\s+", " ", re.sub(r"[^a-zA-Z0-9_\-\.\s]", "", e_clean.lower()))
+        c_stripped = strip_citation_markers(c_clean)
+        c_norm = _normalize_text_for_match(c_clean)
+        e_norm = _normalize_text_for_match(e_clean)
 
-        # 1. Exact or near-exact match
+        # 1. Exact or near-exact normalized match (P0 golden rule for SUPPORTED)
         if c_norm == e_norm or c_norm in e_norm or e_norm in c_norm:
             return NLIVerificationResult(
                 label=NLILabel.SUPPORTED,
@@ -149,20 +230,59 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                 evidence_quote=e_clean
             )
 
-        # 2. Entity-aware comparative relation check (Resolves Review Item 2)
+        # 2. Verbal Negation Guardrail (Review 485345a item 1)
+        c_has_neg = any(re.search(rf"\b{re.escape(neg)}\b", c_clean.lower()) for neg in VERBAL_NEGATIONS)
+        e_has_neg = any(re.search(rf"\b{re.escape(neg)}\b", e_clean.lower()) for neg in VERBAL_NEGATIONS)
+        if c_has_neg != e_has_neg:
+            return NLIVerificationResult(
+                label=NLILabel.NOT_SUPPORTED,
+                confidence=0.50,
+                reason="Verbal negation mismatch between claim and evidence, deferring to LLM verifier",
+                verifier_type="rule_based",
+                claim_text=c_clean,
+                evidence_quote=e_clean
+            )
+
+        # 3. Entity-aware comparative relation check (Resolves Review 485345a items 1a-1e)
         c_triples = extract_comparative_triples(c_clean)
         e_triples = extract_comparative_triples(e_clean)
 
         for c_sub, c_comp, c_obj in c_triples:
-            c_dir = _get_comp_direction(c_comp)
-            for e_sub, e_comp, e_obj in e_triples:
-                e_dir = _get_comp_direction(e_comp)
-                same_entities = (c_sub == e_sub and c_obj == e_obj)
-                swapped_entities = (c_sub == e_obj and c_obj == e_sub)
+            # Check if this triple is already explicitly supported by evidence
+            has_agreeing = any(
+                _entities_match(c_sub, e_s) and _entities_match(c_obj, e_o) and (
+                    c_comp == e_c or (
+                        c_comp in SUPERIOR_TERMS and e_c in SUPERIOR_TERMS
+                    ) or (
+                        c_comp in INFERIOR_TERMS and e_c in INFERIOR_TERMS
+                    )
+                )
+                for e_s, e_c, e_o in e_triples
+            )
+            if has_agreeing:
+                continue
 
-                if same_entities:
-                    # Same entity order: direction must agree
-                    if c_dir != 0 and e_dir != 0 and c_dir != e_dir:
+            for e_sub, e_comp, e_obj in e_triples:
+                # 3a. Reversed comparison direction (e.g. "A is faster than B" vs "B is faster than A")
+                if _entities_match(c_sub, e_obj) and _entities_match(c_obj, e_sub):
+                    same_dir = (
+                        c_comp == e_comp
+                        or (c_comp in SUPERIOR_TERMS and e_comp in SUPERIOR_TERMS)
+                        or (c_comp in INFERIOR_TERMS and e_comp in INFERIOR_TERMS)
+                    )
+                    if same_dir:
+                        return NLIVerificationResult(
+                            label=NLILabel.CONTRADICTED,
+                            confidence=0.95,
+                            reason=f"Reversed comparison direction between {c_sub} and {c_obj}: claim states '{c_sub} {c_comp} {c_obj}', but evidence states '{e_sub} {e_comp} {e_obj}'",
+                            verifier_type="rule_based",
+                            claim_text=c_clean,
+                            evidence_quote=e_clean
+                        )
+
+                # 3b. Opposite comparative direction on same entity pair (e.g. "faster" vs "slower")
+                if _entities_match(c_sub, e_sub) and _entities_match(c_obj, e_obj):
+                    if OPPOSING_PAIRS.get(c_comp) == e_comp:
                         return NLIVerificationResult(
                             label=NLILabel.CONTRADICTED,
                             confidence=0.95,
@@ -171,20 +291,9 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                             claim_text=c_clean,
                             evidence_quote=e_clean
                         )
-                elif swapped_entities:
-                    # Swapped entities: e.g. "A is faster than B" vs "B is faster than A"
-                    if c_dir != 0 and e_dir != 0 and c_dir == e_dir:
-                        return NLIVerificationResult(
-                            label=NLILabel.CONTRADICTED,
-                            confidence=0.95,
-                            reason=f"Reversed comparison direction between {c_sub} and {c_obj}: claim claims {c_sub} {c_comp} {c_obj}, but evidence states {e_sub} {e_comp} {e_obj}",
-                            verifier_type="rule_based",
-                            claim_text=c_clean,
-                            evidence_quote=e_clean
-                        )
 
-        # 3. Numeric consistency check
-        c_nums = extract_substantive_numbers(c_clean)
+        # 4. Numeric consistency check
+        c_nums = extract_substantive_numbers(c_stripped)
         e_nums = extract_substantive_numbers(e_clean)
         for num in c_nums:
             if num not in e_nums and num not in e_clean:
@@ -197,8 +306,8 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                     evidence_quote=e_clean
                 )
 
-        # 4. Token alignment
-        c_tokens = _tokenize_content_words(c_clean)
+        # 5. Token alignment (Token overlap alone NEVER returns SUPPORTED >= 0.85, only PARTIALLY_SUPPORTED)
+        c_tokens = _tokenize_content_words(c_stripped)
         e_tokens = _tokenize_content_words(e_clean)
 
         if not c_tokens:
@@ -219,9 +328,9 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
 
         if overlap_ratio >= 0.65:
             return NLIVerificationResult(
-                label=NLILabel.SUPPORTED,
-                confidence=min(1.0, 0.80 + (overlap_ratio * 0.20)),
-                reason=f"Strong semantic token alignment ({overlap_ratio:.0%}) with consistent facts",
+                label=NLILabel.PARTIALLY_SUPPORTED,
+                confidence=0.70,
+                reason=f"Strong token alignment ({overlap_ratio:.0%}) without exact match, deferring to LLM for full entailment",
                 verifier_type="rule_based",
                 claim_text=c_clean,
                 evidence_quote=e_clean,
@@ -230,7 +339,7 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
         elif overlap_ratio >= 0.40:
             return NLIVerificationResult(
                 label=NLILabel.PARTIALLY_SUPPORTED,
-                confidence=0.70,
+                confidence=0.60,
                 reason=f"Partial semantic token alignment ({overlap_ratio:.0%})",
                 verifier_type="rule_based",
                 claim_text=c_clean,
@@ -285,6 +394,10 @@ class LLMNLIVerifier(BaseNLIVerifier):
             if tracker:
                 calls = getattr(res, "calls_made", 1)
                 tokens = getattr(res, "total_tokens", 0)
+                if not isinstance(calls, int):
+                    calls = 1
+                if not isinstance(tokens, int):
+                    tokens = 0
                 tracker.record_llm_call(tokens=tokens, count=calls)
 
             parsed: NLIStructuredOutputSchema = res.parsed

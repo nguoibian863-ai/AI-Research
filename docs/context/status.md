@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `485345a`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `485345a`.
 
 ## Tiến độ
 
@@ -9,10 +9,10 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | Đã nối NLI Entailment Verifier (Plan 23) vào luồng chính, sửa triệt để rule-based verifier, Session Viewer hiển thị đầy đủ badge NLI. Còn: writer theo section, UI đầy đủ |
+| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: triệt tiêu false confidence của rule-based, word boundary regex, reverse entity search, xử lý phủ định và điều kiện DONE nghiêm ngặt. Còn: writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: 108 passed + 1 skipped (test FastEmbed cần mạng/cache).
+Test: 114 passed + 1 skipped (test FastEmbed cần mạng/cache).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -128,19 +128,33 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
 - **Bổ sung regression tests**:
   - Đạt 109 passed + 1 skipped (bổ sung các unit test cho 4 ca corner case của bộ luật NLI, budget enforcement, status preservation và contradiction session transition).
 
-## Vấn đề còn mở (ưu tiên từ trên xuống) — review `485345a`
+## Đã giải quyết (review `485345a` — NLI verifier & điều kiện DONE)
 
-1. **Bộ luật NLI vẫn sai ở các câu so sánh thường gặp, với độ tin cậy ≥ 0.85 nên bỏ qua luôn bước hỏi LLM** (`CompositeNLIVerifier` trả thẳng kết quả luật). Kết quả kiểm tra trực tiếp:
-   - Claim trùng nguyên văn quote "RT-DETR achieves higher AP with lower latency than YOLOv8 [E1]" → **CONTRADICTED 0.95**. Có hai lỗi chồng nhau: (a) `[E1]` còn trong claim nên bước so khớp nguyên văn thất bại; (b) một câu có cả `higher` và `lower` sinh ra hai quan hệ cùng cặp thực thể nhưng ngược chiều, và chúng bị so chéo với nhau. Claim đúng nhất lại làm session thành PARTIAL.
-   - "On T4 GPU, YOLOv8 is faster than RT-DETR" so với quote "RT-DETR is faster than YOLOv8" → **SUPPORTED 0.97**: chủ ngữ bị lấy là token đầu câu (`t4`), nên không phát hiện đảo chiều.
-   - "RT-DETR is not faster than YOLOv8" → **SUPPORTED 0.93**: `VERBAL_NEGATIONS` được khai báo nhưng không dùng ở đâu.
-   - "YOLOv8 runs faster than RT-DETR-R50" so với quote "RT-DETR-R50 runs faster than YOLOv8-L" → **SUPPORTED**: `yolov8` và `yolov8-l` không được coi là cùng thực thể.
-   - `rfind(comp)` so khớp chuỗi con, nên `more` khớp trong "furthermore", `less` khớp trong "lossless".
-   - Hướng sửa: bỏ `[E#]` trước khi so; chỉ ghép cặp từ so sánh gắn với cùng mệnh đề "than"; chủ ngữ là thực thể của goal gần nhất (dùng `subject_matches_entity`); có phủ định thì trả không chắc chắn (để LLM quyết); bộ luật chỉ được tự kết luận SUPPORTED khi khớp nguyên văn.
-2. **DONE vẫn có thể xảy ra khi không claim nào được NLI xác nhận**: `supported_claims_count` tăng cho mọi claim CITED bất kể nhãn NLI (cả `NOT_SUPPORTED`). Theo nguyên tắc "không fake confidence", DONE nên cần ít nhất một claim SUPPORTED; còn `NOT_SUPPORTED` / `PARTIALLY_SUPPORTED` thì ghi lý do PARTIAL hoặc cảnh báo.
-3. Chạy E2E thật lại 2–3 goal để xem NLI hoạt động thực tế với LLM thật (SmolLM3), kiểm tra tỷ lệ latency/budget tiêu thụ cho NLI trên CPU/GPU. thật lại 2–3 goal để xem NLI hoạt động thực tế với LLM thật (SmolLM3), kiểm tra tỷ lệ latency/budget tiêu thụ cho NLI trên CPU/GPU.
-4. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
-5. Tuần 4 tiếp theo: writer theo section (plan 28), UI đầy đủ.
+- **Chuẩn hóa claim và so khớp nguyên văn an toàn**:
+  - Tự động lược bỏ các thẻ trích dẫn `[E#]`, `**E#**`, `(E#)` trước khi so khớp chuỗi.
+  - Chuẩn hóa text (`_normalize_text_for_match`): giữ nguyên số thập phân (67.3), chuẩn hóa dấu câu và khoảng trắng. Claim trùng nguyên văn quote chứa `[E1]` đạt ngay `SUPPORTED 1.0`.
+- **Cải tổ bộ trích xuất so sánh `extract_comparative_triples`**:
+  - Dùng word boundary regex (`\b{comp}\b`) cho từ so sánh, loại bỏ hoàn toàn so khớp chuỗi con giả ("more" trong "furthermore", "less" trong "lossless").
+  - Quét ngược (reverse token search) từ từ so sánh để xác định chủ ngữ thực thể gần nhất; bổ sung `LINKING_VERBS` (run, achieve, yield, perform...) vào danh sách bỏ qua, giúp "On T4 GPU, YOLOv8 is faster than RT-DETR" nhận diện chính xác chủ ngữ là `yolov8`.
+  - Sử dụng `_entities_match` (dựa trên `subject_matches_entity`) cho phép nhận diện biến thể mô hình (`yolov8` vs `yolov8-l`, `rt-detr` vs `rt-detr-r50`), bắt chính xác mâu thuẫn đảo chiều (`CONTRADICTED 0.95`).
+  - Khi câu có nhiều từ so sánh trên các metric khác nhau ("higher AP with lower latency"), không còn bị so chéo đối lập giả.
+- **Guardrail cho từ phủ định (`VERBAL_NEGATIONS`)**:
+  - Khi claim hoặc evidence xuất hiện từ phủ định logic (not, never, cannot...) mà không khớp nguyên văn, bộ luật trả về `NOT_SUPPORTED` với confidence thấp (0.50), không bao giờ tự ý kết luận `SUPPORTED`, nhường quyền phán quyết cho LLM.
+- **Nguyên tắc vàng: Rule-based không bao giờ bypass LLM bằng token overlap**:
+  - Bộ luật chỉ trả `SUPPORTED` với confidence 1.0 khi khớp nguyên văn/substring chuẩn hóa.
+  - Token overlap cao chỉ trả tối đa `PARTIALLY_SUPPORTED (confidence 0.70 < 0.85)`, đảm bảo `CompositeNLIVerifier` luôn hỏi LLM khi có LLM.
+- **Thắt chặt điều kiện kết thúc `DONE`**:
+  - Phân định rõ `cited_claims_count` và `supported_claims_count` (chỉ đếm các claim được NLI xác nhận `SUPPORTED`).
+  - Phiên chỉ được kết thúc `DONE` khi có ít nhất 1 claim được NLI xác nhận `SUPPORTED` (`supported_claims_count >= 1`).
+  - Nếu claim có trích dẫn nhưng không claim nào được NLI xác nhận, phiên kết thúc `PARTIAL` kèm lý do minh bạch: `"Report contains cited claims but none were confirmed as fully supported by evidence"`.
+- **Regression Tests**:
+  - Đạt 114 passed + 1 skipped (bổ sung đầy đủ 6 test case cho các ca kiểm thử thực tế của review).
+
+## Vấn đề còn mở (ưu tiên từ trên xuống)
+
+1. Chạy E2E thật lại 2–3 goal để xem NLI hoạt động thực tế với LLM thật (SmolLM3), kiểm tra tỷ lệ latency/budget tiêu thụ cho NLI trên CPU/GPU.
+2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+3. Tuần 4 tiếp theo: writer theo section (plan 28), UI đầy đủ.
 
 ## Lịch sử kết quả chạy thật
 

@@ -90,7 +90,8 @@ def test_end_to_end_run_api(client, isolated_engine):
                     "confidence": 0.95
                 }
             ]
-        }
+        },
+        "generate": "FlashAttention-2 yields up to 2x speedup compared to FlashAttention-1 [E1]."
     }
     isolated_engine.llm = MockLLMBackend(canned_responses=canned)
 

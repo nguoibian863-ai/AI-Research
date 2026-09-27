@@ -1066,7 +1066,8 @@ class ResearchEngine:
 
             # Append Evidence & Provenance Table and populate claims lineage if evidence items exist
             claims_json = "[]"
-            supported_claims_count = 0
+            supported_claims_count = 0  # Number of claims confirmed SUPPORTED by NLI (verified: True)
+            cited_claims_count = 0      # Number of claims with valid [E#] citation and numeric consistency
             numeric_mismatch_claims_count = 0
             uncited_numeric_claims_count = 0
             contradicted_claims_count = 0
@@ -1148,8 +1149,10 @@ class ResearchEngine:
                             is_verified = (nli_res.label == NLILabel.SUPPORTED)
                             if nli_res.label == NLILabel.CONTRADICTED:
                                 contradicted_claims_count += 1
+                            elif nli_res.label == NLILabel.SUPPORTED:
+                                supported_claims_count += 1
 
-                            supported_claims_count += 1
+                            cited_claims_count += 1
 
                             self.claim_repo.add(
                                 claim_id=claim_id,
@@ -1231,8 +1234,10 @@ class ResearchEngine:
                     partial_reasons.append("No verified atomic evidence extracted")
                 if missing_evidence_entities:
                     partial_reasons.append(f"Missing evidence for: {', '.join(missing_evidence_entities)}")
-                if supported_claims_count == 0 and numeric_mismatch_claims_count == 0 and evidence_items:
+                if cited_claims_count == 0 and numeric_mismatch_claims_count == 0 and evidence_items:
                     partial_reasons.append("Report contains no valid citations")
+                elif cited_claims_count > 0 and supported_claims_count == 0 and numeric_mismatch_claims_count == 0:
+                    partial_reasons.append("Report contains cited claims but none were confirmed as fully supported by evidence")
                 if numeric_mismatch_claims_count > 0:
                     partial_reasons.append("Report contains numeric claims mismatched with cited evidence")
                 if uncited_numeric_claims_count > 0:

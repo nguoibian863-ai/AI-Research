@@ -77,8 +77,10 @@ class ExecutionBudgetTracker:
 
     def record_llm_call(self, tokens: int = 0, count: int = 1) -> None:
         self.assert_can_call_llm()
-        self.llm_calls += count
-        self.total_tokens_consumed += tokens
+        if isinstance(count, int):
+            self.llm_calls += count
+        if isinstance(tokens, int):
+            self.total_tokens_consumed += tokens
 
     def can_search(self) -> bool:
         return self.search_calls < self.limits.max_search_calls and self.elapsed_seconds <= self.limits.max_runtime_seconds
