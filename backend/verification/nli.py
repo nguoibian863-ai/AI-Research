@@ -42,7 +42,16 @@ LINKING_VERBS = {
     "become", "becomes", "became", "becoming",
 }
 
-CONTEXT_EXCLUDED = DATASET_BENCHMARK_TERMS | HARDWARE_ENV_TERMS | LINKING_VERBS
+GENERIC_DOMAIN_NOUNS: Set[str] = {
+    "detector", "detectors", "model", "models", "system", "systems",
+    "network", "networks", "architecture", "architectures", "method", "methods",
+    "approach", "approaches", "baseline", "baselines", "algorithm", "algorithms",
+    "framework", "frameworks", "technique", "techniques", "solution", "solutions",
+    "pipeline", "pipelines", "variant", "variants", "family", "families",
+    "real-time", "realtime", "sota", "state-of-the-art"
+}
+
+CONTEXT_EXCLUDED = DATASET_BENCHMARK_TERMS | HARDWARE_ENV_TERMS | LINKING_VERBS | GENERIC_DOMAIN_NOUNS
 
 # Metric polarities (Plan 23 & Review items 3)
 LOWER_IS_BETTER_METRICS: Set[str] = {
@@ -54,6 +63,15 @@ HIGHER_IS_BETTER_METRICS: Set[str] = {
     "f1", "precision", "recall", "speedup", "tps"
 }
 ALL_KNOWN_METRICS: Set[str] = LOWER_IS_BETTER_METRICS | HIGHER_IS_BETTER_METRICS
+
+SPEED_METRIC_TERMS: Set[str] = {
+    "latency", "speed", "fps", "ms", "throughput", "runtime", "time", "inference time",
+    "inference latency", "delay", "speedup", "tps"
+}
+ACCURACY_METRIC_TERMS: Set[str] = {
+    "accuracy", "acc", "ap", "map", "nds", "score", "f1", "precision", "recall",
+    "error", "error rate", "loss"
+}
 
 # Direct opposing comparative pairs that inherently specify dimension
 INHERENT_OPPOSING_PAIRS: Dict[str, str] = {
@@ -130,6 +148,65 @@ def _extract_metric_terms(text: str) -> Set[str]:
     return found
 
 
+def _get_metric_polarity(comp: str, metric: str) -> int:
+    """
+    Returns:
+      +1 if the comparative indicates an advantage/superiority on this metric,
+      -1 if the comparative indicates an inferiority/drawback on this metric,
+       0 if neutral, unknown, or not metric-specific.
+    """
+    c = comp.lower().strip()
+    m = metric.lower().strip()
+
+    if c in {"faster", "better", "superior", "outperforms", "exceeds", "beats"}:
+        return 1
+    if c in {"slower", "worse", "inferior", "underperforms", "trails", "loses to"}:
+        return -1
+
+    if m in LOWER_IS_BETTER_METRICS:
+        if c in {"lower", "less", "smaller", "fewer"}:
+            return 1
+        if c in {"higher", "more", "greater", "larger"}:
+            return -1
+    elif m in HIGHER_IS_BETTER_METRICS:
+        if c in {"higher", "more", "greater", "larger"}:
+            return 1
+        if c in {"lower", "less", "smaller", "fewer"}:
+            return -1
+
+    return 0
+
+
+def _resolve_polarity_and_domain(comp: str, metrics: Set[str]) -> Tuple[int, str]:
+    """
+    Resolves the semantic polarity (+1 advantage, -1 disadvantage) and domain (speed, accuracy, general)
+    of a comparative relation given the comparative word and context metrics.
+    """
+    c = comp.lower().strip()
+    if c in {"faster", "slower"}:
+        return (1 if c == "faster" else -1), "speed"
+    if c in {"outperforms", "beats", "exceeds"}:
+        return 1, "general"
+    if c in {"underperforms", "trails", "loses to"}:
+        return -1, "general"
+
+    for m in metrics:
+        pol = _get_metric_polarity(c, m)
+        if pol != 0:
+            domain = "general"
+            if m in SPEED_METRIC_TERMS:
+                domain = "speed"
+            elif m in ACCURACY_METRIC_TERMS:
+                domain = "accuracy"
+            return pol, domain
+
+    pol = _get_metric_polarity(c, "")
+    if pol != 0:
+        return pol, "general"
+
+    return 0, "unknown"
+
+
 def strip_citation_markers(text: str) -> str:
     """Removes [E1], **E1**, (E1), E1 citation tags from sentence."""
     t = re.sub(r"\[E\d+\]", " ", text)
@@ -167,10 +244,10 @@ def _tokenize_content_words(text: str) -> List[str]:
     return [w for w in words if w not in STOPWORDS and len(w) > 1]
 
 
-def extract_comparative_triples(text: str) -> List[Tuple[str, str, str]]:
+def extract_comparative_triples(text: str, known_entities: Optional[List[str]] = None) -> List[Tuple[str, str, str]]:
     """
     Extracts structured comparative relations from text: (subject, comparative_word, object).
-    Uses strict word boundaries and backward entity search for the subject.
+    Uses strict word boundaries, prioritizes known research goal entities, and searches backward for the subject.
     """
     clean_text = strip_citation_markers(text).lower()
     triples: List[Tuple[str, str, str]] = []
@@ -195,15 +272,25 @@ def extract_comparative_triples(text: str) -> List[Tuple[str, str, str]]:
 
             # Search backwards from comparative word to find closest substantive subject
             sub_entity = None
-            for tok in reversed(tokens_before):
-                if (
-                    tok not in STOPWORDS
-                    and tok not in CONTEXT_EXCLUDED
-                    and not _is_number_or_unit(tok)
-                    and len(tok) > 1
-                ):
-                    sub_entity = tok
-                    break
+
+            # Priority 1: Check if any token matches known research goal entities
+            if known_entities:
+                for tok in reversed(tokens_before):
+                    if any(_entities_match(tok, ke) for ke in known_entities):
+                        sub_entity = tok
+                        break
+
+            # Priority 2: Substantive token excluding stopwords, numbers, hardware, and generic domain nouns
+            if not sub_entity:
+                for tok in reversed(tokens_before):
+                    if (
+                        tok not in STOPWORDS
+                        and tok not in CONTEXT_EXCLUDED
+                        and not _is_number_or_unit(tok)
+                        and len(tok) > 1
+                    ):
+                        sub_entity = tok
+                        break
 
             if not sub_entity:
                 for tok in reversed(tokens_before):
@@ -222,7 +309,13 @@ def extract_comparative_triples(text: str) -> List[Tuple[str, str, str]]:
     verb_pattern = r"\b([a-zA-Z0-9_\-\.]+)\b\s+(?:[a-zA-Z0-9_\-\.]+\s+){0,2}?\b(outperforms|underperforms|beats|trails|exceeds)\b\s+\b([a-zA-Z0-9_\-\.]+)\b"
     for m in re.finditer(verb_pattern, clean_text):
         sub, comp, obj = m.group(1), m.group(2), m.group(3)
-        if sub not in STOPWORDS and obj not in STOPWORDS and not _entities_match(sub, obj):
+        if (
+            sub not in STOPWORDS
+            and obj not in STOPWORDS
+            and sub not in CONTEXT_EXCLUDED
+            and obj not in CONTEXT_EXCLUDED
+            and not _entities_match(sub, obj)
+        ):
             triples.append((sub, comp, obj))
 
     return triples
@@ -246,7 +339,8 @@ class BaseNLIVerifier(ABC):
         claim: str,
         evidence: str,
         budget_tracker: Optional[Any] = None,
-        all_quotes: Optional[List[str]] = None
+        all_quotes: Optional[List[str]] = None,
+        known_entities: Optional[List[str]] = None
     ) -> NLIVerificationResult:
         """Verify entailment between claim and evidence."""
         pass
@@ -272,7 +366,8 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
         claim: str,
         evidence: str,
         budget_tracker: Optional[Any] = None,
-        all_quotes: Optional[List[str]] = None
+        all_quotes: Optional[List[str]] = None,
+        known_entities: Optional[List[str]] = None
     ) -> NLIVerificationResult:
         c_clean = claim.strip()
         e_clean = evidence.strip()
@@ -318,32 +413,66 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
             )
 
         # 3. Entity-aware comparative relation check with Metric Polarity awareness
-        c_triples = extract_comparative_triples(c_clean)
-        e_triples = extract_comparative_triples(e_clean)
+        c_triples = extract_comparative_triples(c_clean, known_entities=known_entities)
+        e_triples = extract_comparative_triples(e_clean, known_entities=known_entities)
 
         for c_sub, c_comp, c_obj in c_triples:
+            c_metrics = _extract_metric_terms(c_clean)
+            c_pol, c_dom = _resolve_polarity_and_domain(c_comp, c_metrics)
+
             # Check if this triple is already explicitly supported by evidence
-            has_agreeing = any(
-                _entities_match(c_sub, e_s) and _entities_match(c_obj, e_o) and (
-                    c_comp == e_c or (
-                        c_comp in SUPERIOR_TERMS and e_c in SUPERIOR_TERMS
-                    ) or (
-                        c_comp in INFERIOR_TERMS and e_c in INFERIOR_TERMS
-                    )
+            has_agreeing = False
+            for e_s, e_c, e_o in e_triples:
+                if not (_entities_match(c_sub, e_s) and _entities_match(c_obj, e_o)):
+                    continue
+                e_metrics = _extract_metric_terms(e_clean)
+                e_pol, e_dom = _resolve_polarity_and_domain(e_c, e_metrics)
+                shared_metrics = c_metrics & e_metrics
+                domains_compatible = (
+                    (c_dom == e_dom and c_dom != "unknown")
+                    or bool(shared_metrics)
+                    or (c_dom == "general" or e_dom == "general")
                 )
-                for e_s, e_c, e_o in e_triples
-            )
+                if (c_dom == "speed" and e_dom == "accuracy") or (c_dom == "accuracy" and e_dom == "speed"):
+                    domains_compatible = False
+
+                if c_comp == e_c and (shared_metrics or not (c_metrics or e_metrics)):
+                    has_agreeing = True
+                    break
+                if domains_compatible and c_pol != 0 and e_pol != 0 and c_pol == e_pol:
+                    has_agreeing = True
+                    break
+
             if has_agreeing:
                 continue
 
             for e_sub, e_comp, e_obj in e_triples:
-                c_metrics = _extract_metric_terms(c_clean)
                 e_metrics = _extract_metric_terms(e_clean)
                 shared_metrics = c_metrics & e_metrics
 
+                c_pol, c_dom = _resolve_polarity_and_domain(c_comp, c_metrics)
+                e_pol, e_dom = _resolve_polarity_and_domain(e_comp, e_metrics)
+
+                domains_compatible = (
+                    (c_dom == e_dom and c_dom != "unknown")
+                    or bool(shared_metrics)
+                    or (c_dom == "general" or e_dom == "general")
+                )
+                if (c_dom == "speed" and e_dom == "accuracy") or (c_dom == "accuracy" and e_dom == "speed"):
+                    domains_compatible = False
+
                 # 3a. Reversed comparison direction (e.g. "A is faster than B" vs "B is faster than A")
                 if _entities_match(c_sub, e_obj) and _entities_match(c_obj, e_sub):
-                    if c_comp == e_comp:
+                    if domains_compatible and c_pol != 0 and e_pol != 0 and c_pol == e_pol:
+                        return NLIVerificationResult(
+                            label=NLILabel.CONTRADICTED,
+                            confidence=0.95,
+                            reason=f"Reversed comparison direction between {c_sub} and {c_obj}: claim asserts '{c_sub} {c_comp} {c_obj}' ({c_dom}), but evidence asserts '{e_sub} {e_comp} {e_obj}' ({e_dom})",
+                            verifier_type="rule_based",
+                            claim_text=c_clean,
+                            evidence_quote=e_clean
+                        )
+                    elif c_comp == e_comp:
                         # Exactly identical comparative word on swapped entities
                         # E.g. A faster than B vs B faster than A -> contradiction
                         if not (c_metrics and e_metrics and not shared_metrics):
@@ -376,8 +505,18 @@ class RuleBasedNLIVerifier(BaseNLIVerifier):
                                 evidence_quote=e_clean
                             )
 
-                # 3b. Opposite comparative direction on same entity pair (e.g. "faster" vs "slower")
+                # 3b. Opposite comparative polarity on same entity pair (e.g. "faster" vs "slower")
                 if _entities_match(c_sub, e_sub) and _entities_match(c_obj, e_obj):
+                    if domains_compatible and c_pol != 0 and e_pol != 0 and c_pol != e_pol:
+                        return NLIVerificationResult(
+                            label=NLILabel.CONTRADICTED,
+                            confidence=0.95,
+                            reason=f"Opposite comparative polarity for ({c_sub} vs {c_obj}): claim asserts '{c_comp}' ({c_dom}) but evidence asserts '{e_comp}' ({e_dom})",
+                            verifier_type="rule_based",
+                            claim_text=c_clean,
+                            evidence_quote=e_clean
+                        )
+
                     # Case I: Inherent metric-specific opposing pairs (faster vs slower, outperforms vs underperforms)
                     if INHERENT_OPPOSING_PAIRS.get(c_comp) == e_comp:
                         return NLIVerificationResult(
@@ -493,7 +632,8 @@ class LLMNLIVerifier(BaseNLIVerifier):
         claim: str,
         evidence: str,
         budget_tracker: Optional[Any] = None,
-        all_quotes: Optional[List[str]] = None
+        all_quotes: Optional[List[str]] = None,
+        known_entities: Optional[List[str]] = None
     ) -> NLIVerificationResult:
         tracker = budget_tracker or self.budget_tracker
         if tracker:
@@ -501,7 +641,9 @@ class LLMNLIVerifier(BaseNLIVerifier):
                 tracker.assert_can_call_llm()
             except Exception as e:
                 logger.warning(f"LLM NLI skipped due to budget/time constraint ({e}). Falling back to rule-based.")
-                return self.fallback.verify(claim, evidence, budget_tracker=tracker, all_quotes=all_quotes)
+                return self.fallback.verify(
+                    claim, evidence, budget_tracker=tracker, all_quotes=all_quotes, known_entities=known_entities
+                )
 
         prompt = (
             f"You are a strict factual entailment checker.\n"
@@ -537,7 +679,9 @@ class LLMNLIVerifier(BaseNLIVerifier):
             )
         except Exception as e:
             logger.warning(f"LLM NLI verification failed ({e}). Falling back to rule-based verifier.")
-            return self.fallback.verify(claim, evidence, budget_tracker=tracker, all_quotes=all_quotes)
+            return self.fallback.verify(
+                claim, evidence, budget_tracker=tracker, all_quotes=all_quotes, known_entities=known_entities
+            )
 
 
 class CompositeNLIVerifier(BaseNLIVerifier):
@@ -554,10 +698,13 @@ class CompositeNLIVerifier(BaseNLIVerifier):
         claim: str,
         evidence: str,
         budget_tracker: Optional[Any] = None,
-        all_quotes: Optional[List[str]] = None
+        all_quotes: Optional[List[str]] = None,
+        known_entities: Optional[List[str]] = None
     ) -> NLIVerificationResult:
         # 1. Fast rule-based check
-        rule_res = self.rule_verifier.verify(claim, evidence, budget_tracker=budget_tracker, all_quotes=all_quotes)
+        rule_res = self.rule_verifier.verify(
+            claim, evidence, budget_tracker=budget_tracker, all_quotes=all_quotes, known_entities=known_entities
+        )
 
         # 2. If rule-based clearly identifies SUPPORTED or CONTRADICTED, return immediately (0 token cost!)
         if rule_res.label in (NLILabel.SUPPORTED, NLILabel.CONTRADICTED) and rule_res.confidence >= 0.85:
@@ -565,7 +712,9 @@ class CompositeNLIVerifier(BaseNLIVerifier):
 
         # 3. If rule-based is uncertain (PARTIALLY_SUPPORTED or NOT_SUPPORTED) and LLM is available, consult LLM
         if self.llm_verifier:
-            return self.llm_verifier.verify(claim, evidence, budget_tracker=budget_tracker, all_quotes=all_quotes)
+            return self.llm_verifier.verify(
+                claim, evidence, budget_tracker=budget_tracker, all_quotes=all_quotes, known_entities=known_entities
+            )
 
         return rule_res
 
@@ -577,15 +726,20 @@ class ClaimVerificationPipeline:
 
     def __init__(self, verifier: Optional[BaseNLIVerifier] = None):
         self.verifier = verifier or RuleBasedNLIVerifier()
+        self.rule_verifier = RuleBasedNLIVerifier()
 
-    def verify_claim_against_quotes(self, claim_text: str, quotes: List[str], budget_tracker: Optional[Any] = None) -> NLIVerificationResult:
+    def verify_claim_against_quotes(
+        self,
+        claim_text: str,
+        quotes: List[str],
+        budget_tracker: Optional[Any] = None,
+        known_entities: Optional[List[str]] = None
+    ) -> NLIVerificationResult:
         """
         Evaluates a claim against multiple cited quotes.
-        Priority:
-        1. CONTRADICTED: if any cited quote directly refutes the claim.
-        2. SUPPORTED: if any cited quote explicitly supports the claim, or if combined quotes support it.
-        3. PARTIALLY_SUPPORTED: if partial overlap is found.
-        4. NOT_SUPPORTED: otherwise.
+        For multi-quote claims (Review item 2):
+        1. Runs fast rule checks on individual quotes (0 LLM calls) to catch verbatim matches or direct contradictions.
+        2. Calls verifier (at most 1 LLM call) on combined evidence ' '.join(valid_quotes) so the LLM sees complete context.
         """
         if not quotes:
             return NLIVerificationResult(
@@ -608,35 +762,44 @@ class ClaimVerificationPipeline:
                 evidence_quote=""
             )
 
-        # 1. Check each quote individually for direct CONTRADICTION or single-quote SUPPORT
-        results: List[NLIVerificationResult] = []
-        for q in valid_quotes:
-            res = self.verifier.verify(claim_text, q, budget_tracker=budget_tracker, all_quotes=valid_quotes)
-            results.append(res)
-            # Short-circuit on direct contradiction!
-            if res.label == NLILabel.CONTRADICTED:
-                return res
-
-        # 2. Check for single-quote explicit support
-        for res in results:
-            if res.label == NLILabel.SUPPORTED:
-                return res
-
-        # 3. For multi-quote claims, evaluate against the combined evidence of all cited quotes!
-        if len(valid_quotes) > 1:
-            combined_evidence = " ".join(valid_quotes)
-            comb_res = self.verifier.verify(
-                claim_text, combined_evidence, budget_tracker=budget_tracker, all_quotes=valid_quotes
+        if len(valid_quotes) == 1:
+            return self.verifier.verify(
+                claim_text,
+                valid_quotes[0],
+                budget_tracker=budget_tracker,
+                all_quotes=valid_quotes,
+                known_entities=known_entities
             )
-            if comb_res.label == NLILabel.CONTRADICTED:
-                return comb_res
-            if comb_res.label == NLILabel.SUPPORTED:
-                return comb_res
-            results.append(comb_res)
 
-        # 4. Check for partial support
-        for res in results:
-            if res.label == NLILabel.PARTIALLY_SUPPORTED:
-                return res
+        # Multi-quote claim optimization (Review item 2):
+        # 1. Run zero-cost rule checks on individual quotes (0 LLM calls):
+        # - Catches direct verbatim substring matches (SUPPORTED 1.0)
+        # - Catches incontrovertible rule contradictions (reversed directions, numeric mismatch on single quote)
+        # Note: We do NOT call LLM on individual quotes because:
+        #   (a) It would consume N+1 LLM calls.
+        #   (b) An individual quote in a multi-citation claim only has partial context (e.g. entity A),
+        #       causing a 3B LLM to falsely emit CONTRADICTED or NOT_SUPPORTED.
+        for q in valid_quotes:
+            rule_res = self.rule_verifier.verify(
+                claim_text,
+                q,
+                budget_tracker=budget_tracker,
+                all_quotes=valid_quotes,
+                known_entities=known_entities
+            )
+            # Incontrovertible contradiction on individual quote
+            if rule_res.label == NLILabel.CONTRADICTED and rule_res.confidence >= 0.85:
+                return rule_res
+            # Direct exact match on individual quote
+            if rule_res.label == NLILabel.SUPPORTED and rule_res.confidence >= 0.95:
+                return rule_res
 
-        return results[0]
+        # 2. Evaluate against the full combined evidence of all cited quotes with self.verifier (at most 1 LLM call!)
+        combined_evidence = " ".join(valid_quotes)
+        return self.verifier.verify(
+            claim_text,
+            combined_evidence,
+            budget_tracker=budget_tracker,
+            all_quotes=valid_quotes,
+            known_entities=known_entities
+        )

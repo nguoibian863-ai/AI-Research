@@ -349,15 +349,23 @@ def test_contradiction_in_report_triggers_session_partial(tmp_path: Path):
 
 
 def test_engine_done_requires_at_least_one_nli_supported_claim(tmp_path: Path):
-    """Review 485345a item 2: If claims have citations but NONE are NLI SUPPORTED, session must be PARTIAL."""
+    """Review 485345a item 2: If claims have citations but NONE are NLI SUPPORTED by LLM, session must be PARTIAL."""
     from backend.core.state import ResearchPhase
 
     db = DatabaseManager(db_path=tmp_path / "nli_done_test.db")
     mock_llm = MagicMock()
     mock_llm.model = "mock"
-    # Claim text has low overlap with quote and is NOT exact match -> NLI NOT_SUPPORTED
     mock_llm.generate.return_value = LLMResponse(
         content="YOLOv8 uses cross-stage partial connections with anchor-free detection heads [E1].",
+        total_tokens=40
+    )
+    mock_llm.structured_generate.return_value = LLMResponse(
+        content='{"label": "NOT_SUPPORTED", "confidence": 0.85, "reason": "Not supported by fox quote"}',
+        parsed=NLIStructuredOutputSchema(
+            label=NLILabel.NOT_SUPPORTED,
+            confidence=0.85,
+            reason="Not supported by fox quote"
+        ),
         total_tokens=40
     )
 
@@ -368,7 +376,7 @@ def test_engine_done_requires_at_least_one_nli_supported_claim(tmp_path: Path):
         embedding_backend=LocalHashEmbeddingBackend(64)
     )
 
-    state = engine.create_session("Evaluate YOLOv8 architecture")
+    state = engine.create_session("Evaluate YOLOv8")
     state.phase = ResearchPhase.EVALUATE
     session_id = state.session_id
 
@@ -407,6 +415,61 @@ def test_engine_done_requires_at_least_one_nli_supported_claim(tmp_path: Path):
     assert claims[0]["status"] == "CITED"
     assert claims[0]["verification"]["verified"] is False
     assert claims[0]["verification"]["entailment"] == "NOT_SUPPORTED"
+
+
+def test_engine_done_records_nli_unavailable_when_llm_fails_or_missing(tmp_path: Path):
+    """Review item 3: When LLM NLI is unavailable/fails, record 'NLI unavailable – claims not verified'."""
+    from backend.core.state import ResearchPhase
+
+    db = DatabaseManager(db_path=tmp_path / "nli_unavail_test.db")
+    mock_llm = MagicMock()
+    mock_llm.model = "mock"
+    mock_llm.generate.return_value = LLMResponse(
+        content="YOLOv8 achieves fast inference on standard benchmarks [E1].",
+        total_tokens=40
+    )
+    # LLM structured_generate fails (simulating Ollama offline, timeout, or budget exceeded)
+    mock_llm.structured_generate.side_effect = RuntimeError("Ollama connection refused")
+
+    engine = ResearchEngine(
+        llm=mock_llm,
+        db=db,
+        limits=ResearchLimits(max_research_steps=1),
+        embedding_backend=LocalHashEmbeddingBackend(64)
+    )
+
+    state = engine.create_session("Evaluate YOLOv8")
+    state.phase = ResearchPhase.EVALUATE
+    session_id = state.session_id
+
+    engine.source_repo.add(
+        source_id="src_1",
+        session_id=session_id,
+        url="https://github.com/ultralytics/ultralytics",
+        title="YOLOv8 GitHub",
+        domain="github.com"
+    )
+    engine.raw_evidence_repo.add(
+        raw_evidence_id="raw_1",
+        session_id=session_id,
+        source_id="src_1",
+        raw_quote="YOLOv8 attains high throughput on standard benchmarks."
+    )
+    engine.evidence_repo.add(
+        evidence_id="evi_1",
+        session_id=session_id,
+        raw_evidence_id="raw_1",
+        subject="yolov8",
+        predicate="attains",
+        object_data={"statement": "YOLOv8 attains high throughput."}
+    )
+    state.source_ids = ["src_1"]
+
+    engine.run_basic_answer(state, fetched_docs=[], retrieved_chunks=[])
+
+    assert state.phase == ResearchPhase.PARTIAL
+    assert state.status.value == "PARTIAL"
+    assert "NLI unavailable – claims not verified" in state.error_message
 
 
 # --- 5. Review 69c1355 Tests: 5 Review Issues Fixes ---
@@ -500,4 +563,102 @@ def test_budget_tracker_record_llm_call_coercion_and_validation():
     # Invalid type raises ValueError
     with pytest.raises(ValueError):
         tracker.record_llm_call(tokens="invalid_token_count")
+
+
+# --- 6. Review aa5a034 / Current Turn Tests: Polarity, Generic Nouns, & 1-Call Multi-Quote ---
+
+def test_extract_comparative_triples_skips_generic_nouns_and_prioritizes_known_entities():
+    """Item 4: 'RT-DETR is a real-time detector with higher AP than YOLOv8' must pick RT-DETR, not detector."""
+    from backend.verification.nli import extract_comparative_triples
+
+    text = "RT-DETR is a real-time detector with higher AP than YOLOv8"
+
+    # Test without known entities: generic nouns like 'detector' and 'real-time' must be skipped
+    triples_no_hint = extract_comparative_triples(text)
+    assert len(triples_no_hint) == 1
+    assert triples_no_hint[0][0] == "rt-detr"
+    assert triples_no_hint[0][1] == "higher"
+    assert triples_no_hint[0][2] == "yolov8"
+
+    # Test with explicit known research entities: prioritizes goal entities
+    triples_with_hint = extract_comparative_triples(text, known_entities=["rt-detr", "yolov8"])
+    assert len(triples_with_hint) == 1
+    assert triples_with_hint[0][0] == "rt-detr"
+    assert triples_with_hint[0][1] == "higher"
+    assert triples_with_hint[0][2] == "yolov8"
+
+
+def test_metric_polarity_inherent_and_derived():
+    """Item 4: _get_metric_polarity and RuleBasedNLIVerifier handle lower-is-better and higher-is-better metrics."""
+    from backend.verification.nli import _get_metric_polarity
+
+    # Polarity helper verification
+    assert _get_metric_polarity("faster", "") == 1
+    assert _get_metric_polarity("slower", "") == -1
+    assert _get_metric_polarity("higher", "accuracy") == 1
+    assert _get_metric_polarity("lower", "accuracy") == -1
+    assert _get_metric_polarity("higher", "latency") == -1
+    assert _get_metric_polarity("lower", "latency") == 1
+    assert _get_metric_polarity("higher", "error rate") == -1
+    assert _get_metric_polarity("lower", "error rate") == 1
+
+    verifier = RuleBasedNLIVerifier()
+
+    # Opposite polarity in speed domain: higher latency (-1) vs faster (+1) -> CONTRADICTED
+    c1 = "RT-DETR has higher latency than YOLOv8"
+    q1 = "RT-DETR is faster than YOLOv8"
+    res1 = verifier.verify(c1, q1)
+    assert res1.label == NLILabel.CONTRADICTED
+    assert res1.confidence == 0.95
+
+    # Opposite polarity in accuracy domain: higher error rate (-1) vs higher accuracy (+1) -> CONTRADICTED
+    c2 = "RT-DETR has higher error rate than YOLOv8"
+    q2 = "RT-DETR achieves higher accuracy than YOLOv8"
+    res2 = verifier.verify(c2, q2)
+    assert res2.label == NLILabel.CONTRADICTED
+    assert res2.confidence == 0.95
+
+    # Aligned polarity: lower error rate (+1) vs higher accuracy (+1) -> NOT CONTRADICTED
+    c3 = "RT-DETR has lower error rate than YOLOv8"
+    q3 = "RT-DETR achieves higher accuracy than YOLOv8"
+    res3 = verifier.verify(c3, q3)
+    assert res3.label != NLILabel.CONTRADICTED
+
+
+def test_pipeline_multi_quote_single_llm_call_and_no_single_quote_contradiction():
+    """Item 2: Multi-quote claims run rule checks on individual quotes (0 LLM calls) and call LLM exactly once on combined quotes."""
+    mock_llm = MagicMock(spec=LLMBackend)
+    mock_schema_res = NLIStructuredOutputSchema(
+        label=NLILabel.SUPPORTED,
+        confidence=0.95,
+        reason="Evidence confirms both entities' results."
+    )
+    mock_llm.structured_generate.return_value = LLMResponse(
+        content='{"label": "SUPPORTED", "confidence": 0.95, "reason": "Evidence confirms both entities\' results."}',
+        parsed=mock_schema_res,
+        total_tokens=100,
+        calls_made=1
+    )
+
+    composite = CompositeNLIVerifier(llm=mock_llm)
+    pipeline = ClaimVerificationPipeline(verifier=composite)
+
+    quotes = [
+        "CenterPoint achieves 67.3 NDS on nuScenes.",
+        "PointPillars achieves 59.2 NDS on nuScenes."
+    ]
+    claim = "CenterPoint reaches 67.3 NDS while PointPillars reaches 59.2 NDS on nuScenes."
+
+    res = pipeline.verify_claim_against_quotes(claim, quotes)
+
+    assert res.label == NLILabel.SUPPORTED
+    assert res.confidence == 0.95
+    # Must make EXACTLY ONE call to LLM structured_generate on combined evidence, NOT 3 calls (N+1)!
+    assert mock_llm.structured_generate.call_count == 1
+
+    call_args, call_kwargs = mock_llm.structured_generate.call_args
+    prompt_used = call_args[0]
+    # Prompt must contain both quotes combined so the 3B LLM has full context
+    assert "CenterPoint achieves 67.3 NDS" in prompt_used
+    assert "PointPillars achieves 59.2 NDS" in prompt_used
 

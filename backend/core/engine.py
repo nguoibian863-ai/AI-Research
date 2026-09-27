@@ -1071,6 +1071,8 @@ class ResearchEngine:
             numeric_mismatch_claims_count = 0
             uncited_numeric_claims_count = 0
             contradicted_claims_count = 0
+            nli_llm_evaluated_count = 0
+            goal_core_entities = self._goal_subject_entities(state.goal)
 
             if evidence_items:
                 augmented_answer, citation_stats = CitationVerifier.verify_and_append_appendix(raw_report, evidence_items)
@@ -1143,8 +1145,10 @@ class ResearchEngine:
                                 if (ev.get("exact_quote") or ev.get("raw_quote"))
                             ]
                             nli_res = self.claim_verification_pipeline.verify_claim_against_quotes(
-                                sent, quotes_for_nli, budget_tracker=budget
+                                sent, quotes_for_nli, budget_tracker=budget, known_entities=goal_core_entities
                             )
+                            if nli_res.verifier_type == "llm":
+                                nli_llm_evaluated_count += 1
 
                             is_verified = (nli_res.label == NLILabel.SUPPORTED)
                             if nli_res.label == NLILabel.CONTRADICTED:
@@ -1237,7 +1241,10 @@ class ResearchEngine:
                 if cited_claims_count == 0 and numeric_mismatch_claims_count == 0 and evidence_items:
                     partial_reasons.append("Report contains no valid citations")
                 elif cited_claims_count > 0 and supported_claims_count == 0 and numeric_mismatch_claims_count == 0:
-                    partial_reasons.append("Report contains cited claims but none were confirmed as fully supported by evidence")
+                    if nli_llm_evaluated_count == 0:
+                        partial_reasons.append("NLI unavailable – claims not verified")
+                    else:
+                        partial_reasons.append("Report contains cited claims but none were confirmed as fully supported by evidence")
                 if numeric_mismatch_claims_count > 0:
                     partial_reasons.append("Report contains numeric claims mismatched with cited evidence")
                 if uncited_numeric_claims_count > 0:
@@ -1298,6 +1305,10 @@ class ResearchEngine:
         evidence_map = {e["evidence_id"]: e for e in self.evidence_repo.get_full_evidence_by_session(session_id)}
         updated_claims = []
 
+        sess = self.session_repo.get(session_id)
+        goal = sess.get("goal") if sess else ""
+        known_entities = self._goal_subject_entities(goal) if goal else None
+
         for claim in claims:
             # DO NOT touch NUMERIC_MISMATCH or UNSUPPORTED claims! (Review item 3)
             if claim.get("status") in ("NUMERIC_MISMATCH", "UNSUPPORTED"):
@@ -1319,7 +1330,7 @@ class ResearchEngine:
                 continue
 
             res = self.claim_verification_pipeline.verify_claim_against_quotes(
-                claim["text"], quotes, budget_tracker=budget_tracker
+                claim["text"], quotes, budget_tracker=budget_tracker, known_entities=known_entities
             )
 
             current_verif = claim.get("verification") or {}

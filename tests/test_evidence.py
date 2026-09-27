@@ -398,6 +398,11 @@ def test_run_week1_end_to_end_extracts_evidence_without_foreign_key_error(tmp_pa
                 }
             ]
         },
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence explicitly confirms CenterPoint 60.3 mAP."
+        },
         "generate": "CenterPoint achieves 60.3 mAP [E1] on nuScenes benchmark."
     }
 
@@ -803,6 +808,11 @@ def test_uncited_numeric_report_creates_unsupported_claim_and_forces_partial(tmp
                 }
             ]
         },
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence explicitly confirms CenterPoint 60.3 mAP."
+        },
         # The LLM answers with an uncited fabricated numeric claim!
         "generate": (
             "CenterPoint achieves 60.3 mAP on nuScenes [E1]. "
@@ -998,6 +1008,11 @@ def test_sentence_citing_multiple_evidences_deduplicates_to_single_claim(tmp_pat
                     "confidence": 0.99
                 }
             ]
+        },
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence confirms both metrics."
         },
         # Sentence citing both [E1] and [E2]
         "generate": "CenterPoint achieves 60.3 mAP [E1] and 67.3 NDS on the benchmark [E2]."
@@ -1335,6 +1350,11 @@ def test_bold_citations_from_small_model_count_as_cited(tmp_path):
              "metric": "NDS", "value": "67.3", "raw_quote": "CenterPoint achieves 60.3 mAP and 67.3 NDS"},
             {"statement": "PointPillars achieves 59.2 NDS on nuScenes.", "subject": "PointPillars", "predicate": "achieves",
              "metric": "NDS", "value": "59.2", "raw_quote": "PointPillars achieves 59.2 NDS"}]},
+        "NLIStructuredOutputSchema": {
+            "label": "SUPPORTED",
+            "confidence": 0.95,
+            "reason": "Evidence confirms both results."
+        },
         "generate": "CenterPoint reaches 67.3 NDS **E1** while PointPillars reaches 59.2 NDS (E2).",
     }
     engine = ResearchEngine(

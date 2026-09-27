@@ -41,6 +41,13 @@ class MockLLMBackend(LLMBackend):
         schema_name = schema.__name__
         if schema_name in self.canned_responses:
             data = self.canned_responses[schema_name]
+        elif schema_name == "NLIStructuredOutputSchema":
+            # Strict mock behavior: never falsely bless claims as SUPPORTED unless explicitly canned in test
+            data = {
+                "label": "NOT_SUPPORTED",
+                "confidence": 0.5,
+                "reason": "Mock default NLI: not supported unless explicitly canned in test"
+            }
         else:
             # Construct a dummy instance with schema defaults or basic mock data
             data = {}

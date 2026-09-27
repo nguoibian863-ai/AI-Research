@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `69c1355`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `aa5a034` (mock NLI, multi-quote 1-call optimization, metric polarity & generic domain nouns).
 
 ## Tiến độ
 
@@ -9,10 +9,10 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: sửa so khớp nguyên văn bất đối xứng, kiểm tra số theo hợp các quote, nhận diện polarity metric, lọc số/đơn vị khi tìm chủ ngữ, ép kiểu budget an toàn. Còn: writer theo section, UI đầy đủ |
+| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: sửa mock NLI strict, pipeline multi-quote 1 LLM call, phân biệt lý do PARTIAL khi NLI unavailable, metric polarity domain matching, lọc generic domain nouns và ưu tiên known_entities. Còn: writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: 119 passed + 1 skipped (test FastEmbed cần mạng/cache).
+Test: **123 passed, 0 skipped**.
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -173,6 +173,27 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
   - `MockLLMBackend.structured_generate` tự động gán giá trị enum hợp lệ (`list(field_info.annotation)[0].value`) thay vì `None`, giúp các unit test chạy với schema Enum như `NLILabel` không bị ném `ValidationError`.
 - **Regression Tests**:
   - Đạt **119 passed + 1 skipped** (bổ sung đầy đủ 5 test case kiểm thử hồi quy tương ứng với 5 vấn đề trong `tests/test_verification_nli.py`).
+
+## Đã giải quyết (sau review `aa5a034` — Mock NLI, Multi-Quote 1-Call & Metric Polarity)
+
+- **Sửa hành vi mặc định Mock NLI (P0)**:
+  - Trong `backend/llm/mock.py`: với `NLIStructuredOutputSchema`, mock không còn tự động gán enum đầu tiên (`SUPPORTED`) mà mặc định trả về `NOT_SUPPORTED 0.5`, tránh hiện tượng false pass trong test khi test không khai báo `canned_responses` cho NLI.
+  - Khai báo tường minh canned NLI schema trong các integration test `tests/test_evidence.py` khi kiểm tra luồng hoàn chỉnh.
+- **Tối ưu hóa Pipeline Multi-Quote: Tối đa 1 LLM Call & tránh False Contradiction (P0)**:
+  - Trong `ClaimVerificationPipeline.verify_claim_against_quotes`: khi câu có nhiều trích dẫn (`len(valid_quotes) > 1`), pipeline không còn gọi LLM cho từng quote riêng lẻ (vốn tốn $N+1$ lượt gọi và dễ bị LLM 3B phán nhầm `CONTRADICTED` vì một quote đơn lẻ không chứa đủ vế so sánh).
+  - Thay vào đó, pipeline chạy `rule_verifier` trên từng quote (0 LLM call) chỉ để bắt mâu thuẫn đối lập trực tiếp hoặc trùng nguyên văn (`SUPPORTED 1.0`); sau đó gọi `self.verifier` DUY NHẤT 1 LẦN trên văn bản hợp nhất `combined_evidence = " ".join(valid_quotes)`.
+- **Lý do PARTIAL minh bạch khi NLI không khả dụng (P1)**:
+  - Trong `ResearchEngine.run_basic_answer`: ghi nhận `nli_llm_evaluated_count`.
+  - Nếu session kết thúc bằng `PARTIAL` vì claim có trích dẫn nhưng không claim nào đạt `SUPPORTED`:
+    - Nếu không có lượt gọi LLM NLI nào thành công (`nli_llm_evaluated_count == 0` do LLM lỗi, Ollama offline, hoặc hết budget nên chỉ qua rule-based), lý do ghi nhận rõ ràng: `"NLI unavailable – claims not verified"`.
+    - Nếu LLM NLI đã đánh giá nhưng từ chối: ghi nhận `"Report contains cited claims but none were confirmed as fully supported by evidence"`.
+- **Khai thác chiều metric (Polarity) và lọc danh từ chung khi trích xuất chủ ngữ (P1)**:
+  - Bổ sung `_resolve_polarity_and_domain` tích hợp `_get_metric_polarity`, phân loại `SPEED_METRIC_TERMS` và `ACCURACY_METRIC_TERMS`. Áp dụng trực tiếp vào bước 3 của `RuleBasedNLIVerifier.verify`, đồng bộ cả kiểm tra đối kháng (`CONTRADICTED`) và kiểm tra đồng thuận (`has_agreeing`).
+  - Bổ sung `GENERIC_DOMAIN_NOUNS` (`detector`, `detectors`, `model`, `system`, `real-time`, `sota`...) vào `CONTEXT_EXCLUDED`.
+  - Bổ sung tham số `known_entities` (lấy từ research goal) được truyền xuyên suốt qua `BaseNLIVerifier`, `CompositeNLIVerifier`, và `ClaimVerificationPipeline`.
+  - Trong `extract_comparative_triples`: ưu tiên 1 so khớp với `known_entities`, ưu tiên 2 bỏ qua `GENERIC_DOMAIN_NOUNS`, giúp câu phức như `"RT-DETR is a real-time detector with higher AP than YOLOv8"` trích xuất chính xác chủ ngữ là `rt-detr`.
+- **Regression Tests**:
+  - Đạt **123 passed, 0 skipped** (bổ sung 4 unit test mới kiểm thử hồi quy cho generic nouns, polarity, multi-quote 1-call và nli unavailable trong `tests/test_verification_nli.py`).
 
 ## Vấn đề còn mở (ưu tiên từ trên xuống)
 
