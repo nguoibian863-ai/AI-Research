@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `0374bbd`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau review `f9fd2fb`.
 
 ## Tiến độ
 
@@ -12,7 +12,7 @@
 | 4 — Verification + UI | 🟢 đang thực hiện | Đã có Session Viewer (/ui) và NLI Entailment Verifier (Plan 23). Còn: writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: 107 passed (hoàn toàn offline không cần GPU hay mạng).
+Test: 106 passed + 1 skipped (test FastEmbed cần mạng/cache).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -107,11 +107,19 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
   - Tích hợp phương thức `ResearchEngine.verify_session_claims(session_id)`: kiểm chứng ngữ nghĩa entailment các claim `CITED` với các quote bằng chứng đã trích dẫn, cập nhật trạng thái `SUPPORTED` / `CONTRADICTED` và ghi nhận độ tin cậy cùng lý do.
   - Bổ sung 9 unit test cho toàn bộ pipeline NLI trong `tests/test_verification_nli.py`.
 
-## Vấn đề còn mở (ưu tiên từ trên xuống)
+## Vấn đề còn mở (ưu tiên từ trên xuống) — review `f9fd2fb` (NLI)
 
-1. Chạy E2E thật lại 2–3 goal để xem lỗi JSON bị cắt hoặc số lần retry có tăng khi context còn 2048 không (chạy với model SmolLM3 thật).
-2. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
-3. Tuần 4 tiếp theo: writer theo section (plan 28), UI đầy đủ.
+1. **NLI chưa được nối vào luồng chạy thật**: chỉ test gọi `verify_session_claims`, còn `run_week1` và API không gọi. Claim trong E2E thật vẫn là `CITED` / `entailment: PENDING`.
+2. **`RuleBasedNLIVerifier` (dùng khi LLM lỗi hoặc không có LLM) cho kết quả sai ngay ở các ca cơ bản** (đã kiểm tra trực tiếp):
+   - Claim trùng nguyên văn quote "RT-DETR achieves higher AP with lower latency than YOLOv8" → `CONTRADICTED`. Kiểm tra cặp trái nghĩa chỉ xét từ có mặt (`higher` trong claim, `lower` trong evidence), không xét từ đó gắn với thực thể nào.
+   - "removes NMS" so với quote "without NMS" → `CONTRADICTED`, vì `without` bị coi là phủ định.
+   - Đảo chiều so sánh "YOLOv8 is faster than RT-DETR" so với quote "RT-DETR is faster than YOLOv8" → `SUPPORTED`. Đây lại đúng là lỗi NLI phải bắt.
+   - Nên để lỗi của bộ luật dẫn tới `NOT_SUPPORTED` hoặc `PENDING` thay vì đưa ra kết luận; chỉ bắt `CONTRADICTED` khi so sánh cùng cặp thực thể.
+3. **`verify_session_claims` ghi đè status bằng nhãn NLI**: claim `NUMERIC_MISMATCH` hoặc `UNSUPPORTED` có thể thành `SUPPORTED` (dù `verified: False`), làm mất tín hiệu sai số. Session cũng không chuyển sang `PARTIAL` khi có claim `CONTRADICTED`. Nên giữ status theo luật số liệu, NLI chỉ ghi vào `verification`. Session Viewer chưa có màu cho `SUPPORTED` / `CONTRADICTED`.
+4. Các call LLM của NLI không được ghi vào budget (`record_llm_call`) và không bị runtime giới hạn; khi nối vào luồng chạy sẽ có số claim × số quote call không bị đếm.
+5. Chạy E2E thật lại 2–3 goal để xem lỗi JSON bị cắt hoặc số lần retry có tăng khi context còn 2048 không (chạy với model SmolLM3 thật). thật lại 2–3 goal để xem lỗi JSON bị cắt hoặc số lần retry có tăng khi context còn 2048 không (chạy với model SmolLM3 thật).
+6. Tỉ lệ quote bị loại "not in source chunk" cao → dữ liệu cho Dataset C (plan 43).
+7. Tuần 4 tiếp theo: writer theo section (plan 28), UI đầy đủ.
 
 ## Lịch sử kết quả chạy thật
 
