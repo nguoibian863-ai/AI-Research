@@ -1,6 +1,6 @@
 # Trạng thái hiện tại
 
-> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `485345a`.
+> Cập nhật sau mỗi vòng review. Lần cập nhật: 2026-09-27, sau giải quyết review `69c1355`.
 
 ## Tiến độ
 
@@ -9,10 +9,10 @@
 | 1 — Core Engine | ~95% | Đã chạy E2E thật với SmolLM3 |
 | 2 — Parsing + Retrieval | ~95% | Đã chạy E2E thật (YOLOv8 vs RT-DETR) |
 | 3 — Evidence Engine | ~95% | Đã chạy E2E thật xác nhận các bản sửa: quote nguyên văn, chuẩn hoá [E#], claim lineage CITED, không bịa số liệu, dừng trung thực |
-| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: triệt tiêu false confidence của rule-based, word boundary regex, reverse entity search, xử lý phủ định và điều kiện DONE nghiêm ngặt. Còn: writer theo section, UI đầy đủ |
+| 4 — Verification + UI | 🟢 đang thực hiện | Hoàn thiện NLI Verifier: sửa so khớp nguyên văn bất đối xứng, kiểm tra số theo hợp các quote, nhận diện polarity metric, lọc số/đơn vị khi tìm chủ ngữ, ép kiểu budget an toàn. Còn: writer theo section, UI đầy đủ |
 | 5 — Evaluation + Trajectory | ~25% | Đã ghi và xuất trajectory có query_origin và prompt_version |
 
-Test: 114 passed + 1 skipped (test FastEmbed cần mạng/cache).
+Test: 119 passed + 1 skipped (test FastEmbed cần mạng/cache).
 
 Xem kết quả: `http://127.0.0.1:8000/ui` (Session Viewer, plan 29.0) hoặc `python scripts/show_session.py`.
 Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
@@ -149,6 +149,30 @@ Xuất trajectory: `python scripts/export_trajectories.py` (Plan 43.1).
   - Nếu claim có trích dẫn nhưng không claim nào được NLI xác nhận, phiên kết thúc `PARTIAL` kèm lý do minh bạch: `"Report contains cited claims but none were confirmed as fully supported by evidence"`.
 - **Regression Tests**:
   - Đạt 114 passed + 1 skipped (bổ sung đầy đủ 6 test case cho các ca kiểm thử thực tế của review).
+
+## Đã giải quyết (review `69c1355` — NLI Asymmetry, Multi-Quote Union & Polarity)
+
+- **Sửa so khớp nguyên văn bất đối xứng (P0)**:
+  - Trong `RuleBasedNLIVerifier.verify`, loại bỏ triệt để `e_norm in c_norm`, chỉ giữ `c_norm == e_norm or c_norm in e_norm`.
+  - Claim chứa quote kèm thêm nội dung bịa/chưa kiểm chứng (ví dụ `"PointPillars achieves 59.2 NDS and is 10x faster than CenterPoint and all other detectors"`) không còn được đánh dấu `SUPPORTED 1.0`, mà nhận `NOT_SUPPORTED 0.85` / `PARTIALLY_SUPPORTED 0.70` và bắt buộc phải qua LLM.
+- **Kiểm tra số liệu theo hợp các quote trích dẫn (P0)**:
+  - Trong `RuleBasedNLIVerifier.verify`, bổ sung tham số `all_quotes: Optional[List[str]] = None`. Khi câu có nhiều trích dẫn, các số trong claim (`c_nums`) được đối soát với tập hợp số trong toàn bộ các quote được trích (`union(all_quotes)`), loại bỏ hoàn toàn lỗi fail số giả (`59.2 not found`) khi câu trích 2 nguồn.
+  - Trong `ClaimVerificationPipeline.verify_claim_against_quotes`: truyền `all_quotes=valid_quotes` khi kiểm tra từng quote. Đồng thời với câu trích nhiều nguồn (`len(valid_quotes) > 1`), pipeline đánh giá thêm toàn văn câu so sánh với hợp các bằng chứng `combined_evidence = " ".join(valid_quotes)`.
+  - Khôi phục câu test gốc `"CenterPoint reaches 67.3 NDS **E1** while PointPillars reaches 59.2 NDS (E2)."` trong `tests/test_evidence.py`, đảm bảo session kết thúc `DONE` tự nhiên mà không cần trick biến đổi câu văn.
+- **Nhận diện chiều (Polarity) của Metric so sánh (P1)**:
+  - Phân loại rõ `LOWER_IS_BETTER_METRICS` (latency, error, error rate, loss, memory, params, flops...) và `HIGHER_IS_BETTER_METRICS` (accuracy, ap, map, nds, fps, throughput...).
+  - Thắt chặt điều kiện kết luận `CONTRADICTED`: chỉ kết luận khi cùng metric (ví dụ cùng nói về `latency` một bên `lower`, một bên `higher`) hoặc các cặp từ so sánh nội hàm metric đối lập trực tiếp (`faster` vs `slower`, `outperforms` vs `underperforms`).
+  - Khi hai câu đề cập metric khác nhau (ví dụ `"RT-DETR has a lower error rate than YOLOv8"` vs `"RT-DETR achieves higher accuracy than YOLOv8"`), bộ luật không còn kết luận sai thành `CONTRADICTED`, mà nhường quyền đánh giá ngữ nghĩa cho LLM.
+- **Lọc số, hệ số nhân và đơn vị khi tìm chủ ngữ (P1)**:
+  - Bổ sung helper `_is_number_or_unit`: nhận diện số thực/nguyên (`1.5`, `59.2`), hệ số nhân (`2x`, `10x`), và đơn vị (`ms`, `fps`, `ap`, `map`, `nds`, `%`...).
+  - Thêm `_is_number_or_unit(tok)` vào điều kiện bỏ qua khi quét ngược tìm thực thể chủ ngữ trong `extract_comparative_triples`.
+  - `"YOLOv8 is 2x faster than RT-DETR"` trích xuất chính xác chủ ngữ là `yolov8`; `"RT-DETR is 1.5 AP higher than YOLOv8"` trích xuất chính xác `rt-detr`.
+- **Ép kiểu an toàn và bẫy lỗi trong `budget.record_llm_call` (P2)**:
+  - Dùng `int(count)` và `int(float(tokens))`, ném `ValueError` rõ ràng khi nhận kiểu dữ liệu không hợp lệ thay vì âm thầm bỏ qua.
+- **Hỗ trợ Enum schema trong `MockLLMBackend`**:
+  - `MockLLMBackend.structured_generate` tự động gán giá trị enum hợp lệ (`list(field_info.annotation)[0].value`) thay vì `None`, giúp các unit test chạy với schema Enum như `NLILabel` không bị ném `ValidationError`.
+- **Regression Tests**:
+  - Đạt **119 passed + 1 skipped** (bổ sung đầy đủ 5 test case kiểm thử hồi quy tương ứng với 5 vấn đề trong `tests/test_verification_nli.py`).
 
 ## Vấn đề còn mở (ưu tiên từ trên xuống)
 

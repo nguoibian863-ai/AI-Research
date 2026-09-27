@@ -1,4 +1,5 @@
 import json
+from enum import Enum
 from typing import Any, Dict, Optional, Type
 from pydantic import BaseModel
 from backend.llm.backend import LLMBackend, LLMResponse
@@ -46,6 +47,8 @@ class MockLLMBackend(LLMBackend):
             for field_name, field_info in schema.model_fields.items():
                 if field_info.default is not None and not str(field_info.default).startswith("PydanticUndefined"):
                     data[field_name] = field_info.default
+                elif isinstance(field_info.annotation, type) and issubclass(field_info.annotation, Enum):
+                    data[field_name] = list(field_info.annotation)[0].value
                 elif field_info.annotation == str:
                     data[field_name] = f"Mock {field_name}"
                 elif field_info.annotation == int:

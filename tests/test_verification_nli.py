@@ -407,3 +407,97 @@ def test_engine_done_requires_at_least_one_nli_supported_claim(tmp_path: Path):
     assert claims[0]["status"] == "CITED"
     assert claims[0]["verification"]["verified"] is False
     assert claims[0]["verification"]["entailment"] == "NOT_SUPPORTED"
+
+
+# --- 5. Review 69c1355 Tests: 5 Review Issues Fixes ---
+
+def test_rule_based_nli_claim_containing_quote_plus_unverified_not_supported():
+    """Issue 1 (P0): Claim containing quote + ungrounded claims must NOT be marked SUPPORTED 1.0."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "PointPillars achieves 59.2 NDS and is 10x faster than CenterPoint and all other detectors"
+    quote = "PointPillars achieves 59.2 NDS"
+
+    result = verifier.verify(claim, quote)
+    assert result.label != NLILabel.SUPPORTED
+    assert result.label in (NLILabel.PARTIALLY_SUPPORTED, NLILabel.NOT_SUPPORTED)
+
+
+def test_rule_based_nli_multi_quote_numeric_consistency_not_rejected():
+    """Issue 2 (P0): Multi-quote claims must check numbers against the union of cited quotes."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "CenterPoint reaches 67.3 NDS [E1] while PointPillars reaches 59.2 NDS [E2]"
+    quotes = [
+        "CenterPoint achieves 60.3 mAP and 67.3 NDS",
+        "PointPillars achieves 59.2 NDS"
+    ]
+
+    # When all_quotes is passed, neither quote check should fail due to 'number not found'
+    res1 = verifier.verify(claim, quotes[0], all_quotes=quotes)
+    assert "not found" not in res1.reason.lower()
+
+    res2 = verifier.verify(claim, quotes[1], all_quotes=quotes)
+    assert "not found" not in res2.reason.lower()
+
+    # In pipeline with combined quote evaluation:
+    pipeline = ClaimVerificationPipeline(verifier=verifier)
+    pipe_res = pipeline.verify_claim_against_quotes(claim, quotes)
+    assert pipe_res.label != NLILabel.CONTRADICTED
+    assert "not found" not in pipe_res.reason.lower()
+
+
+def test_rule_based_nli_metric_polarity_not_falsely_contradicted():
+    """Issue 3 (P1): 'lower error rate' vs 'higher accuracy' must NOT be falsely CONTRADICTED."""
+    verifier = RuleBasedNLIVerifier()
+    claim = "RT-DETR has a lower error rate than YOLOv8"
+    quote = "RT-DETR achieves higher accuracy than YOLOv8"
+
+    result = verifier.verify(claim, quote)
+    assert result.label != NLILabel.CONTRADICTED
+
+    # Contrasting test: same metric ('latency') with opposite direction MUST be CONTRADICTED
+    claim_same_metric = "RT-DETR has lower latency than YOLOv8"
+    quote_same_metric = "RT-DETR has higher latency than YOLOv8"
+    result_same_metric = verifier.verify(claim_same_metric, quote_same_metric)
+    assert result_same_metric.label == NLILabel.CONTRADICTED
+    assert result_same_metric.confidence == 0.95
+
+
+def test_extract_comparative_triples_ignores_numbers_and_units():
+    """Issue 4 (P1): Quantifiers like '2x' and metric units like '1.5 AP' must not be grabbed as subject."""
+    from backend.verification.nli import extract_comparative_triples
+
+    text1 = "YOLOv8 is 2x faster than RT-DETR"
+    triples1 = extract_comparative_triples(text1)
+    assert len(triples1) == 1
+    assert triples1[0][0] == "yolov8"
+    assert triples1[0][1] == "faster"
+    assert triples1[0][2] == "rt-detr"
+
+    text2 = "On COCO val2017, RT-DETR is 1.5 AP higher than YOLOv8"
+    triples2 = extract_comparative_triples(text2)
+    assert len(triples2) == 1
+    assert triples2[0][0] == "rt-detr"
+    assert triples2[0][1] == "higher"
+    assert triples2[0][2] == "yolov8"
+
+
+def test_budget_tracker_record_llm_call_coercion_and_validation():
+    """Issue 5 (P2): record_llm_call should coerce float tokens and raise ValueError on invalid types."""
+    from backend.core.budget import ExecutionBudgetTracker
+    from backend.core.limits import ResearchLimits
+
+    tracker = ExecutionBudgetTracker(limits=ResearchLimits(max_llm_calls=10, max_tokens=1000))
+    # Float tokens coerced safely
+    tracker.record_llm_call(tokens=120.0, count=1)
+    assert tracker.total_tokens_consumed == 120
+    assert tracker.llm_calls == 1
+
+    # String numeric coerced safely
+    tracker.record_llm_call(tokens="80", count="2")
+    assert tracker.total_tokens_consumed == 200
+    assert tracker.llm_calls == 3
+
+    # Invalid type raises ValueError
+    with pytest.raises(ValueError):
+        tracker.record_llm_call(tokens="invalid_token_count")
+
